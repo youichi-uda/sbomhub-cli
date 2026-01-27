@@ -1,0 +1,23 @@
+# Binaries
+sbomhub
+sbomhub.exe
+*.exe
+
+# Build output
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Config (don't commit API keys)
+config.yaml

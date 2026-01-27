@@ -1,0 +1,72 @@
+version: 2
+
+builds:
+  - id: sbomhub
+    main: ./cmd/sbomhub
+    binary: sbomhub
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/youichi-uda/sbomhub-cli/cmd/sbomhub/commands.version={{.Version}}
+      - -X github.com/youichi-uda/sbomhub-cli/cmd/sbomhub/commands.commit={{.Commit}}
+      - -X github.com/youichi-uda/sbomhub-cli/cmd/sbomhub/commands.date={{.Date}}
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE
+
+brews:
+  - name: sbomhub
+    repository:
+      owner: sbomhub
+      name: homebrew-tap
+    homepage: https://sbomhub.app
+    description: CLI for SBOMHub - SBOM Management Dashboard
+    license: MIT
+    install: |
+      bin.install "sbomhub"
+    test: |
+      system "#{bin}/sbomhub", "version"
+
+scoops:
+  - name: sbomhub
+    repository:
+      owner: sbomhub
+      name: scoop-bucket
+    homepage: https://sbomhub.app
+    description: CLI for SBOMHub - SBOM Management Dashboard
+    license: MIT
+
+checksum:
+  name_template: 'checksums.txt'
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+
+release:
+  github:
+    owner: youichi-uda
+    name: sbomhub-cli
+  draft: false
+  prerelease: auto
+  name_template: "{{.Tag}}"
