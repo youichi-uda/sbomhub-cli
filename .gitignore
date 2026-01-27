@@ -1,7 +1,6 @@
 # Binaries
-sbomhub
-sbomhub.exe
-*.exe
+/sbomhub
+/sbomhub.exe
 
 # Build output
 dist/
