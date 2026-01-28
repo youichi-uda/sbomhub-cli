@@ -33,10 +33,13 @@ archives:
 brews:
   - name: sbomhub
     repository:
-      owner: sbomhub
-      name: homebrew-tap
+      owner: youichi-uda
+      name: homebrew-sbomhub
+      branch: master
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
     homepage: https://sbomhub.app
-    description: CLI for SBOMHub - SBOM Management Dashboard
+    description: CLI for SBOMHub - SBOM generation and vulnerability scanning
     license: MIT
     install: |
       bin.install "sbomhub"
@@ -46,11 +49,15 @@ brews:
 scoops:
   - name: sbomhub
     repository:
-      owner: sbomhub
-      name: scoop-bucket
+      owner: youichi-uda
+      name: scoop-sbomhub
+      branch: master
+      token: "{{ .Env.SCOOP_BUCKET_TOKEN }}"
+    directory: bucket
     homepage: https://sbomhub.app
-    description: CLI for SBOMHub - SBOM Management Dashboard
+    description: CLI for SBOMHub - SBOM generation and vulnerability scanning
     license: MIT
+
 
 checksum:
   name_template: 'checksums.txt'
