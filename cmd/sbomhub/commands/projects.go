@@ -87,20 +87,31 @@ func runProjectsList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("プロジェクト一覧の取得に失敗しました: %w", err)
 	}
 
+	out := GetOutputConfig()
+
+	// JSON output
+	if out.IsJSON() {
+		return out.PrintJSON(map[string]interface{}{
+			"projects": projects,
+			"total":    len(projects),
+		})
+	}
+
+	// Human-readable output
 	if len(projects) == 0 {
 		printInfo("プロジェクトがありません")
 		return nil
 	}
 
-	fmt.Println("プロジェクト一覧")
-	fmt.Println("----------------")
+	out.Println("プロジェクト一覧")
+	out.Println("----------------")
 	for _, p := range projects {
-		fmt.Printf("  %s  %s\n", p.ID, p.Name)
+		out.Print("  %s  %s\n", p.ID, p.Name)
 		if p.Description != "" {
-			fmt.Printf("      %s\n", p.Description)
+			out.Print("      %s\n", p.Description)
 		}
 	}
-	fmt.Printf("\n合計: %d プロジェクト\n", len(projects))
+	out.Print("\n合計: %d プロジェクト\n", len(projects))
 
 	return nil
 }
