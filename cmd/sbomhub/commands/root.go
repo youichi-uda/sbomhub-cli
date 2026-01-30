@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -72,10 +71,6 @@ func initConfig() {
 	if apiKey == "" {
 		apiKey = os.Getenv("SBOMHUB_API_KEY")
 	}
-}
-
-func printError(msg string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "Error: "+msg+"\n", args...)
 }
 
 func printSuccess(msg string, args ...interface{}) {

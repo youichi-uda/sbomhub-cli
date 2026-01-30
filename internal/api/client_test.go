@@ -53,7 +53,7 @@ func TestUploadSBOM(t *testing.T) {
 			Low:                1,
 		}
 		w.WriteHeader(http.StatusCreated)
-		json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(result)
 	}))
 	defer server.Close()
 
@@ -82,7 +82,7 @@ func TestUploadSBOM(t *testing.T) {
 func TestUploadSBOMError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte(`{"error": "invalid api key"}`))
+		_, _ = w.Write([]byte(`{"error": "invalid api key"}`))
 	}))
 	defer server.Close()
 
@@ -112,7 +112,7 @@ func TestCheckVulnerabilities(t *testing.T) {
 			Medium:   3,
 			Low:      2,
 		}
-		json.NewEncoder(w).Encode(result)
+		_ = json.NewEncoder(w).Encode(result)
 	}))
 	defer server.Close()
 
@@ -140,15 +140,15 @@ func TestListProjects(t *testing.T) {
 			t.Errorf("Method = %q, want GET", r.Method)
 		}
 
-		if r.URL.Path != "/api/v1/projects" {
-			t.Errorf("Path = %q, want /api/v1/projects", r.URL.Path)
+		if r.URL.Path != "/api/v1/cli/projects" {
+			t.Errorf("Path = %q, want /api/v1/cli/projects", r.URL.Path)
 		}
 
 		projects := []Project{
 			{ID: "1", Name: "Project A", Description: "First project"},
 			{ID: "2", Name: "Project B", Description: "Second project"},
 		}
-		json.NewEncoder(w).Encode(projects)
+		_ = json.NewEncoder(w).Encode(projects)
 	}))
 	defer server.Close()
 
@@ -172,7 +172,7 @@ func TestListProjects(t *testing.T) {
 func TestListProjectsError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte(`{"error": "internal server error"}`))
+		_, _ = w.Write([]byte(`{"error": "internal server error"}`))
 	}))
 	defer server.Close()
 

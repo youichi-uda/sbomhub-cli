@@ -18,11 +18,10 @@ func (s *CdxgenScanner) Available() bool {
 
 func (s *CdxgenScanner) Scan(path string, format string) ([]byte, error) {
 	args := []string{"-o", "-", path}
-	
-	if format == "spdx" {
-		// cdxgen doesn't natively support SPDX, use CycloneDX
-		// TODO: Add conversion if needed
-	}
+
+	// Note: cdxgen doesn't natively support SPDX output.
+	// Format parameter is ignored; CycloneDX is always used.
+	_ = format
 
 	cmd := exec.Command("cdxgen", args...)
 	output, err := cmd.Output()
