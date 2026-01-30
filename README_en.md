@@ -5,9 +5,9 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Go Version](https://img.shields.io/badge/go-1.22+-00ADD8)
 
-SBOMHub用のコマンドラインツール。Syft/Trivy/cdxgen等のSBOM生成ツールをラップし、生成からSBOMHubへのアップロードまでを1コマンドで実行。
+A command-line tool for SBOMHub. Wraps SBOM generation tools like Syft, Trivy, and cdxgen to generate and upload SBOMs to SBOMHub in a single command.
 
-## インストール
+## Installation
 
 ### Homebrew (macOS/Linux)
 
@@ -34,53 +34,53 @@ scoop bucket add sbomhub https://github.com/sbomhub/scoop-bucket
 scoop install sbomhub
 ```
 
-## 使い方
+## Usage
 
-### 初期設定
+### Initial Setup
 
 ```bash
-# ログイン（ブラウザ認証 or API Key入力）
+# Login (browser auth or API key input)
 sbomhub login
 
-# 設定確認
+# Check configuration
 sbomhub config
 ```
 
-### スキャン & アップロード
+### Scan & Upload
 
 ```bash
-# カレントディレクトリをスキャン
+# Scan current directory
 sbomhub scan .
 
-# プロジェクト指定
+# Specify project
 sbomhub scan . --project my-app
 
-# コンテナイメージをスキャン
+# Scan container image
 sbomhub scan ./image.tar
 
-# 詳細オプション
+# Advanced options
 sbomhub scan . \
   --project my-app \
   --tool syft \              # syft / trivy / cdxgen (default: auto-detect)
   --format cyclonedx \       # cyclonedx / spdx (default: cyclonedx)
-  --output sbom.json \       # ローカルにも保存
-  --fail-on critical         # Critical検出時にexit 1（CI用）
+  --output sbom.json \       # Also save locally
+  --fail-on critical         # Exit 1 on Critical findings (for CI)
 ```
 
-### 脆弱性チェック（アップロードせず）
+### Vulnerability Check (without upload)
 
 ```bash
 sbomhub check .
 sbomhub check ./sbom.json
 ```
 
-### プロジェクト管理
+### Project Management
 
 ```bash
 sbomhub projects list
 ```
 
-## CI/CD連携
+## CI/CD Integration
 
 ### GitHub Actions
 
@@ -105,16 +105,16 @@ sbom_scan:
     SBOMHUB_API_KEY: ${SBOMHUB_API_KEY}
 ```
 
-## 設定ファイル
+## Configuration Files
 
-### グローバル設定 (~/.sbomhub/config.yaml)
+### Global Configuration (~/.sbomhub/config.yaml)
 
 ```yaml
 api_url: https://api.sbomhub.app
 api_key: sk_xxxxxxxxxxxxx
 ```
 
-### プロジェクト設定 (.sbomhub.yaml)
+### Project Configuration (.sbomhub.yaml)
 
 ```yaml
 project: my-app
@@ -123,26 +123,26 @@ format: cyclonedx
 fail_on: high
 ```
 
-## 開発
+## Development
 
-### ビルド
+### Build
 
 ```bash
 go build -o sbomhub ./cmd/sbomhub
 ```
 
-### テスト
+### Test
 
 ```bash
 go test ./...
 ```
 
-### リリース
+### Release
 
 ```bash
 goreleaser release --snapshot --clean
 ```
 
-## ライセンス
+## License
 
 MIT License
