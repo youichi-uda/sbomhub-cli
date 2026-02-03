@@ -7,6 +7,11 @@
 
 A command-line tool for SBOMHub. Wraps SBOM generation tools like Syft, Trivy, and cdxgen to generate and upload SBOMs to SBOMHub in a single command.
 
+## Supported Formats
+
+- CycloneDX 1.4, 1.5, 1.6
+- SPDX 2.2, 2.3
+
 ## Installation
 
 ### Homebrew (macOS/Linux)

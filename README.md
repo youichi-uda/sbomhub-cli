@@ -7,6 +7,11 @@
 
 SBOMHub用のコマンドラインツール。Syft/Trivy/cdxgen等のSBOM生成ツールをラップし、生成からSBOMHubへのアップロードまでを1コマンドで実行。
 
+## Supported Formats
+
+- CycloneDX 1.4, 1.5, 1.6
+- SPDX 2.2, 2.3
+
 ## インストール
 
 ### Homebrew (macOS/Linux)
