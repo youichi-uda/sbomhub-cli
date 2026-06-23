@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"time"
 )
@@ -48,46 +47,57 @@ type UploadResult struct {
 	KEVCount int `json:"kev_count"`
 }
 
-// UploadSBOM uploads an SBOM to SBOMHub
+// sbomUploadResponse mirrors the JSON returned by the canonical SBOM upload
+// endpoint (POST /api/v1/projects/:id/sbom). That endpoint returns the saved
+// `Sbom` model (apps/api/internal/model/sbom.go), NOT the legacy CLI-shaped
+// UploadResponse — so we map it here and let UploadSBOM reassemble the
+// surface UploadResult that the CLI commands already consume.
+type sbomUploadResponse struct {
+	ID        string `json:"id"`
+	ProjectID string `json:"project_id"`
+	Format    string `json:"format"`
+	Version   string `json:"version"`
+	CreatedAt string `json:"created_at"`
+}
+
+// UploadSBOM uploads an SBOM to SBOMHub.
+//
+// Wire contract (Trust Rescue 9.3.1 / #9, BREAKING):
+//   - Step 1: resolve `projectName` to a tenant-scoped project ID by calling
+//     POST /api/v1/cli/projects, which has get-or-create semantics
+//     (CLIService.GetOrCreateProject on the server side).
+//   - Step 2: POST the raw SBOM bytes to /api/v1/projects/{id}/sbom — the
+//     canonical endpoint protected by MultiAuth that the web UI also uses.
+//     Content-Type is `application/json` because both CycloneDX-JSON and
+//     SPDX-JSON parse as JSON and the server auto-detects which by the
+//     body's `bomFormat` / `spdxVersion` field.
+//
+// The legacy multipart POST /api/v1/cli/upload still exists with a Sunset of
+// 2026-09-24, but new requests MUST go through the canonical endpoint so the
+// product has one source of truth on auth + tenant scoping.
 func (c *Client) UploadSBOM(projectName string, sbomData []byte, format string) (*UploadResult, error) {
-	// Create multipart form
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-
-	// Add project name
-	if err := writer.WriteField("project_name", projectName); err != nil {
-		return nil, err
-	}
-
-	// Add format
-	if err := writer.WriteField("format", format); err != nil {
-		return nil, err
-	}
-
-	// Add SBOM file
-	part, err := writer.CreateFormFile("sbom", "sbom.json")
+	// Step 1: get-or-create the project so we have a stable :id to POST to.
+	project, projectCreated, err := c.CreateProject(projectName, "")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("プロジェクト解決エラー: %w", err)
 	}
-	if _, err := part.Write(sbomData); err != nil {
-		return nil, err
-	}
-
-	if err := writer.Close(); err != nil {
-		return nil, err
+	if project == nil || project.ID == "" {
+		return nil, fmt.Errorf("APIがプロジェクトIDを返しませんでした")
 	}
 
-	// Create request
-	url := fmt.Sprintf("%s/api/v1/cli/upload", c.baseURL)
-	req, err := http.NewRequest("POST", url, &buf)
+	// Step 2: POST raw body to the canonical SBOM upload endpoint.
+	url := fmt.Sprintf("%s/api/v1/projects/%s/sbom", c.baseURL, project.ID)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(sbomData))
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	// Send raw JSON; the server reads body via io.ReadAll and detects
+	// CycloneDX vs SPDX from content, so the exact JSON media type is
+	// informational rather than dispatch-driving.
+	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 
-	// Send request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("リクエスト送信エラー: %w", err)
@@ -100,17 +110,37 @@ func (c *Client) UploadSBOM(projectName string, sbomData []byte, format string) 
 		return nil, fmt.Errorf("APIエラー (%d): %s", resp.StatusCode, string(body))
 	}
 
-	var result UploadResult
-	if err := json.Unmarshal(body, &result); err != nil {
+	var sbomResp sbomUploadResponse
+	if err := json.Unmarshal(body, &sbomResp); err != nil {
 		return nil, fmt.Errorf("レスポンス解析エラー: %w", err)
 	}
 
-	// Generate URL if not provided
+	// The canonical endpoint does not return component or vulnerability
+	// counts (vulnerability scans run asynchronously in the background after
+	// upload). Counts displayed by the CLI come from local counting of the
+	// SBOM file (scan.go computes them before upload), so leaving them at
+	// zero here is the honest representation of what the server told us.
+	result := &UploadResult{
+		Success:        true,
+		ProjectID:      sbomResp.ProjectID,
+		ProjectName:    project.Name,
+		ProjectCreated: projectCreated,
+		SBOMID:         sbomResp.ID,
+		Format:         sbomResp.Format,
+	}
+
+	// Best-effort: pick up the web URL on the same host as the API. If the
+	// API and web host are split, the operator is expected to set this via
+	// configuration in a follow-up.
 	if result.URL == "" && result.ProjectID != "" {
 		result.URL = fmt.Sprintf("%s/projects/%s", c.baseURL, result.ProjectID)
 	}
 
-	return &result, nil
+	// `format` is accepted for backwards compatibility with callers that pass
+	// e.g. "cyclonedx", but the server now owns format detection.
+	_ = format
+
+	return result, nil
 }
 
 // CheckResult represents the result of a vulnerability check

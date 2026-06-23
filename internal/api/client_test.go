@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -23,42 +24,77 @@ func TestNewClient(t *testing.T) {
 	}
 }
 
+// TestUploadSBOM exercises the new two-step upload contract introduced by
+// Trust Rescue 9.3.1 (#9):
+//   1. POST /api/v1/cli/projects with the project name → project ID (the
+//      `/cli/projects` endpoint still has get-or-create semantics and is
+//      kept for one release of overlap; it is NOT under the deprecation
+//      banner that /cli/upload carries).
+//   2. POST /api/v1/projects/{id}/sbom with the raw SBOM JSON body, gated
+//      by the unified MultiAuth Bearer auth on the server side.
 func TestUploadSBOM(t *testing.T) {
-	// Create test server
+	const projectID = "00000000-0000-0000-0000-000000000abc"
+	const sbomID = "00000000-0000-0000-0000-000000000def"
+
+	var (
+		createProjectHits int
+		uploadHits        int
+	)
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify request
-		if r.Method != "POST" {
-			t.Errorf("Method = %q, want POST", r.Method)
-		}
-
-		if r.URL.Path != "/api/v1/cli/upload" {
-			t.Errorf("Path = %q, want /api/v1/cli/upload", r.URL.Path)
-		}
-
-		// Verify auth header
 		auth := r.Header.Get("Authorization")
 		if auth != "Bearer test-key" {
 			t.Errorf("Authorization = %q, want Bearer test-key", auth)
 		}
 
-		// Send response
-		result := UploadResult{
-			ProjectID:          "proj-123",
-			SBOMID:             "sbom-456",
-			URL:                "https://sbomhub.app/projects/proj-123",
-			VulnerabilityCount: 5,
-			Critical:           1,
-			High:               2,
-			Medium:             1,
-			Low:                1,
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/api/v1/cli/projects":
+			createProjectHits++
+			resp := CreateProjectResponse{
+				Project: &Project{ID: projectID, Name: "my-project"},
+				Created: true,
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(resp)
+
+		case r.Method == "POST" && r.URL.Path == "/api/v1/projects/"+projectID+"/sbom":
+			uploadHits++
+
+			// Verify the body is RAW JSON (not multipart) — this is the
+			// load-bearing change of the contract.
+			ct := r.Header.Get("Content-Type")
+			if ct != "application/json" {
+				t.Errorf("Content-Type = %q, want application/json (raw body, not multipart)", ct)
+			}
+			body, _ := io.ReadAll(r.Body)
+			var probe map[string]interface{}
+			if err := json.Unmarshal(body, &probe); err != nil {
+				t.Errorf("server received non-JSON body: %v (got %q)", err, string(body))
+			}
+			if probe["bomFormat"] != "CycloneDX" {
+				t.Errorf("server lost SBOM body: got %v", probe)
+			}
+
+			// Mirror the actual server response shape: the canonical
+			// endpoint returns the saved Sbom model (id, project_id,
+			// format, version, created_at) — NOT the legacy CLI shape.
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":         sbomID,
+				"project_id": projectID,
+				"format":     "cyclonedx",
+				"version":    "1.4",
+				"created_at": "2026-06-24T00:00:00Z",
+			})
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
 		}
-		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(result)
 	}))
 	defer server.Close()
 
 	client := NewClient(server.URL, "test-key")
-
 	sbomData := []byte(`{"bomFormat": "CycloneDX", "specVersion": "1.4"}`)
 	result, err := client.UploadSBOM("my-project", sbomData, "cyclonedx")
 
@@ -66,23 +102,47 @@ func TestUploadSBOM(t *testing.T) {
 		t.Fatalf("UploadSBOM() error = %v", err)
 	}
 
-	if result.ProjectID != "proj-123" {
-		t.Errorf("ProjectID = %q, want proj-123", result.ProjectID)
+	if createProjectHits != 1 {
+		t.Errorf("POST /cli/projects called %d times, want 1", createProjectHits)
 	}
-
-	if result.VulnerabilityCount != 5 {
-		t.Errorf("VulnerabilityCount = %d, want 5", result.VulnerabilityCount)
+	if uploadHits != 1 {
+		t.Errorf("POST /projects/{id}/sbom called %d times, want 1", uploadHits)
 	}
-
-	if result.Critical != 1 {
-		t.Errorf("Critical = %d, want 1", result.Critical)
+	if result.ProjectID != projectID {
+		t.Errorf("ProjectID = %q, want %q", result.ProjectID, projectID)
+	}
+	if result.SBOMID != sbomID {
+		t.Errorf("SBOMID = %q, want %q", result.SBOMID, sbomID)
+	}
+	if result.Format != "cyclonedx" {
+		t.Errorf("Format = %q, want cyclonedx", result.Format)
+	}
+	if !result.ProjectCreated {
+		t.Error("ProjectCreated should be true when /cli/projects returned created=true")
 	}
 }
 
+// TestUploadSBOMError verifies the upload step's error path. The canonical
+// endpoint should fail loudly on 401 with the server's error body surfaced
+// so the operator can debug auth / tenant misconfiguration.
 func TestUploadSBOMError(t *testing.T) {
+	const projectID = "00000000-0000-0000-0000-000000000abc"
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error": "invalid api key"}`))
+		switch {
+		case r.URL.Path == "/api/v1/cli/projects":
+			resp := CreateProjectResponse{
+				Project: &Project{ID: projectID, Name: "my-project"},
+				Created: false,
+			}
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(resp)
+		case r.URL.Path == "/api/v1/projects/"+projectID+"/sbom":
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error": "invalid api key"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
 	}))
 	defer server.Close()
 
@@ -91,7 +151,7 @@ func TestUploadSBOMError(t *testing.T) {
 	_, err := client.UploadSBOM("my-project", []byte(`{}`), "cyclonedx")
 
 	if err == nil {
-		t.Error("UploadSBOM() expected error for 401 response")
+		t.Error("UploadSBOM() expected error for 401 response from canonical endpoint")
 	}
 }
 
