@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Go Version](https://img.shields.io/badge/go-1.22+-00ADD8)
 
-SBOMHub用のコマンドラインツール。Syft/Trivy/cdxgen等のSBOM生成ツールをラップし、生成からSBOMHubへのアップロードまでを1コマンドで実行。
+SBOMHub CLI: SBOM 生成からアップロード、 将来は CRA 提出向け VEX エクスポート / CRA レポート下書きまで、 1 コマンドで CRA 2026/9 期限対応を進めるためのコマンドラインツール。 Syft/Trivy/cdxgen 等の SBOM 生成ツールをラップし、 self-host 版 SBOMHub と組み合わせて利用する。
 
 ## Supported Formats
 
@@ -44,8 +44,11 @@ scoop install sbomhub
 ### 初期設定
 
 ```bash
-# ログイン（ブラウザ認証 or API Key入力）
-sbomhub login
+# 推奨: self-host SBOMHub に接続
+sbomhub login --url http://localhost:8080 --api-key sbh_xxxxx
+
+# SaaS 版 (sbomhub.app / api.sbomhub.app) は 2026-06 にサンセット済。
+# 以降は self-host (Docker Compose) を前提とする。
 
 # 設定確認
 sbomhub config
@@ -85,6 +88,16 @@ sbomhub check ./sbom.json
 sbomhub projects list
 ```
 
+## Roadmap (M1 以降)
+
+CRA 2026/9 期限対応に向け、 以下のコマンドを M1〜M2 で順次実装予定。 いずれも AI 下書き + 人間承認モデル (自動承認なし)。
+
+- `sbomhub triage` — Critical/High 脆弱性のインタラクティブ triage、 AI VEX 下書きへのハンドオフ
+- `sbomhub vex export` — 承認済 VEX statement を CycloneDX VEX / CSAF 形式でエクスポート (CRA 提出向け)
+- `sbomhub cra draft` — SBOM + VEX + 監査ログから CRA 脆弱性報告書ドラフトを生成
+
+詳細: [`sbomhub-internal/planning/PRODUCT_REBOOT_PLAN.md`](https://github.com/youichi-uda/sbomhub) (内部リンク、 公開時は M1 で external roadmap doc を整備)
+
 ## CI/CD連携
 
 ### GitHub Actions
@@ -95,6 +108,7 @@ sbomhub projects list
 
 - name: Scan and upload SBOM
   env:
+    SBOMHUB_API_URL: ${{ secrets.SBOMHUB_API_URL }}  # 例: https://sbomhub.internal.example.com
     SBOMHUB_API_KEY: ${{ secrets.SBOMHUB_API_KEY }}
   run: sbomhub scan . --project ${{ github.repository }} --fail-on critical
 ```
@@ -107,6 +121,7 @@ sbom_scan:
     - curl -fsSL https://sbomhub.app/install.sh | sh
     - sbomhub scan . --project ${CI_PROJECT_NAME} --fail-on critical
   variables:
+    SBOMHUB_API_URL: ${SBOMHUB_API_URL}  # 例: https://sbomhub.internal.example.com
     SBOMHUB_API_KEY: ${SBOMHUB_API_KEY}
 ```
 
@@ -115,8 +130,9 @@ sbom_scan:
 ### グローバル設定 (~/.sbomhub/config.yaml)
 
 ```yaml
-api_url: https://api.sbomhub.app
-api_key: sk_xxxxxxxxxxxxx
+# self-host SBOMHub (Docker Compose) のデフォルト
+api_url: http://localhost:8080
+api_key: sbh_xxxxxxxxxxxxx
 ```
 
 ### プロジェクト設定 (.sbomhub.yaml)
