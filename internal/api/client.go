@@ -44,6 +44,8 @@ type UploadResult struct {
 	High               int `json:"high"`
 	Medium             int `json:"medium"`
 	Low                int `json:"low"`
+	// KEV (Known Exploited Vulnerabilities) count
+	KEVCount int `json:"kev_count"`
 }
 
 // UploadSBOM uploads an SBOM to SBOMHub

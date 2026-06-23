@@ -45,7 +45,7 @@ func init() {
 	scanCmd.Flags().StringVarP(&scanTool, "tool", "t", "", "使用するツール (syft/trivy/cdxgen, デフォルト: 自動検出)")
 	scanCmd.Flags().StringVarP(&scanFormat, "format", "f", "cyclonedx", "出力フォーマット (cyclonedx/spdx)")
 	scanCmd.Flags().StringVarP(&scanOutput, "output", "o", "", "ローカルにも保存するファイルパス")
-	scanCmd.Flags().StringVar(&scanFailOn, "fail-on", "", "指定した重大度以上の脆弱性でexit 1 (critical/high/medium/low)")
+	scanCmd.Flags().StringVar(&scanFailOn, "fail-on", "", "指定した重大度以上の脆弱性でexit 1 (critical/high/medium/low/kev)")
 	scanCmd.Flags().BoolVar(&scanDryRun, "dry-run", false, "アップロードせずSBOM生成のみ")
 	scanCmd.Flags().BoolVar(&scanNotify, "notify", false, "脆弱性検出時に通知")
 }
@@ -198,6 +198,9 @@ func countComponents(sbomData []byte) int {
 
 func formatVulnSummary(result *api.UploadResult) string {
 	parts := []string{}
+	if result.KEVCount > 0 {
+		parts = append(parts, fmt.Sprintf("%d KEV 🔥", result.KEVCount))
+	}
 	if result.Critical > 0 {
 		parts = append(parts, fmt.Sprintf("%d Critical", result.Critical))
 	}
@@ -215,6 +218,8 @@ func formatVulnSummary(result *api.UploadResult) string {
 
 func shouldFail(result *api.UploadResult, failOn string) bool {
 	switch failOn {
+	case "kev":
+		return result.KEVCount > 0
 	case "critical":
 		return result.Critical > 0
 	case "high":
