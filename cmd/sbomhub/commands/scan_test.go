@@ -539,6 +539,104 @@ func TestFormatScanVulnSummary_ServerTotalZeroButBucketsPopulated(t *testing.T) 
 	}
 }
 
+// TestFormatScanVulnSummary_NilSummaryDoesNotShowClean verifies the
+// Codex R15 P2 fix: when waitForScanCompletion returns summary=nil
+// (permanent 4xx fast-fail before any successful poll, ctx timeout
+// before any snapshot landed, or --wait-for-scan=false skipping the
+// poll loop entirely) and the upload response carries no usable
+// counts, the formatter must NOT render "なし ✅".
+//
+// Before the fix, printResultBox → formatScanVulnSummary fell through
+// to result.* zeros and rendered "なし ✅" directly above whatever
+// warning runScan printed afterwards ("polling aborted: HTTP 401 …" or
+// "scan timed out, snapshot unavailable"). Humans reading CI logs saw
+// contradictory output; automation that grep'd for "なし ✅" silently
+// concluded the scan was vulnerability-free even when it had never
+// finished. We now emit an explicit "未完了" marker so both audiences
+// land on the same honest signal.
+//
+// The legacy `result.*` fallback path (future server populates
+// vulnerability counts on the upload response itself) is preserved —
+// the marker only fires when there is truly no signal anywhere.
+func TestFormatScanVulnSummary_NilSummaryDoesNotShowClean(t *testing.T) {
+	cases := []struct {
+		name    string
+		result  *api.UploadResult
+		summary *api.VulnerabilitySummary
+		wantHas string
+		wantNot string
+	}{
+		{
+			// Most pathological case: polling fast-failed on a permanent
+			// 4xx and printResultBox got summary=nil with no upload-time
+			// counts to fall back to (canonical upload endpoint always
+			// returns zeros today).
+			name:    "summary nil + result nil renders 未完了, not なし",
+			result:  nil,
+			summary: nil,
+			wantHas: "未完了",
+			wantNot: "なし",
+		},
+		{
+			// Today's reality: upload endpoint always returns the zero-
+			// counts UploadResult, polling failed. Pre-fix this rendered
+			// "なし ✅" — that's exactly the silent-clean signal we are
+			// killing.
+			name:    "summary nil + result with all-zero counts renders 未完了, not なし",
+			result:  &api.UploadResult{},
+			summary: nil,
+			wantHas: "未完了",
+			wantNot: "なし",
+		},
+		{
+			// Same shape, but exercised with a fully-populated zero
+			// UploadResult including KEVCount/Component fields — the
+			// formatter must still detect "no signal" and emit 未完了.
+			name:    "summary nil + result populated zeros renders 未完了, not なし",
+			result:  &api.UploadResult{Success: true, ProjectID: "p", SBOMID: "s", ComponentCount: 17},
+			summary: nil,
+			wantHas: "未完了",
+			wantNot: "なし",
+		},
+		{
+			// Future-server fallback preservation: if a hypothetical
+			// upload endpoint DID populate vulnerability counts and
+			// polling failed, honour those counts rather than hiding
+			// them behind 未完了. The "未完了" marker is for the
+			// genuinely-no-signal case only.
+			name:    "summary nil + result with real counts surfaces counts",
+			result:  &api.UploadResult{Critical: 1, High: 2, KEVCount: 1},
+			summary: nil,
+			wantHas: "1 Critical",
+			wantNot: "未完了",
+		},
+		{
+			// Regression guard for the existing happy path: when
+			// polling succeeded and reported all-zero buckets, the
+			// formatter must STILL emit "なし ✅" (that's a legitimate
+			// clean scan, not an unknown state). Without this case a
+			// future "always show 未完了 when total==0" refactor would
+			// pass silently.
+			name:    "summary non-nil with all zeros still renders なし (legit clean scan)",
+			result:  nil,
+			summary: &api.VulnerabilitySummary{},
+			wantHas: "なし",
+			wantNot: "未完了",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatScanVulnSummary(tc.result, tc.summary)
+			if tc.wantHas != "" && !strings.Contains(got, tc.wantHas) {
+				t.Errorf("formatScanVulnSummary() = %q, want substring %q", got, tc.wantHas)
+			}
+			if tc.wantNot != "" && strings.Contains(got, tc.wantNot) {
+				t.Errorf("formatScanVulnSummary() = %q, must not contain %q (Codex R15 P2 regression — nil summary slipped through to clean signal)", got, tc.wantNot)
+			}
+		})
+	}
+}
+
 // TestRunScan_FailOnRequiresWaitForScan verifies the Codex R3 fix: when
 // `--fail-on` is set, passing `--wait-for-scan=false` must be rejected at
 // startup with a usage error. Before the fix, the combination silently

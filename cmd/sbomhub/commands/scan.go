@@ -606,13 +606,36 @@ func countComponents(sbomData []byte) int {
 // older API build that doesn't compute total client-side). Trusting the
 // sum we compute locally also matches the semantics of the buckets we
 // actually display below.
+//
+// Codex R15 fix (P2): when polling returns summary=nil (permanent API
+// error before any successful poll, ctx timeout before any snapshot, or
+// --wait-for-scan=false skipping the loop entirely) AND the upload
+// response carries no usable counts, render an explicit "スキャン未完了"
+// marker instead of falling through to the zero-bucket "なし ✅" path.
+// The previous behaviour mis-claimed a clean result next to whatever
+// warning the caller printed below the box — confusing humans reading
+// CI logs and letting automation conclude the scan was vulnerability-
+// free. The legacy `result.*` fallback is preserved when those fields
+// are non-zero (future server versions that populate counts on upload),
+// so we only emit the "未完了" marker when there is truly no signal.
 func formatScanVulnSummary(result *api.UploadResult, summary *api.VulnerabilitySummary) string {
 	c, h, m, l, u, kev := 0, 0, 0, 0, 0, 0
-	if summary != nil {
+	switch {
+	case summary != nil:
 		c, h, m, l, u, kev = summary.Critical, summary.High, summary.Medium, summary.Low, summary.Unknown, summary.KEV
-	} else if result != nil {
-		// UploadResult has no Unknown field today; leave u=0 in the fallback.
+	case result != nil && result.Critical+result.High+result.Medium+result.Low+result.KEVCount > 0:
+		// Future-server fallback: upload endpoint returned non-zero
+		// counts. Honour them since we have no scan-status snapshot to
+		// use instead. UploadResult has no Unknown field today; leave
+		// u=0 in the fallback.
 		c, h, m, l, kev = result.Critical, result.High, result.Medium, result.Low, result.KEVCount
+	default:
+		// summary is nil AND the upload result carries no usable counts.
+		// Polling either failed (timeout w/o snapshot, permanent 4xx) or
+		// was skipped (--wait-for-scan=false). Either way, claiming
+		// "なし ✅" would silently misrepresent an unknown state and
+		// directly contradict the warning printed alongside this box.
+		return "スキャン未完了 ⚠️ (詳細は警告参照)"
 	}
 
 	// Compute total from the buckets we render rather than trusting the
