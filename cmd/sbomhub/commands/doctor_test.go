@@ -348,6 +348,84 @@ func TestDoctor_EnvOnlyNoConfigFile(t *testing.T) {
 	}
 }
 
+// TestDoctor_HonorsCustomConfigFile covers Codex R11: when the operator runs
+// `sbomhub --config /custom/path/config.yaml doctor`, the doctor must inspect
+// that file, not the default ~/.sbomhub/config.yaml. Before the fix, cfgFile
+// was a no-op for doctor and the credential / file-presence checks read the
+// wrong file, producing misleading [FAIL]s in multi-env / CI shapes.
+func TestDoctor_HonorsCustomConfigFile(t *testing.T) {
+	// Custom directory that has nothing to do with $HOME/.sbomhub.
+	customDir := t.TempDir()
+	customPath := filepath.Join(customDir, "config.yaml")
+	const customKey = "sbh_customcfgtoken1234"
+	const customURL = "https://example.invalid"
+	if err := os.WriteFile(customPath, []byte(
+		"api_url: "+customURL+"\n"+
+			"api_key: "+customKey+"\n",
+	), 0o600); err != nil {
+		t.Fatalf("write custom config: %v", err)
+	}
+
+	// Mutate the global cfgFile bound to --config (mirrors what cobra does
+	// when the user passes --config on the command line) and restore it for
+	// subsequent tests.
+	prevCfgFile := cfgFile
+	cfgFile = customPath
+	t.Cleanup(func() { cfgFile = prevCfgFile })
+
+	resetCredentialGlobals(t)
+	clearCredentialEnv(t)
+
+	// Wiring: doctorConfigDir must derive the directory from --config so
+	// downstream resolveCredentials / file inspection read the right file.
+	if got := doctorConfigDir(); got != customDir {
+		t.Errorf("doctorConfigDir() = %q, want %q (filepath.Dir(cfgFile))", got, customDir)
+	}
+
+	// End-to-end: doctorChecks with the cfgFile-derived dir should observe
+	// the custom file and report config-sourced credentials, NOT the default
+	// $HOME/.sbomhub/config.yaml (which we never wrote to in this test).
+	results := doctorChecks(doctorConfigDir(), newTestHTTPClient(), false, false)
+
+	cf := findResult(results, "config-file")
+	if cf == nil || cf.status != doctorOK {
+		t.Errorf("expected config-file OK at custom path, got %+v", cf)
+	}
+	if cf != nil && !strings.Contains(cf.message, customPath) {
+		t.Errorf("expected config-file message to mention custom path %q, got: %s", customPath, cf.message)
+	}
+
+	ak := findResult(results, "api-key")
+	if ak == nil || ak.status != doctorOK {
+		t.Errorf("expected api-key OK from custom config, got %+v", ak)
+	} else if !strings.Contains(ak.message, "source: config") {
+		t.Errorf("expected api-key source=config, got: %s", ak.message)
+	}
+
+	au := findResult(results, "api-url")
+	if au == nil || au.status != doctorOK {
+		t.Errorf("expected api-url OK from custom config, got %+v", au)
+	} else if !strings.Contains(au.message, "source: config") {
+		t.Errorf("expected api-url source=config, got: %s", au.message)
+	}
+	if au != nil && !strings.Contains(au.message, customURL) {
+		t.Errorf("expected api-url message to contain custom URL %q, got: %s", customURL, au.message)
+	}
+}
+
+// TestDoctor_ConfigDirFallback locks in the default behaviour: when --config
+// is NOT supplied, doctorConfigDir must return defaultConfigDir() so the
+// long-standing $HOME/.sbomhub path keeps working.
+func TestDoctor_ConfigDirFallback(t *testing.T) {
+	prevCfgFile := cfgFile
+	cfgFile = ""
+	t.Cleanup(func() { cfgFile = prevCfgFile })
+
+	if got, want := doctorConfigDir(), defaultConfigDir(); got != want {
+		t.Errorf("doctorConfigDir() with no --config = %q, want defaultConfigDir() = %q", got, want)
+	}
+}
+
 // TestDoctor_FlagOnlyNoConfigFile covers the ad-hoc shape: no config file, no
 // env, the operator invoked `sbomhub doctor --api-url=... --api-key=...`. The
 // flag-set globals are mutated directly here; resetCredentialGlobals restores

@@ -101,12 +101,35 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 	// credentials apart from env / config / default fall-throughs.
 	return runDoctorWith(
 		cmd.OutOrStdout(),
-		defaultConfigDir(),
+		doctorConfigDir(),
 		client,
 		verboseFlag,
 		cmd.Flags().Changed("api-key"),
 		cmd.Flags().Changed("api-url"),
 	)
+}
+
+// doctorConfigDir picks the directory whose config.yaml should be inspected.
+//
+// Codex R11 fix: honour the global --config flag (root.go: cfgFile) so
+// `sbomhub --config /custom/path/config.yaml doctor` diagnoses the file the
+// operator actually intends to use, not ~/.sbomhub/config.yaml. Without this
+// the doctor silently reports against a different file from the one
+// indicated by --config, producing misleading [FAIL]s in multi-env / CI
+// shapes that point --config at a per-env file.
+//
+// Caveat: config.LoadOrDefault only knows how to read "<dir>/config.yaml",
+// so a non-canonical filename (e.g. --config /tmp/my.yaml) still resolves
+// to /tmp/config.yaml on the loader side — same behaviour as today's
+// scan / projects / login commands, which ignore --config entirely. Wider
+// --config support (arbitrary filename, all commands) is out of scope for
+// this round and tracked separately; the DO NOT TOUCH list in
+// codex-r11 brief excludes root.go / projects.go / scan.go / login.go.
+func doctorConfigDir() string {
+	if cfgFile != "" {
+		return filepath.Dir(cfgFile)
+	}
+	return defaultConfigDir()
 }
 
 // defaultConfigDir mirrors the lookup used by loadConfigAndClient in
