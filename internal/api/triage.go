@@ -138,6 +138,15 @@ type TriageRunResult struct {
 	Clamped    bool            `json:"clamped"`
 	Threshold  float64         `json:"threshold"`
 	AIDisabled bool            `json:"ai_disabled,omitempty"`
+
+	// Error is an optional top-level error string. A well-behaved
+	// server NEVER emits this on a 2xx response — when present it is
+	// the F23 protocol-violation signal: the handler returned HTTP 200
+	// but logically failed, almost always because the upstream LLM
+	// provider raised an exception that the handler papered over. The
+	// CLI promotes this to a transient *TriageError in RunTriage so
+	// the exit-code path can flag the failure (M1 Codex review #F23).
+	Error string `json:"error,omitempty"`
 }
 
 // vexDraftListResponse mirrors handler.vexDraftListResponse.
@@ -192,6 +201,16 @@ type TriageError struct {
 	Message    string // top-level "error" field
 	Reason     string // "reason" field (only populated for 503 DisabledError)
 	Raw        string // original body, preserved for debug logging
+
+	// ProtocolError flags a synthesised TriageError raised for a 2xx
+	// response that violated the success contract — server returned
+	// HTTP 200/201 but the body had no draft (and was not flagged
+	// ai_disabled), or carried an explicit "error" field. Callers
+	// inspect this via IsTransient (always true when set) so the CLI
+	// triage loop surfaces such bugs through the exit-4 transient path
+	// instead of silently bucketing the vuln as `skipped` (M1 Codex
+	// review #F23).
+	ProtocolError bool
 }
 
 func (e *TriageError) Error() string {
@@ -290,14 +309,23 @@ func (e *TriageError) IsPermanent() bool {
 // as "skipped" used to make CI green on 403/429 storms.
 //
 // M1 Codex review #F22: a 503 with no recognised AI-disabled marker
-// is now classified transient. Previously this helper returned false
+// is now classified transient. Previously the helper returned false
 // for every 503 because IsAIDisabled was assumed to swallow them all;
 // after the strict IsAIDisabled check, real upstream outages (pgx
 // connection refused, gateway timeout, server overload) reach this
 // helper and must surface as exit 4.
+//
+// M1 Codex review #F23: ProtocolError signals a synthesised TriageError
+// for a 2xx response that violated the success contract (missing draft
+// or error field present). The operator's correct response is the same
+// as for any transient — retry, possibly after a server redeploy — so
+// it joins the transient bucket here.
 func (e *TriageError) IsTransient() bool {
 	if e == nil {
 		return false
+	}
+	if e.ProtocolError {
+		return true
 	}
 	if e.StatusCode == http.StatusTooManyRequests {
 		return true
@@ -377,6 +405,42 @@ func (c *Client) RunTriage(ctx context.Context, projectID string, req TriageRunR
 	var out TriageRunResult
 	if err := json.Unmarshal(respBody, &out); err != nil {
 		return nil, fmt.Errorf("triage レスポンス解析エラー: %w", err)
+	}
+
+	// M1 Codex review #F23: success contract validation. A 2xx response
+	// must carry (a) a top-level error == "" AND (b) at least one
+	// persisted draft. Before this guard, a server that returned 200
+	// with {"error":"..."} or {"clamped":false,"threshold":0.7} (no
+	// draft) was decoded as a zero-valued success and the CLI bucketed
+	// the vuln as `skipped` → exit 0 with zero persisted drafts on a
+	// silent server protocol bug. ProtocolError=true routes the error
+	// through IsTransient → exit code 4 so CI can retry rather than
+	// silently green-light an empty run.
+	if out.Error != "" {
+		return nil, &TriageError{
+			StatusCode:    resp.StatusCode,
+			URL:           endpoint,
+			Method:        http.MethodPost,
+			Message:       out.Error,
+			Raw:           string(respBody),
+			ProtocolError: true,
+		}
+	}
+	if out.Draft == nil && len(out.Drafts) == 0 {
+		var msg string
+		if out.AIDisabled {
+			msg = "triage success response carried ai_disabled=true but no draft persisted (server bug — F4 contract violation)"
+		} else {
+			msg = "triage success response missing draft (server protocol error — F23 contract violation)"
+		}
+		return nil, &TriageError{
+			StatusCode:    resp.StatusCode,
+			URL:           endpoint,
+			Method:        http.MethodPost,
+			Message:       msg,
+			Raw:           string(respBody),
+			ProtocolError: true,
+		}
 	}
 	return &out, nil
 }

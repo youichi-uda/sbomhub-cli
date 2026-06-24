@@ -373,9 +373,16 @@ func runTriageLoop(ctx context.Context, client *api.Client, opts triageOpts) err
 		renderDraft(opts.stdout, runResp)
 
 		if runResp == nil || runResp.Draft == nil {
-			// Defensive: the server returned 2xx but with no draft.
-			// Skip and continue rather than panicking on a nil deref.
-			fmt.Fprintln(opts.stderr, "  サーバから draft が返ってきませんでした (skip)")
+			// Defensive belt-and-braces: M1 Codex review #F23 added a
+			// contract guard in api.Client.RunTriage that turns a 2xx
+			// with no draft into a *TriageError (ProtocolError=true),
+			// so this branch should be unreachable. If a future refactor
+			// drops the guard, surface the regression as a transient
+			// protocol failure (exit 4) instead of silently bucketing
+			// the vuln as `skipped` — the previous behaviour let CI
+			// green-light a run with zero persisted drafts.
+			fmt.Fprintln(opts.stderr, "  サーバから draft が返ってきませんでした (protocol error — counted as transient failure)")
+			transientFailures++
 			skipped++
 			continue
 		}

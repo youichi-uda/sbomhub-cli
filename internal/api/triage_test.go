@@ -284,6 +284,107 @@ func TestTriageError_IsAIDisabled_503KnownReasonMatch_F22(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// F23 regression — a 2xx response with a malformed body (error field, or
+// no draft) must surface as a TriageError so the CLI's exit-code path
+// can flag the problem instead of silently incrementing `skipped` and
+// exiting 0.
+// ----------------------------------------------------------------------------
+
+// TestRunTriage_2xxEmptyDraft_ReturnsError_F23 — a 200/201 response
+// with neither `draft` nor `drafts` is a server protocol violation.
+// Before this fix RunTriage decoded it as a zero-valued success and
+// the CLI bucketed the vuln as `skipped` → exit 0.
+func TestRunTriage_2xxEmptyDraft_ReturnsError_F23(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+	}{
+		{"200 empty draft", http.StatusOK},
+		{"201 empty draft", http.StatusCreated},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"clamped":   false,
+					"threshold": 0.7,
+				})
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "k")
+			res, err := client.RunTriage(context.Background(), "p", TriageRunRequest{VulnerabilityID: "v", CVEID: "c"})
+			if err == nil {
+				t.Fatalf("F23: expected error for 2xx response with no draft, got result %+v", res)
+			}
+			var te *TriageError
+			if !errors.As(err, &te) {
+				t.Fatalf("F23: err = %v (%T), want *TriageError", err, err)
+			}
+			if !te.IsTransient() {
+				t.Errorf("F23: protocol error must be classified transient (server bug, retry recommended)")
+			}
+		})
+	}
+}
+
+// TestRunTriage_2xxWithErrorField_ReturnsError_F23 — a 200 response
+// carrying an "error" field in the body is a server protocol violation;
+// it must surface as a TriageError so the CLI does not bucket the vuln
+// as skipped + exit 0.
+func TestRunTriage_2xxWithErrorField_ReturnsError_F23(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"error":"upstream LLM provider failure"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "k")
+	res, err := client.RunTriage(context.Background(), "p", TriageRunRequest{VulnerabilityID: "v", CVEID: "c"})
+	if err == nil {
+		t.Fatalf("F23: expected error for 2xx response with error field, got result %+v", res)
+	}
+	var te *TriageError
+	if !errors.As(err, &te) {
+		t.Fatalf("F23: err = %v (%T), want *TriageError", err, err)
+	}
+	if !strings.Contains(te.Message, "upstream LLM provider failure") {
+		t.Errorf("F23: error message must round-trip server error field, got %q", te.Message)
+	}
+	if !te.IsTransient() {
+		t.Errorf("F23: 2xx with error field must classify transient (server protocol bug, retry recommended)")
+	}
+}
+
+// TestRunTriage_2xxAIDisabledWithDraft_NoError_F23 — the legitimate
+// AI-disabled success path (2xx + ai_disabled=true + persisted draft)
+// must remain a clean return. This is the canary that catches an
+// over-aggressive F23 fix that breaks the F4 fast path.
+func TestRunTriage_2xxAIDisabledWithDraft_NoError_F23(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"draft": map[string]interface{}{
+				"id":    "d1",
+				"state": "under_investigation",
+			},
+			"ai_disabled": true,
+			"threshold":   0.7,
+		})
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	res, err := client.RunTriage(context.Background(), "p", TriageRunRequest{VulnerabilityID: "v", CVEID: "c"})
+	if err != nil {
+		t.Fatalf("F23: AI-disabled with persisted draft must remain a clean success, got %v", err)
+	}
+	if res == nil || !res.AIDisabled || res.Draft == nil {
+		t.Errorf("F23: expected ai_disabled=true with non-nil draft, got %+v", res)
+	}
+}
+
 // TestListVulnerabilities_BareArray verifies that the server's bare
 // JSON array shape decodes correctly (the canonical handler returns
 // `[...]` not `{"vulnerabilities":[...]}`).

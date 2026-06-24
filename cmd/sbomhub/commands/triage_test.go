@@ -1081,6 +1081,90 @@ func TestTriageLoop_503GatewayError_ExitCode4_F22(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// F23 regression — a malformed 2xx response (no draft, or error field
+// present) must not be silently bucketed as `skipped` + exit 0.
+// ----------------------------------------------------------------------------
+
+// TestTriageLoop_AllMalformed2xx_ExitCode4_F23 — every triage/run
+// returns 2xx with NO draft and NO ai_disabled flag. The legacy code
+// treated this as a successful skip and exited 0 with zero drafts
+// persisted; the F23 fix must surface it as a transient protocol
+// failure → exit 4.
+func TestTriageLoop_AllMalformed2xx_ExitCode4_F23(t *testing.T) {
+	tf := newTriageFakeServer(t, threeVulns())
+	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {
+		// 200 OK but body is empty of drafts and not flagged as
+		// ai_disabled — pure server protocol violation.
+		return http.StatusOK, map[string]interface{}{
+			"clamped":   false,
+			"threshold": 0.7,
+		}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+
+	stdin := strings.NewReader("")
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      true,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               stdin,
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+	exitErr, ok := err.(*triageExitError)
+	if !ok {
+		t.Fatalf("F23: err = %v (%T), want *triageExitError (malformed 2xx must surface)", err, err)
+	}
+	if exitErr.ExitCode() != 4 {
+		t.Errorf("F23: ExitCode = %d, want 4 (malformed 2xx = server protocol error, retry recommended)", exitErr.ExitCode())
+	}
+	// No decisions persisted because every triage/run violated the
+	// contract.
+	if got := atomic.LoadInt32(&tf.decisionHits); got != 0 {
+		t.Errorf("F23: decisionHits = %d, want 0 (no draft → no decision PUT)", got)
+	}
+}
+
+// TestTriageLoop_2xxWithErrorField_ExitCode4_F23 — every triage/run
+// returns 200 + {"error":"..."} (server-side LLM provider blew up but
+// the handler accidentally returned 200). Must surface as transient.
+func TestTriageLoop_2xxWithErrorField_ExitCode4_F23(t *testing.T) {
+	tf := newTriageFakeServer(t, threeVulns())
+	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {
+		return http.StatusOK, map[string]interface{}{
+			"error":     "upstream LLM provider failure",
+			"clamped":   false,
+			"threshold": 0.7,
+		}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+	stdin := strings.NewReader("")
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      true,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               stdin,
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+	exitErr, ok := err.(*triageExitError)
+	if !ok {
+		t.Fatalf("F23: err = %v (%T), want *triageExitError", err, err)
+	}
+	if exitErr.ExitCode() != 4 {
+		t.Errorf("F23: ExitCode = %d, want 4 (2xx + error field = protocol violation, transient)", exitErr.ExitCode())
+	}
+}
+
 // --- helpers ------------------------------------------------------
 
 func bufioReaderFrom(s string) *bufio.Reader {
