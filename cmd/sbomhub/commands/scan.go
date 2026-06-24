@@ -225,20 +225,40 @@ func runScan(cmd *cobra.Command, args []string) error {
 	printSuccess("アップロード完了！")
 	fmt.Println()
 
-	// --fail-on が指定されていればサーバ側スキャン完了を polling、
-	// それ以外は upload までで終わって従来通り即時 return。
+	// Codex R4 finding 1 fix: poll whenever --wait-for-scan is true,
+	// regardless of --fail-on. The flag's help text promises to wait for
+	// the server-side scan, and the canonical upload endpoint does NOT
+	// populate severity counts in its response (vulnerability scans run
+	// asynchronously after upload). Previously this branch was gated on
+	// `failOnLevel != None`, so a default `sbomhub scan .` (no --fail-on,
+	// default --wait-for-scan=true) returned immediately with counts=0
+	// and printed "なし ✅" — silently misrepresenting a scan that had
+	// real findings once the server finished enriching it.
+	//
+	// --wait-for-scan=false (with no --fail-on) still skips polling: that
+	// is the explicit opt-out, and the upload response's zero counts are
+	// the user's stated intent. --wait-for-scan=false with --fail-on is
+	// already rejected at startup by the R3 guard above.
 	var summary *api.VulnerabilitySummary
 	var scanTimedOut bool
 	var scanFailedMsg string
-	if failOnLevel != severity.LevelNone && scanWaitForScan {
+	if scanWaitForScan {
 		summary, scanTimedOut, scanFailedMsg = waitForScanCompletion(client, result.ProjectID, result.SBOMID)
 	}
 
 	// 結果表示
 	printResultBox(componentCount, result, summary)
 
-	// --fail-on の判定
+	// --fail-on の判定がなければここで終了。
+	// --wait-for-scan で timeout / failure が起きていても、 閾値設定がない
+	// 以上 CI を exit 2 で止めるべきではない (false positive 回避)。 ただし
+	// 操作者には stderr で警告を残す。
 	if failOnLevel == severity.LevelNone {
+		if scanTimedOut {
+			fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが --wait-timeout %s 以内に完了しませんでした。 表示している件数は中間値です。\n", scanWaitTimeout)
+		} else if scanFailedMsg != "" {
+			fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが失敗しました: %s\n", scanFailedMsg)
+		}
 		return nil
 	}
 
