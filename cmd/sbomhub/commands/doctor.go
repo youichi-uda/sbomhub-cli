@@ -19,6 +19,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 // apiKeyPrefix mirrors the server-side constant in
@@ -95,7 +96,17 @@ func init() {
 
 func runDoctor(cmd *cobra.Command, args []string) error {
 	client := &http.Client{Timeout: doctorHTTPTimeout}
-	return runDoctorWith(cmd.OutOrStdout(), defaultConfigDir(), client, verboseFlag)
+	// Capture explicit-flag state here (cobra owns this knowledge); it lets
+	// the source-attribution logic in doctorChecks tell flag-supplied
+	// credentials apart from env / config / default fall-throughs.
+	return runDoctorWith(
+		cmd.OutOrStdout(),
+		defaultConfigDir(),
+		client,
+		verboseFlag,
+		cmd.Flags().Changed("api-key"),
+		cmd.Flags().Changed("api-url"),
+	)
 }
 
 // defaultConfigDir mirrors the lookup used by loadConfigAndClient in
@@ -112,8 +123,16 @@ func defaultConfigDir() string {
 // runDoctorWith is the testable seam: it takes an explicit config dir and HTTP
 // client so unit tests can point the checks at a temp directory and an
 // httptest server without touching $HOME or the real network.
-func runDoctorWith(out io.Writer, configDir string, client *http.Client, verbose bool) error {
-	results := doctorChecks(configDir, client)
+//
+// apiKeyFromFlag / apiURLFromFlag mirror cmd.Flags().Changed(...) so tests can
+// exercise the flag precedence path without spinning up a cobra command tree.
+func runDoctorWith(
+	out io.Writer,
+	configDir string,
+	client *http.Client,
+	verbose, apiKeyFromFlag, apiURLFromFlag bool,
+) error {
+	results := doctorChecks(configDir, client, apiKeyFromFlag, apiURLFromFlag)
 	anyFail := false
 	for _, r := range results {
 		fmt.Fprintf(out, "%s %s\n", r.status, r.message)
@@ -135,50 +154,89 @@ func runDoctorWith(out io.Writer, configDir string, client *http.Client, verbose
 // doctorChecks runs every diagnostic and returns the results as a slice.
 // Splitting this out from the printer keeps the unit tests free of stdout
 // assertions — they just inspect the structured results.
-func doctorChecks(configDir string, client *http.Client) []doctorResult {
+//
+// apiKeyFromFlag / apiURLFromFlag are the cmd.Flags().Changed(...) values for
+// --api-key / --api-url. They are used only for source attribution in the
+// resulting messages; the actual precedence is owned by resolveCredentials.
+func doctorChecks(configDir string, client *http.Client, apiKeyFromFlag, apiURLFromFlag bool) []doctorResult {
 	var results []doctorResult
 
-	// 1. config file presence. If this fails the rest of the checks can't
-	// say anything useful, so we early-return with an actionable hint.
+	// 1. Config file presence. A missing file is NOT fatal: env vars
+	// (SBOMHUB_API_URL / SBOMHUB_API_KEY) and CLI flags (--api-url /
+	// --api-key) are equally valid credential sources (Trust Rescue
+	// R2-2e / R9-9b: resolveCredentials is the canonical merge). Without
+	// this downgrade, `SBOMHUB_API_KEY=... sbomhub doctor` in a clean CI
+	// runner always [FAIL]s before reaching the real checks.
 	configPath := filepath.Join(configDir, "config.yaml")
-	if _, err := os.Stat(configPath); err != nil {
-		if os.IsNotExist(err) {
-			return append(results, doctorResult{
-				name:   "config-file",
-				status: doctorFail,
-				message: fmt.Sprintf("設定ファイルが見つかりません (%s) — `sbomhub login` で初期化してください",
-					configPath),
-			})
-		}
+	configFileExists := false
+	if _, err := os.Stat(configPath); err == nil {
+		configFileExists = true
+		results = append(results, doctorResult{
+			name:    "config-file",
+			status:  doctorOK,
+			message: fmt.Sprintf("設定ファイル存在 (%s)", configPath),
+		})
+	} else if os.IsNotExist(err) {
+		results = append(results, doctorResult{
+			name:    "config-file",
+			status:  doctorOK,
+			message: fmt.Sprintf("設定ファイル無し (%s) — env / flag 経路で動作", configPath),
+		})
+	} else {
+		// stat returned something other than ENOENT (permission denied,
+		// I/O error, ...) — bail out, the rest is undefined.
 		return append(results, doctorResult{
 			name:    "config-file",
 			status:  doctorFail,
 			message: fmt.Sprintf("設定ファイル参照エラー (%s): %v", configPath, err),
 		})
 	}
-	results = append(results, doctorResult{
-		name:    "config-file",
-		status:  doctorOK,
-		message: fmt.Sprintf("設定ファイル存在 (%s)", configPath),
-	})
 
-	cfg, err := config.Load(configDir)
+	// Raw file values (no DefaultAPIURL injection) for source attribution.
+	// config.Load() rewrites an empty api_url to DefaultAPIURL, which would
+	// make us mislabel "default" as "config"; reading the file directly
+	// preserves the distinction.
+	var fileAPIURL, fileAPIKey string
+	if configFileExists {
+		if data, readErr := os.ReadFile(configPath); readErr == nil {
+			var raw config.Config
+			if yamlErr := yaml.Unmarshal(data, &raw); yamlErr != nil {
+				// File exists but is malformed; downstream merges will
+				// also fail. Surface the parse error and stop.
+				return append(results, doctorResult{
+					name:    "config-parse",
+					status:  doctorFail,
+					message: fmt.Sprintf("設定ファイルの解析に失敗しました: %v", yamlErr),
+				})
+			}
+			fileAPIURL = raw.APIURL
+			fileAPIKey = raw.APIKey
+		}
+	}
+
+	// Resolve credentials through the same path real commands use, so
+	// what doctor reports is exactly what e.g. `scan` / `projects` would
+	// see (flag > env > file > default).
+	cfg, err := resolveCredentials(configDir)
 	if err != nil {
-		// File existed but parse failed; downstream checks can't run.
 		return append(results, doctorResult{
-			name:    "config-parse",
+			name:    "credentials",
 			status:  doctorFail,
-			message: fmt.Sprintf("設定ファイルの解析に失敗しました: %v", err),
+			message: fmt.Sprintf("credential 解決に失敗しました: %v", err),
 		})
 	}
 
+	envKey := os.Getenv("SBOMHUB_API_KEY")
+	envURL := os.Getenv("SBOMHUB_API_URL")
+
 	// 2. API key (prefix sanity check — the real auth probe is #5).
+	keySource := doctorCredSource(apiKeyFromFlag, envKey, fileAPIKey, "", cfg.APIKey)
 	switch {
 	case cfg.APIKey == "":
 		results = append(results, doctorResult{
 			name:    "api-key",
 			status:  doctorFail,
-			message: "api_key が未設定です — `sbomhub login` で設定してください",
+			message: "api_key が未設定です — SBOMHUB_API_KEY env / --api-key flag / `sbomhub login` のいずれかが必要",
 		})
 	case !strings.HasPrefix(cfg.APIKey, doctorAPIKeyPrefix):
 		results = append(results, doctorResult{
@@ -186,37 +244,40 @@ func doctorChecks(configDir string, client *http.Client) []doctorResult {
 			// WARN not FAIL: a non-sbh_ key may still work against a forked
 			// server, and the auth-verify step below will catch real breakage.
 			status:  doctorWarn,
-			message: fmt.Sprintf("api_key が期待される prefix (%s) で始まっていません", doctorAPIKeyPrefix),
+			message: fmt.Sprintf("api_key が期待される prefix (%s) で始まっていません (source: %s)", doctorAPIKeyPrefix, keySource),
 		})
 	default:
 		results = append(results, doctorResult{
 			name:    "api-key",
 			status:  doctorOK,
-			message: fmt.Sprintf("api_key 設定済み (%s)", maskAPIKey(cfg.APIKey)),
+			message: fmt.Sprintf("api_key 設定済み (source: %s, %s)", keySource, maskAPIKey(cfg.APIKey)),
 		})
 	}
 
-	// 3. API URL — empty is fatal, SaaS default is a self-host nudge (WARN).
+	// 3. API URL — empty is fatal (resolveCredentials applies a default,
+	// so this is essentially unreachable), SaaS default is a self-host
+	// nudge (WARN).
+	urlSource := doctorCredSource(apiURLFromFlag, envURL, fileAPIURL, config.DefaultAPIURL, cfg.APIURL)
 	switch cfg.APIURL {
 	case "":
 		results = append(results, doctorResult{
 			name:    "api-url",
 			status:  doctorFail,
-			message: "api_url が未設定です — `sbomhub login --url <self-host-url>` で設定してください",
+			message: "api_url が未設定です — SBOMHUB_API_URL env / --api-url flag / `sbomhub login --url <self-host-url>` のいずれかが必要",
 		})
 	case doctorDefaultAPIURL:
 		results = append(results, doctorResult{
 			name:   "api-url",
 			status: doctorWarn,
 			message: fmt.Sprintf(
-				"api_url が SaaS 既定 (%s) のままです — SaaS は 2026-06-23 sunset、 self-host への切替を推奨",
-				cfg.APIURL),
+				"api_url が SaaS 既定 (%s) のままです — SaaS は 2026-06-23 sunset、 self-host への切替を推奨 (source: %s)",
+				cfg.APIURL, urlSource),
 		})
 	default:
 		results = append(results, doctorResult{
 			name:    "api-url",
 			status:  doctorOK,
-			message: fmt.Sprintf("api_url 設定済み (%s)", cfg.APIURL),
+			message: fmt.Sprintf("api_url 設定済み (source: %s, %s)", urlSource, cfg.APIURL),
 		})
 	}
 
@@ -346,6 +407,34 @@ func doctorGet(client *http.Client, url, bearer string) (int, string, error) {
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	return resp.StatusCode, string(body), nil
+}
+
+// doctorCredSource reports which precedence layer ultimately supplied the
+// credential, mirroring resolveCredentials (flag > env > config > default).
+// defaultVal is the built-in fallback (e.g. config.DefaultAPIURL for api_url;
+// empty for api_key, which has no default).
+func doctorCredSource(fromFlag bool, envVal, fileVal, defaultVal, finalVal string) string {
+	switch {
+	case finalVal == "":
+		return "none"
+	case fromFlag:
+		return "flag"
+	case envVal != "" && envVal == finalVal:
+		return "env"
+	case fileVal != "" && fileVal == finalVal:
+		return "config"
+	case defaultVal != "" && defaultVal == finalVal:
+		return "default"
+	default:
+		// Final value did not match any known source. This can happen when
+		// the file specified a non-empty value that exactly equals the
+		// default — attribute to config in that case (the file is the
+		// proximate cause of the value being present).
+		if fileVal != "" {
+			return "config"
+		}
+		return "unknown"
+	}
 }
 
 func truncateBody(s string) string {
