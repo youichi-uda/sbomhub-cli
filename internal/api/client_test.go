@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -417,6 +419,11 @@ func TestGetScanStatus(t *testing.T) {
 // TestGetScanStatusError exercises the transient-error path. The CLI
 // poll loop logs and retries on errors here, so the only contract we
 // need from the client is "return a non-nil error".
+//
+// Codex R7: the error must also be a typed *APIError so the polling
+// loop can inspect StatusCode and classify it (5xx → transient, retry
+// within --wait-timeout). Without the typed wrapper the loop has no
+// way to distinguish 5xx from network errors from 4xx.
 func TestGetScanStatusError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -425,8 +432,73 @@ func TestGetScanStatusError(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "test-key")
-	if _, err := client.GetScanStatus(context.Background(), "p", "s"); err == nil {
-		t.Error("GetScanStatus() expected error for 500 response")
+	_, err := client.GetScanStatus(context.Background(), "p", "s")
+	if err == nil {
+		t.Fatal("GetScanStatus() expected error for 500 response")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error is not *APIError: %T %v (R7: non-2xx must surface as typed APIError for classification)", err, err)
+	}
+	if apiErr.StatusCode != http.StatusInternalServerError {
+		t.Errorf("APIError.StatusCode = %d, want %d", apiErr.StatusCode, http.StatusInternalServerError)
+	}
+}
+
+// TestGetScanStatus_PermanentClientError verifies the Codex R7 fix:
+// 4xx responses from scan-status are returned as a typed *APIError so
+// the polling loop in scan.go can recognise the permanent failure and
+// fast-fail (exit-3) instead of silently retrying for --wait-timeout
+// and then reporting it as a misleading exit-2 "scan timed out".
+//
+// We cover the common permanent cases:
+//   - 401 Unauthorized: API key is wrong / missing
+//   - 403 Forbidden:    key valid but no access to this project / sbom
+//   - 404 Not Found:    older server without scan-status endpoint, or
+//                       the sbom ID was wrong (race against deletion)
+//   - 400 Bad Request:  malformed path / sbom ID; same class of "this
+//                       will never succeed, stop retrying"
+func TestGetScanStatus_PermanentClientError(t *testing.T) {
+	cases := []struct {
+		name string
+		code int
+	}{
+		{"401 unauthorized", http.StatusUnauthorized},
+		{"403 forbidden", http.StatusForbidden},
+		{"404 not found", http.StatusNotFound},
+		{"400 bad request", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(`{"error":"permanent"}`))
+			}))
+			defer server.Close()
+
+			client := NewClient(server.URL, "test-key")
+			_, err := client.GetScanStatus(context.Background(), "p", "s")
+			if err == nil {
+				t.Fatal("expected error")
+			}
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) {
+				t.Fatalf("error is not *APIError: %T %v", err, err)
+			}
+			if apiErr.StatusCode != tc.code {
+				t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, tc.code)
+			}
+			// URL must round-trip so the operator-facing message in
+			// runScan can include the failing endpoint.
+			if apiErr.URL == "" {
+				t.Error("APIError.URL is empty; want the failing scan-status URL for diagnostics")
+			}
+			// The body must round-trip too so the server's error
+			// message (e.g. "invalid api key") is preserved end-to-end.
+			if !strings.Contains(apiErr.Message, "permanent") {
+				t.Errorf("APIError.Message = %q, want substring %q (server body lost)", apiErr.Message, "permanent")
+			}
+		})
 	}
 }
 

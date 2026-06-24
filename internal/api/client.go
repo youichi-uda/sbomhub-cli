@@ -17,6 +17,35 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// APIError represents a non-2xx HTTP response from the SBOMHub API.
+//
+// Codex R7 fix: returning a typed error (instead of a wrapped
+// fmt.Errorf "APIエラー (%d): %s") lets callers — specifically the
+// scan-status polling loop in cmd/sbomhub/commands/scan.go — use
+// errors.As to inspect the status code and decide whether to retry
+// (transient: network flap, 5xx, ctx cancellation) or fast-fail
+// (permanent: 401/403 bad auth, 404 endpoint missing on older server).
+//
+// Before this change, every non-2xx response was treated as transient
+// by waitForScanCompletion's `continue` branch, so a permanent 401
+// would silently retry for the full --wait-timeout (default 5 min) and
+// then report the failure as a "scan timed out" exit-2 — misleading
+// the operator into thinking the scan was slow when the real failure
+// mode was a misconfigured API key.
+//
+// Currently only emitted by GetScanStatus; other client methods still
+// return wrapped sentinel errors. They can adopt APIError incrementally
+// as their callers gain a need to classify failures.
+type APIError struct {
+	StatusCode int
+	Message    string
+	URL        string
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("APIエラー (%d) %s: %s", e.StatusCode, e.URL, e.Message)
+}
+
 // NewClient creates a new API client
 func NewClient(baseURL, apiKey string) *Client {
 	return &Client{
@@ -426,6 +455,11 @@ type ScanStatusResponse struct {
 // effect was the Client.httpClient default 60s, so --wait-timeout=10s
 // still hung for up to 60s on a slow server — violating the documented
 // timeout contract.
+//
+// Codex R7 fix: non-2xx HTTP responses are returned as *APIError (instead
+// of a stringly-wrapped fmt.Errorf) so the polling loop can classify
+// 4xx as permanent (fast-fail with exit 3) vs 5xx / network as transient
+// (retry within --wait-timeout). See APIError doc for the full rationale.
 func (c *Client) GetScanStatus(ctx context.Context, projectID, sbomID string) (*ScanStatusResponse, error) {
 	url := fmt.Sprintf("%s/api/v1/projects/%s/sboms/%s/scan-status", c.baseURL, projectID, sbomID)
 
@@ -443,7 +477,11 @@ func (c *Client) GetScanStatus(ctx context.Context, projectID, sbomID string) (*
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("APIエラー (%d): %s", resp.StatusCode, string(body))
+		return nil, &APIError{
+			StatusCode: resp.StatusCode,
+			Message:    string(body),
+			URL:        url,
+		}
 	}
 
 	var out ScanStatusResponse

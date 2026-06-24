@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -243,6 +244,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	var summary *api.VulnerabilitySummary
 	var scanTimedOut bool
 	var scanFailedMsg string
+	var scanAPIErrMsg string
 	var scanLastFetchedAt time.Time
 	if scanWaitForScan {
 		// Bind the polling loop's deadline to a context so the in-flight
@@ -251,12 +253,30 @@ func runScan(cmd *cobra.Command, args []string) error {
 		// the only thing in effect before this — meaning --wait-timeout=10s
 		// could still hang for up to 60s on a slow server.
 		ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
-		summary, scanTimedOut, scanFailedMsg, scanLastFetchedAt = waitForScanCompletion(ctx, client, result.ProjectID, result.SBOMID)
+		summary, scanTimedOut, scanFailedMsg, scanAPIErrMsg, scanLastFetchedAt = waitForScanCompletion(ctx, client, result.ProjectID, result.SBOMID)
 		cancel()
 	}
 
 	// 結果表示
 	printResultBox(componentCount, result, summary)
+
+	// Codex R7 fix: scan-status polling hit a permanent client-side error
+	// (typically 401/403 from bad auth, or 404 from a server that does
+	// not implement scan-status). Fast-fail with exit-3 (API error)
+	// regardless of --fail-on — a broken polling endpoint means we cannot
+	// trust ANY downstream counts, so the only honest signal is "the
+	// polling contract is broken; fix config or upgrade the server".
+	//
+	// This runs BEFORE the failOnLevel==None / threshold branches below,
+	// so even a `sbomhub scan .` with no threshold still surfaces the
+	// permanent error via a non-zero exit code (rather than swallowing it
+	// into a green "no fail-on configured, returning 0" path).
+	if scanAPIErrMsg != "" {
+		return &scanExitError{
+			code: exitAPIError,
+			msg:  fmt.Sprintf("scan-status polling aborted: %s", scanAPIErrMsg),
+		}
+	}
 
 	// --fail-on の判定がなければここで終了。
 	// --wait-for-scan で timeout / failure が起きていても、 閾値設定がない
@@ -348,6 +368,13 @@ func runScan(cmd *cobra.Command, args []string) error {
 //     when no poll ever returned a valid response before ctx fired.
 //   - timedOut:       true if ctx fired before a terminal state was seen
 //   - failedErrorMsg: non-empty if server reported the scan failed
+//     (server-side scan ran but the enrichment pipeline errored). Distinct
+//     from apiErrMsg — this maps to exit-2 (scan-timeout family), since
+//     the server reached a terminal "this scan is dead" state and the CLI
+//     could not enforce --fail-on against it.
+//   - apiErrMsg:      non-empty if scan-status polling aborted because the
+//     endpoint returned a permanent client-side error (HTTP 4xx). Maps to
+//     exit-3 (API error). See Codex R7 fix below for the full rationale.
 //   - lastFetchedAt:  wall-clock timestamp of the most recent successful
 //     poll; zero time.Time when no poll ever succeeded. Caller surfaces
 //     this to the operator alongside the timeout warning so the partial
@@ -367,7 +394,25 @@ func runScan(cmd *cobra.Command, args []string) error {
 // counts shown" warning — actively misleading. We now keep the latest
 // successful snapshot and return it so the operator sees the real partial
 // numbers and the warning is consistent with the box content.
-func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, sbomID string) (summary *api.VulnerabilitySummary, timedOut bool, failedErrorMsg string, lastFetchedAt time.Time) {
+//
+// Codex R7 fix: HTTP 4xx responses from scan-status now fast-fail instead
+// of being silently retried until --wait-timeout. The two pathological
+// failure modes this catches:
+//
+//   - 401/403: the operator's API key is wrong, or the key lost access to
+//     the project. Retrying for 5 minutes will not fix this; the only
+//     useful signal is "your auth is broken, fix it and re-run".
+//   - 404:     this server build does not implement the scan-status
+//     endpoint (older API). Retrying will never produce a different
+//     answer; surfacing the 404 immediately lets the operator either
+//     upgrade the server or drop --wait-for-scan / --fail-on for now.
+//
+// 5xx and network-flap errors are still classified as transient and
+// retried — that's the original "ride out a brief blip mid-CI" intent.
+// Unknown error types (e.g. JSON parse failures) are also kept on the
+// transient path because they may signal a temporary upstream glitch
+// rather than a permanent contract mismatch.
+func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, sbomID string) (summary *api.VulnerabilitySummary, timedOut bool, failedErrorMsg, apiErrMsg string, lastFetchedAt time.Time) {
 	tick := scanPollInterval
 	if tick <= 0 {
 		tick = 5 * time.Second
@@ -380,7 +425,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 	var latestAt time.Time
 	for {
 		if ctx.Err() != nil {
-			return latest, true, "", latestAt
+			return latest, true, "", "", latestAt
 		}
 
 		status, err := client.GetScanStatus(ctx, projectID, sbomID)
@@ -389,8 +434,21 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 			// mid-request) treat it as a clean timeout — not a transient
 			// API error to retry past the deadline.
 			if ctx.Err() != nil {
-				return latest, true, "", latestAt
+				return latest, true, "", "", latestAt
 			}
+
+			// Permanent client-side error (4xx): fast-fail. Retrying a
+			// 401/403/404 for the full --wait-timeout would hide the real
+			// failure mode (bad auth, missing endpoint) behind a misleading
+			// "scan timed out" exit. The caller maps apiErrMsg to exit-3.
+			var apiErr *api.APIError
+			if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+				fmt.Printf("   ✗ scan-status 取得エラー (HTTP %d): 永続的なエラーのため即座に中断します\n", apiErr.StatusCode)
+				return latest, false, "", fmt.Sprintf("HTTP %d %s: %s", apiErr.StatusCode, apiErr.URL, strings.TrimSpace(apiErr.Message)), latestAt
+			}
+
+			// Transient (5xx, network flap, JSON parse glitch, …): log
+			// and keep polling within the ctx budget.
 			fmt.Printf("   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
 		} else {
 			elapsed := time.Since(startTime)
@@ -410,9 +468,9 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 
 			switch status.Status {
 			case "completed":
-				return latest, false, "", latestAt
+				return latest, false, "", "", latestAt
 			case "failed":
-				return latest, false, fallbackString(status.Error, "unspecified server-side scan failure"), latestAt
+				return latest, false, fallbackString(status.Error, "unspecified server-side scan failure"), "", latestAt
 			}
 		}
 
@@ -423,7 +481,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return latest, true, "", latestAt
+			return latest, true, "", "", latestAt
 		case <-timer.C:
 		}
 	}

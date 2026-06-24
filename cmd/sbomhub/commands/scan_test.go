@@ -3,8 +3,10 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -55,12 +57,15 @@ func TestWaitForScanCompletion_Completes(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
 	defer cancel()
-	summary, timedOut, failedMsg, lastFetchedAt := waitForScanCompletion(ctx, client, projectID, sbomID)
+	summary, timedOut, failedMsg, apiErrMsg, lastFetchedAt := waitForScanCompletion(ctx, client, projectID, sbomID)
 	if timedOut {
 		t.Fatalf("waitForScanCompletion timed out unexpectedly (hits=%d)", atomic.LoadInt32(&hits))
 	}
 	if failedMsg != "" {
 		t.Fatalf("waitForScanCompletion reported failed=%q", failedMsg)
+	}
+	if apiErrMsg != "" {
+		t.Fatalf("waitForScanCompletion reported apiErrMsg=%q on a clean completion", apiErrMsg)
 	}
 	if summary == nil {
 		t.Fatal("summary is nil on completion")
@@ -102,9 +107,12 @@ func TestWaitForScanCompletion_TimesOut(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
 	defer cancel()
-	summary, timedOut, failedMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
+	summary, timedOut, failedMsg, apiErrMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
 	if !timedOut {
-		t.Errorf("expected timeout, got summary=%+v failedMsg=%q", summary, failedMsg)
+		t.Errorf("expected timeout, got summary=%+v failedMsg=%q apiErrMsg=%q", summary, failedMsg, apiErrMsg)
+	}
+	if apiErrMsg != "" {
+		t.Errorf("apiErrMsg = %q on plain timeout path, want empty", apiErrMsg)
 	}
 }
 
@@ -132,12 +140,15 @@ func TestWaitForScanCompletion_Failed(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
 	defer cancel()
-	_, timedOut, failedMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
+	_, timedOut, failedMsg, apiErrMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
 	if timedOut {
 		t.Error("expected failed path, not timeout")
 	}
 	if failedMsg != "nvd: rate limited" {
 		t.Errorf("failedMsg = %q, want %q", failedMsg, "nvd: rate limited")
+	}
+	if apiErrMsg != "" {
+		t.Errorf("apiErrMsg = %q on server-side scan failure, want empty (server reached terminal state, polling endpoint was fine)", apiErrMsg)
 	}
 }
 
@@ -196,14 +207,17 @@ func TestWaitForScanCompletion_TimeoutPreservesPartialCounts(t *testing.T) {
 	defer cancel()
 
 	before := time.Now()
-	summary, timedOut, failedMsg, lastFetchedAt := waitForScanCompletion(ctx, client, projectID, sbomID)
+	summary, timedOut, failedMsg, apiErrMsg, lastFetchedAt := waitForScanCompletion(ctx, client, projectID, sbomID)
 	after := time.Now()
 
 	if !timedOut {
-		t.Fatalf("expected timeout, got summary=%+v failedMsg=%q", summary, failedMsg)
+		t.Fatalf("expected timeout, got summary=%+v failedMsg=%q apiErrMsg=%q", summary, failedMsg, apiErrMsg)
 	}
 	if failedMsg != "" {
 		t.Errorf("failedMsg = %q, want empty (timeout path)", failedMsg)
+	}
+	if apiErrMsg != "" {
+		t.Errorf("apiErrMsg = %q, want empty (timeout path; transient hang is not a permanent API error)", apiErrMsg)
 	}
 	if summary == nil {
 		t.Fatal("summary is nil on timeout — partial counts were discarded (Codex R5 regression)")
@@ -249,7 +263,7 @@ func TestWaitForScanCompletion_TimeoutNoSuccessfulPoll(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
 	defer cancel()
-	summary, timedOut, _, lastFetchedAt := waitForScanCompletion(ctx, client, "p", "s")
+	summary, timedOut, _, apiErrMsg, lastFetchedAt := waitForScanCompletion(ctx, client, "p", "s")
 	if !timedOut {
 		t.Fatal("expected timeout")
 	}
@@ -258,6 +272,9 @@ func TestWaitForScanCompletion_TimeoutNoSuccessfulPoll(t *testing.T) {
 	}
 	if !lastFetchedAt.IsZero() {
 		t.Errorf("lastFetchedAt = %s, want zero time when no poll ever returned", lastFetchedAt)
+	}
+	if apiErrMsg != "" {
+		t.Errorf("apiErrMsg = %q, want empty (server hangs are transient, not permanent API errors)", apiErrMsg)
 	}
 }
 
@@ -297,11 +314,14 @@ func TestWaitForScanCompletion_ContextCancelAbortsHungRequest(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, timedOut, _, _ := waitForScanCompletion(ctx, client, "p", "s")
+	_, timedOut, _, apiErrMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
 	elapsed := time.Since(start)
 
 	if !timedOut {
 		t.Errorf("expected timeout when ctx cancels mid-request")
+	}
+	if apiErrMsg != "" {
+		t.Errorf("apiErrMsg = %q on ctx-cancel timeout, want empty (ctx cancellation is the clean-timeout path, not a permanent API error)", apiErrMsg)
 	}
 	// Allow generous slack but reject the "waited the full 60s httpClient
 	// default" failure mode (and anything close to it).
@@ -634,6 +654,231 @@ func TestRunScan_FailOnGuardAllowsValidCombos(t *testing.T) {
 				t.Errorf("guard fired on valid combo: err=%v", err)
 			}
 		})
+	}
+}
+
+// TestWaitForScanCompletion_PermanentAPIErrorFastFails verifies the
+// Codex R7 fix: when scan-status returns a permanent 4xx response
+// (401/403 from bad auth, or 404 from a server that does not implement
+// the endpoint), the polling loop must abort on the FIRST hit with
+// apiErrMsg set — NOT continue retrying until --wait-timeout elapses.
+//
+// Before this fix, a permanent error was indistinguishable from a
+// transient flap; the loop would `continue` past every 4xx until ctx
+// fired, then report "scan timed out" — actively hiding the real
+// failure mode (bad config) behind a misleading "your scan was slow"
+// exit-2 signal.
+//
+// Acceptance criteria:
+//   - timedOut == false (we didn't time out; we fast-failed)
+//   - failedMsg == "" (server-side scan didn't fail; the API call did)
+//   - apiErrMsg non-empty (carries the HTTP status + URL for the
+//     exit-3 message in runScan)
+//   - server received exactly 1 hit (no retry on permanent error)
+//   - elapsed << --wait-timeout (we did not burn the budget)
+func TestWaitForScanCompletion_PermanentAPIErrorFastFails(t *testing.T) {
+	cases := []struct {
+		name string
+		code int
+	}{
+		{"401 unauthorized fast-fails", http.StatusUnauthorized},
+		{"403 forbidden fast-fails", http.StatusForbidden},
+		{"404 not found fast-fails", http.StatusNotFound},
+		{"400 bad request fast-fails", http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.WriteHeader(tc.code)
+				_, _ = w.Write([]byte(`{"error":"nope"}`))
+			}))
+			defer server.Close()
+
+			client := api.NewClient(server.URL, "test-key")
+
+			// Generous wait-timeout: a regressed loop that retries the
+			// 4xx would burn the full budget. Fast-fail must land in
+			// well under a second.
+			scanWaitTimeout = 10 * time.Second
+			scanPollInterval = 10 * time.Millisecond
+			t.Cleanup(func() {
+				scanWaitTimeout = 5 * time.Minute
+				scanPollInterval = 5 * time.Second
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+			defer cancel()
+			start := time.Now()
+			_, timedOut, failedMsg, apiErrMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
+			elapsed := time.Since(start)
+
+			if timedOut {
+				t.Error("permanent 4xx must not be reported as timeout (would map to exit-2 and mislead operator)")
+			}
+			if failedMsg != "" {
+				t.Errorf("permanent 4xx must use apiErrMsg, not failedErrorMsg; got failedMsg=%q", failedMsg)
+			}
+			if apiErrMsg == "" {
+				t.Error("apiErrMsg empty; permanent 4xx must surface here so runScan can return exit-3 (API error)")
+			}
+			// Sanity: the message should carry the HTTP status so the
+			// operator sees the actual failure mode rather than "unknown".
+			if !strings.Contains(apiErrMsg, http.StatusText(tc.code)) && !strings.Contains(apiErrMsg, "HTTP ") {
+				t.Errorf("apiErrMsg = %q, expected to mention HTTP status (got code=%d)", apiErrMsg, tc.code)
+			}
+			if got := atomic.LoadInt32(&hits); got != 1 {
+				t.Errorf("server hit %d times for permanent error; want 1 (no retries — that's the point of fast-fail)", got)
+			}
+			if elapsed > 2*time.Second {
+				t.Errorf("waitForScanCompletion took %s for a permanent 4xx; expected fast-fail under 1s (Codex R7 regression — permanent error being treated as transient)", elapsed)
+			}
+		})
+	}
+}
+
+// TestWaitForScanCompletion_TransientServerErrorRetries verifies the
+// inverse of the R7 fast-fail: 5xx responses are still classified as
+// transient (the network may flap, the server may briefly OOM, etc.)
+// and the loop keeps polling within the --wait-timeout budget.
+// A regression where 5xx fast-failed would break the documented
+// "ride out brief blips mid-CI" behaviour added for R4-4c.
+func TestWaitForScanCompletion_TransientServerErrorRetries(t *testing.T) {
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"boom"}`))
+	}))
+	defer server.Close()
+
+	client := api.NewClient(server.URL, "test-key")
+	scanWaitTimeout = 120 * time.Millisecond
+	scanPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		scanWaitTimeout = 5 * time.Minute
+		scanPollInterval = 5 * time.Second
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+	defer cancel()
+	_, timedOut, failedMsg, apiErrMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
+
+	if !timedOut {
+		t.Errorf("expected timeout after 5xx retries (loop should NOT fast-fail on 5xx); failedMsg=%q apiErrMsg=%q", failedMsg, apiErrMsg)
+	}
+	if apiErrMsg != "" {
+		t.Errorf("apiErrMsg = %q; 5xx must NOT trigger fast-fail (it's transient)", apiErrMsg)
+	}
+	if failedMsg != "" {
+		t.Errorf("failedMsg = %q; 5xx is neither a server-side scan failure nor a permanent API error", failedMsg)
+	}
+	if got := atomic.LoadInt32(&hits); got < 2 {
+		t.Errorf("server hit %d times in %s; expected >= 2 retries within the wait-timeout budget", got, scanWaitTimeout)
+	}
+}
+
+// TestRunScan_PermanentScanStatusErrorReturnsExit3 verifies the end-to-end
+// path through runScan: a permanent 4xx during scan-status polling must
+// surface as a scanExitError with code=exitAPIError (3), so main.go
+// routes it to os.Exit(3). This is what makes the R7 fix observable to
+// CI workflows.
+//
+// We use --dry-run-equivalent approach: stand up a fake server that
+// (a) accepts the upload then (b) returns 401 on every scan-status
+// poll, drive runScan with the package globals, and assert the
+// returned error carries exit code 3 (NOT 2, the timeout code).
+//
+// Note: we deliberately exercise the no-fail-on path. The R7 fast-fail
+// must trip regardless of --fail-on — a broken polling endpoint means
+// counts are untrustworthy, so the only honest signal is the API error.
+func TestRunScan_PermanentScanStatusErrorReturnsExit3(t *testing.T) {
+	const projectID = "55555555-5555-5555-5555-555555555555"
+	const sbomID = "66666666-6666-6666-6666-666666666666"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/api/v1/projects/"+projectID+"/sbom":
+			// Upload succeeds so we reach the polling loop.
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"id":"` + sbomID + `","project_id":"` + projectID + `","format":"cyclonedx","version":"1.4","created_at":"2026-06-24T00:00:00Z"}`))
+		case r.URL.Path == "/api/v1/projects/"+projectID+"/sboms/"+sbomID+"/scan-status":
+			// Permanent error: should fast-fail on the first hit.
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid api key"}`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	// Snapshot + restore package globals so the test doesn't leak.
+	saveProject, saveFailOn, saveWait, saveDry := scanProject, scanFailOn, scanWaitForScan, scanDryRun
+	saveTimeout, savePoll := scanWaitTimeout, scanPollInterval
+	saveURL, saveKey := apiURL, apiKey
+	t.Cleanup(func() {
+		scanProject = saveProject
+		scanFailOn = saveFailOn
+		scanWaitForScan = saveWait
+		scanDryRun = saveDry
+		scanWaitTimeout = saveTimeout
+		scanPollInterval = savePoll
+		apiURL = saveURL
+		apiKey = saveKey
+	})
+
+	// Use the UUID short-circuit in UploadSBOM so we skip CreateProject
+	// and the test handler only needs to mock 2 endpoints.
+	scanProject = projectID
+	scanFailOn = ""
+	scanWaitForScan = true
+	scanDryRun = false
+	scanWaitTimeout = 5 * time.Second // generous; we expect fast-fail well under this
+	scanPollInterval = 10 * time.Millisecond
+	apiURL = server.URL
+	apiKey = "test-key"
+
+	// Point the credentials lookup at an empty config dir so it falls
+	// through to the flag layer (set above).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", "")
+	t.Setenv("SBOMHUB_API_URL", "")
+	t.Setenv("SBOMHUB_API_KEY", "")
+
+	// We need a real path for the os.Stat guard, and a scanner that
+	// produces SOME SBOM. Easiest: write a minimal CycloneDX file and
+	// point --output at it so the local-file flow works; but the real
+	// path is the scanner. We bypass by setting --dry-run... no, dry-run
+	// short-circuits before upload. Instead we let scanner.New pick a
+	// tool; on a CI box without syft/trivy/cdxgen this won't work.
+	//
+	// Compromise: skip if no scanner is available. The test still
+	// guards the contract on dev boxes where at least one scanner is
+	// present.
+	if _, err := exec.LookPath("syft"); err != nil {
+		if _, err2 := exec.LookPath("trivy"); err2 != nil {
+			if _, err3 := exec.LookPath("cdxgen"); err3 != nil {
+				t.Skip("no SBOM scanner (syft/trivy/cdxgen) on PATH; skipping end-to-end runScan test")
+			}
+		}
+	}
+
+	tmpDir := t.TempDir()
+	err := runScan(scanCmd, []string{tmpDir})
+	if err == nil {
+		t.Fatal("runScan returned nil; expected scanExitError with exit code 3")
+	}
+	var exitErr *scanExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("error is not *scanExitError: %T %v", err, err)
+	}
+	if exitErr.ExitCode() != exitAPIError {
+		t.Errorf("exit code = %d, want %d (exitAPIError); permanent 4xx must not map to exit-2 (timeout)", exitErr.ExitCode(), exitAPIError)
+	}
+	if !strings.Contains(exitErr.Error(), "scan-status polling aborted") {
+		t.Errorf("exit message = %q, want substring %q so the operator sees the actual failure mode", exitErr.Error(), "scan-status polling aborted")
 	}
 }
 
