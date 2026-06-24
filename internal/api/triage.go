@@ -1,0 +1,446 @@
+package api
+
+// Triage API client — wraps the M1 VEX draft endpoints documented in
+// sbomhub/apps/api/internal/handler/vex_drafts.go (truth source):
+//
+//	POST   /api/v1/projects/:id/triage/run
+//	GET    /api/v1/projects/:id/vex-drafts
+//	PUT    /api/v1/projects/:id/vex-drafts/:draft_id/decision
+//
+// The CLI's `sbomhub triage` command uses these three to:
+//  1. enumerate the existing vulnerabilities for a project (via the
+//     pre-existing GET /api/v1/projects/:id/vulnerabilities endpoint —
+//     see ListVulnerabilities below),
+//  2. ask the server to run one AI triage cycle per (cve_id, vuln_id),
+//  3. surface the AI-drafted VEX to the operator and persist their
+//     approve / edit / reject decision.
+//
+// All three helpers share the existing api.Client (Bearer auth, base
+// URL, default 60s timeout). Non-2xx responses fall through to the
+// shared parsing helper triageDecodeError which carries the server's
+// JSON body verbatim so the CLI can surface the "AI features are
+// disabled" reason text from llm.DisabledError end-to-end.
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+)
+
+// ----------------------------------------------------------------------------
+// Wire DTOs (mirror sbomhub/apps/api/internal/handler/vex_drafts.go)
+// ----------------------------------------------------------------------------
+
+// TriageRunRequest is the body of POST /api/v1/projects/:id/triage/run.
+//
+// `VulnerabilityID` is required by the server (parsed via uuid.Parse);
+// `CVEID` is also required; `ComponentID` is optional. Sending an empty
+// ComponentID is fine — the server resolves a component_id from the
+// vulnerability_id when omitted (see handler.RunTriage).
+type TriageRunRequest struct {
+	VulnerabilityID string `json:"vulnerability_id"`
+	CVEID           string `json:"cve_id"`
+	ComponentID     string `json:"component_id,omitempty"`
+}
+
+// TriageEvidence mirrors triage.EvidencePointer in the API.
+//
+// Only the fields the CLI needs for the interactive UX are decoded;
+// the JSON tag set keeps this loose so we tolerate the server adding
+// new fields without a breaking change.
+type TriageEvidence struct {
+	Kind        string `json:"kind"`
+	FilePath    string `json:"file_path,omitempty"`
+	Line        int    `json:"line,omitempty"`
+	Column      int    `json:"column,omitempty"`
+	Symbol      string `json:"symbol,omitempty"`
+	ImportPath  string `json:"import_path,omitempty"`
+	Description string `json:"description,omitempty"`
+	RawSnippet  string `json:"raw_snippet,omitempty"`
+	Source      string `json:"source,omitempty"`
+	Note        string `json:"note,omitempty"`
+}
+
+// ParsedDecision mirrors triage.ParsedDecision in the API.
+//
+// State is one of "not_affected" / "affected" / "under_investigation"
+// / "resolved" per CycloneDX VEX 1.5. Confidence is in [0.0, 1.0]
+// after server-side clamping (the runner already applied the
+// threshold guard before sending the response).
+type ParsedDecision struct {
+	State         string           `json:"state"`
+	Justification string           `json:"justification,omitempty"`
+	Detail        string           `json:"detail,omitempty"`
+	Confidence    float64          `json:"confidence"`
+	Evidence      []TriageEvidence `json:"evidence,omitempty"`
+}
+
+// VEXDraft mirrors repository.VEXDraft.
+//
+// We decode only the fields the interactive UI needs to render and the
+// decision PUT needs as a draft_id. Server-side timestamps / hashes
+// land in the raw JSON map for forward compatibility — the CLI does
+// not currently surface them but they would round-trip cleanly into a
+// debug `--json` flag.
+type VEXDraft struct {
+	ID              string  `json:"id"`
+	ProjectID       string  `json:"project_id"`
+	ComponentID     string  `json:"component_id"`
+	VulnerabilityID string  `json:"vulnerability_id"`
+	CVEID           string  `json:"cve_id"`
+	State           string  `json:"state"`
+	Justification   string  `json:"justification"`
+	Detail          string  `json:"detail"`
+	Confidence      *float64 `json:"confidence,omitempty"`
+	Provider        string  `json:"provider,omitempty"`
+	Model           string  `json:"model,omitempty"`
+	// Evidence here is the server-persisted JSONB array — same shape
+	// as ParsedDecision.Evidence but the field name in the DB row is
+	// `evidence` per repository.VEXDraft.
+	Evidence  json.RawMessage `json:"evidence,omitempty"`
+	Decision  string          `json:"decision"`
+	CreatedAt string          `json:"created_at,omitempty"`
+	UpdatedAt string          `json:"updated_at,omitempty"`
+}
+
+// TriageRunResult is what POST /triage/run returns on success (201).
+//
+// Threshold echoes the server's effective SBOMHUB_AI_CONFIDENCE_THRESHOLD
+// so the CLI can render "(threshold=0.7)" alongside the AI confidence.
+// Clamped reports whether the server demoted state to
+// `under_investigation` because confidence fell below the threshold —
+// that flag is the trigger for the CLI's auto-`under_investigation`
+// path in `--non-interactive`.
+type TriageRunResult struct {
+	Draft     *VEXDraft       `json:"draft"`
+	LLMCallID string          `json:"llm_call_id"`
+	Parsed    *ParsedDecision `json:"parsed_decision"`
+	Clamped   bool            `json:"clamped"`
+	Threshold float64         `json:"threshold"`
+}
+
+// vexDraftListResponse mirrors handler.vexDraftListResponse.
+type vexDraftListResponse struct {
+	Drafts []VEXDraft `json:"drafts"`
+}
+
+// VEXDraftListFilter narrows ListVEXDrafts. Empty fields are not sent
+// to the server (zero-valued query params have no effect server-side
+// anyway, but skipping them keeps the URL clean and the test golden).
+type VEXDraftListFilter struct {
+	CVEID    string
+	Decision string
+	Limit    int
+	Offset   int
+}
+
+// DecisionRequest is the body of PUT /vex-drafts/:draft_id/decision.
+//
+// Decision must be one of "approved", "edited", "rejected" — the server
+// 400's other values. EditedState / EditedJustification / EditedDetail
+// are only honored when Decision == "edited"; for "approved" /
+// "rejected" they are ignored server-side (see runner.UpdateDecision).
+type DecisionRequest struct {
+	Decision            string `json:"decision"`
+	EditedState         string `json:"edited_state,omitempty"`
+	EditedJustification string `json:"edited_justification,omitempty"`
+	EditedDetail        string `json:"edited_detail,omitempty"`
+	Note                string `json:"note,omitempty"`
+}
+
+// ----------------------------------------------------------------------------
+// Error decoding
+// ----------------------------------------------------------------------------
+
+// TriageError is the typed error returned by the triage helpers when the
+// server emits a non-2xx response. It carries the parsed JSON body
+// (`error` + optional `reason`) so the CLI can branch on:
+//
+//   - 503 + reason  → llm.DisabledError ("AI features are disabled") →
+//     fall back to under_investigation
+//   - 4xx           → permanent user / config error
+//   - 5xx (non-503) → transient server error
+//
+// Callers test category with the helpers IsAIDisabled / IsPermanent
+// rather than reaching into StatusCode directly, so the classification
+// stays in one place.
+type TriageError struct {
+	StatusCode int
+	URL        string
+	Method     string
+	Message    string // top-level "error" field
+	Reason     string // "reason" field (only populated for 503 DisabledError)
+	Raw        string // original body, preserved for debug logging
+}
+
+func (e *TriageError) Error() string {
+	if e.Reason != "" {
+		return fmt.Sprintf("triage API %s %s -> %d: %s (%s)", e.Method, e.URL, e.StatusCode, e.Message, e.Reason)
+	}
+	if e.Message != "" {
+		return fmt.Sprintf("triage API %s %s -> %d: %s", e.Method, e.URL, e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("triage API %s %s -> %d: %s", e.Method, e.URL, e.StatusCode, e.Raw)
+}
+
+// IsAIDisabled reports whether the server replied 503 from llm.DisabledError —
+// the BYOK-not-configured case. When true the CLI falls back to recording
+// the vuln as `under_investigation` and prints the "API キー未設定" hint.
+func (e *TriageError) IsAIDisabled() bool {
+	return e != nil && e.StatusCode == http.StatusServiceUnavailable
+}
+
+// IsPermanent reports whether the error is a permanent 4xx that the
+// caller cannot retry without fixing config (auth / input validation /
+// missing draft). 429 is intentionally treated as transient (not
+// permanent) to match the same R13 classification the scan polling
+// loop uses.
+func (e *TriageError) IsPermanent() bool {
+	if e == nil {
+		return false
+	}
+	if e.StatusCode == http.StatusTooManyRequests {
+		return false
+	}
+	return e.StatusCode >= 400 && e.StatusCode < 500
+}
+
+// decodeTriageError builds a TriageError from a non-2xx response body.
+// We tolerate non-JSON bodies (some intermediate gateways send HTML
+// 502 pages) — Raw always carries the original text so the operator
+// can still see what came back.
+func decodeTriageError(method, url string, status int, body []byte) *TriageError {
+	te := &TriageError{
+		StatusCode: status,
+		URL:        url,
+		Method:     method,
+		Raw:        string(body),
+	}
+	var parsed struct {
+		Error  string `json:"error"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(body, &parsed); err == nil {
+		te.Message = parsed.Error
+		te.Reason = parsed.Reason
+	}
+	return te
+}
+
+// ----------------------------------------------------------------------------
+// RunTriage — POST /api/v1/projects/:id/triage/run
+// ----------------------------------------------------------------------------
+
+// RunTriage executes one AI triage cycle for (project, vulnerability)
+// on the server and returns the persisted draft + parsed decision +
+// the clamping outcome.
+//
+// 503 from llm.DisabledError is returned as a *TriageError where
+// IsAIDisabled() == true — the CLI inspects that with errors.As and
+// short-circuits the interactive loop into the under_investigation
+// fallback.
+func (c *Client) RunTriage(ctx context.Context, projectID string, req TriageRunRequest) (*TriageRunResult, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/triage/run", c.baseURL, projectID)
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("triage リクエストのシリアライズに失敗: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("triage リクエスト送信エラー: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, decodeTriageError(http.MethodPost, endpoint, resp.StatusCode, respBody)
+	}
+
+	var out TriageRunResult
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("triage レスポンス解析エラー: %w", err)
+	}
+	return &out, nil
+}
+
+// ----------------------------------------------------------------------------
+// ListVEXDrafts — GET /api/v1/projects/:id/vex-drafts
+// ----------------------------------------------------------------------------
+
+// ListVEXDrafts returns the project's existing VEX drafts, optionally
+// filtered by CVE ID / decision / paginated. Returns an empty slice
+// (not nil) when there are no drafts so callers can `range` safely.
+func (c *Client) ListVEXDrafts(ctx context.Context, projectID string, filter VEXDraftListFilter) ([]VEXDraft, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/vex-drafts", c.baseURL, projectID)
+
+	q := url.Values{}
+	if filter.CVEID != "" {
+		q.Set("cve_id", filter.CVEID)
+	}
+	if filter.Decision != "" {
+		q.Set("decision", filter.Decision)
+	}
+	if filter.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", filter.Limit))
+	}
+	if filter.Offset > 0 {
+		q.Set("offset", fmt.Sprintf("%d", filter.Offset))
+	}
+	if encoded := q.Encode(); encoded != "" {
+		endpoint = endpoint + "?" + encoded
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("vex-drafts リクエスト送信エラー: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeTriageError(http.MethodGet, endpoint, resp.StatusCode, respBody)
+	}
+
+	var out vexDraftListResponse
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("vex-drafts レスポンス解析エラー: %w", err)
+	}
+	if out.Drafts == nil {
+		return []VEXDraft{}, nil
+	}
+	return out.Drafts, nil
+}
+
+// ----------------------------------------------------------------------------
+// DecideDraft — PUT /api/v1/projects/:id/vex-drafts/:draft_id/decision
+// ----------------------------------------------------------------------------
+
+// DecideDraft applies a human approve / edit / reject decision to a
+// VEX draft. The server mirrors approve/edit verdicts into the
+// vex_statements table and writes an audit log row — neither concern
+// surfaces in this client API.
+func (c *Client) DecideDraft(ctx context.Context, projectID, draftID string, dec DecisionRequest) (*VEXDraft, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/vex-drafts/%s/decision", c.baseURL, projectID, draftID)
+
+	body, err := json.Marshal(dec)
+	if err != nil {
+		return nil, fmt.Errorf("decision リクエストのシリアライズに失敗: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPut, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("decision リクエスト送信エラー: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeTriageError(http.MethodPut, endpoint, resp.StatusCode, respBody)
+	}
+
+	var out VEXDraft
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("decision レスポンス解析エラー: %w", err)
+	}
+	return &out, nil
+}
+
+// ----------------------------------------------------------------------------
+// ListVulnerabilities — GET /api/v1/projects/:id/vulnerabilities
+// ----------------------------------------------------------------------------
+
+// VulnerabilityRecord is the per-project vulnerability row returned by
+// GET /api/v1/projects/:id/vulnerabilities (handler.GetVulnerabilities
+// in sbom.go). We decode only the fields the triage loop needs to call
+// RunTriage with — ID is the local `vulnerabilities.id` UUID, CVEID is
+// the human-facing identifier surfaced in the prompt.
+//
+// ※要確認: the server-side `/vulnerabilities` endpoint returns the
+// per-vulnerability model rows but does not currently include a
+// component_id on each row (the cross-table relation lives in
+// component_vulnerabilities). The CLI therefore omits ComponentID in
+// TriageRunRequest, letting the server resolve a representative
+// component from vulnerability_id. Once the server adds a richer
+// projection (cve + component pair), the CLI should switch to passing
+// component_id explicitly so drafts are pinned to the precise
+// (component, vuln) tuple.
+type VulnerabilityRecord struct {
+	ID          string  `json:"id"`
+	CVEID       string  `json:"cve_id"`
+	Description string  `json:"description,omitempty"`
+	Severity    string  `json:"severity,omitempty"`
+	CVSSScore   float64 `json:"cvss_score,omitempty"`
+	InKEV       bool    `json:"in_kev,omitempty"`
+	Source      string  `json:"source,omitempty"`
+}
+
+// ListVulnerabilities returns the project's vulnerabilities so the
+// triage CLI can iterate over them.
+//
+// The server returns a JSON array directly (see handler.GetVulnerabilities
+// — it `c.JSON(http.StatusOK, vulns)` the slice without an enveloping
+// `{ "vulnerabilities": [...] }`). We decode the bare array shape
+// accordingly.
+func (c *Client) ListVulnerabilities(ctx context.Context, projectID string) ([]VulnerabilityRecord, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/vulnerabilities", c.baseURL, projectID)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("vulnerabilities リクエスト送信エラー: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeTriageError(http.MethodGet, endpoint, resp.StatusCode, respBody)
+	}
+
+	// Accept both shapes — the canonical handler returns a bare array,
+	// but defensive decoding for an enveloped `{ "vulnerabilities":
+	// [...] }` keeps the CLI compatible with future server changes
+	// without a coordinated release.
+	var bare []VulnerabilityRecord
+	if err := json.Unmarshal(respBody, &bare); err == nil {
+		return bare, nil
+	}
+	var enveloped struct {
+		Vulnerabilities []VulnerabilityRecord `json:"vulnerabilities"`
+	}
+	if err := json.Unmarshal(respBody, &enveloped); err != nil {
+		return nil, fmt.Errorf("vulnerabilities レスポンス解析エラー: %w", err)
+	}
+	return enveloped.Vulnerabilities, nil
+}
