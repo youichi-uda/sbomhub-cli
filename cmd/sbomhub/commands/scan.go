@@ -10,7 +10,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
-	"github.com/youichi-uda/sbomhub-cli/internal/config"
 	"github.com/youichi-uda/sbomhub-cli/internal/scanner"
 	"github.com/youichi-uda/sbomhub-cli/internal/severity"
 )
@@ -160,28 +159,31 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// 設定の読み込み
+	// 設定の解決: config file → env → CLI flag の precedence で merge する。
+	// config file が無くても flag/env だけで動く (Codex R2 fix): CI runner
+	// のような ephemeral 環境向け。
 	configDir := filepath.Join(os.Getenv("HOME"), ".sbomhub")
 	if os.Getenv("USERPROFILE") != "" {
 		configDir = filepath.Join(os.Getenv("USERPROFILE"), ".sbomhub")
 	}
 
-	cfg, err := config.Load(configDir)
+	cfg, err := resolveCredentials(configDir)
 	if err != nil {
 		return &scanExitError{
 			code: exitAPIError,
-			msg:  fmt.Sprintf("設定の読み込みに失敗しました。'sbomhub login' を実行してください: %v", err),
+			msg:  fmt.Sprintf("設定の読み込みに失敗しました: %v", err),
 		}
-	}
-
-	// API Key の確認
-	if apiKey != "" {
-		cfg.APIKey = apiKey
 	}
 	if cfg.APIKey == "" {
 		return &scanExitError{
 			code: exitAPIError,
-			msg:  "API Keyが設定されていません。'sbomhub login' を実行するか --api-key を指定してください",
+			msg:  "API Keyが設定されていません。 'sbomhub login' で対話設定するか、 --api-key フラグ・ 環境変数 SBOMHUB_API_KEY を指定してください",
+		}
+	}
+	if cfg.APIURL == "" {
+		return &scanExitError{
+			code: exitAPIError,
+			msg:  "API URLが設定されていません。 'sbomhub login' で設定するか、 --api-url フラグ・ 環境変数 SBOMHUB_API_URL を指定してください",
 		}
 	}
 

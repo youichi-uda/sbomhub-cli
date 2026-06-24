@@ -118,6 +118,69 @@ func TestSaveConfig(t *testing.T) {
 	}
 }
 
+// TestLoadOrDefaultMissing verifies the Codex R2 fix: a missing config
+// file is NOT an error for the fail-soft loader. Noninteractive callers
+// (CI runners passing credentials by --api-* flag or env var) must be
+// able to operate without having run `sbomhub login` first.
+func TestLoadOrDefaultMissing(t *testing.T) {
+	tmpDir := t.TempDir() // no config.yaml written
+
+	cfg, err := LoadOrDefault(tmpDir)
+	if err != nil {
+		t.Fatalf("LoadOrDefault() error = %v, want nil for missing file", err)
+	}
+	if cfg == nil {
+		t.Fatal("LoadOrDefault() returned nil cfg for missing file")
+	}
+	if cfg.APIURL != DefaultAPIURL {
+		t.Errorf("APIURL = %q, want default %q (default must seed when file is absent)", cfg.APIURL, DefaultAPIURL)
+	}
+	if cfg.APIKey != "" {
+		t.Errorf("APIKey = %q, want empty (no source provided the key)", cfg.APIKey)
+	}
+}
+
+// TestLoadOrDefaultParseError verifies LoadOrDefault is fail-soft ONLY on
+// missing files — a malformed config.yaml on disk must still surface so
+// the operator can fix it rather than silently running with empty creds.
+func TestLoadOrDefaultParseError(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("invalid: yaml: content:"), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	_, err := LoadOrDefault(tmpDir)
+	if err == nil {
+		t.Error("LoadOrDefault() expected error for invalid YAML, got nil")
+	}
+}
+
+// TestLoadOrDefaultPresent verifies the existing-file path of LoadOrDefault
+// is equivalent to Load: the function should not zero out fields just
+// because it also tolerates absence.
+func TestLoadOrDefaultPresent(t *testing.T) {
+	tmpDir := t.TempDir()
+	configContent := `api_url: https://api.example.com
+api_key: present-key
+`
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		t.Fatalf("Failed to write config file: %v", err)
+	}
+
+	cfg, err := LoadOrDefault(tmpDir)
+	if err != nil {
+		t.Fatalf("LoadOrDefault() error = %v", err)
+	}
+	if cfg.APIURL != "https://api.example.com" {
+		t.Errorf("APIURL = %q, want %q", cfg.APIURL, "https://api.example.com")
+	}
+	if cfg.APIKey != "present-key" {
+		t.Errorf("APIKey = %q, want %q", cfg.APIKey, "present-key")
+	}
+}
+
 func TestSaveConfigPermissions(t *testing.T) {
 	tmpDir := t.TempDir()
 	configDir := filepath.Join(tmpDir, "sbomhub")

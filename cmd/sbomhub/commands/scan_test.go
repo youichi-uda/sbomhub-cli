@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
+	"github.com/youichi-uda/sbomhub-cli/internal/config"
 )
 
 // TestWaitForScanCompletion_Completes verifies the polling loop reaches a
@@ -126,6 +127,99 @@ func TestWaitForScanCompletion_Failed(t *testing.T) {
 	}
 	if failedMsg != "nvd: rate limited" {
 		t.Errorf("failedMsg = %q, want %q", failedMsg, "nvd: rate limited")
+	}
+}
+
+// TestResolveCredentials_FailSoftMissingConfig verifies the Codex R2 fix:
+// when ~/.sbomhub/config.yaml does not exist (e.g. a CI runner that
+// never ran `sbomhub login`), `--api-url` / `--api-key` flags and
+// SBOMHUB_API_URL / SBOMHUB_API_KEY env vars are honoured anyway.
+//
+// Before the fix, scan.go called config.Load which returned an error for
+// the missing file, killing the run with exitAPIError before the flag /
+// env layer could even be inspected.
+func TestResolveCredentials_FailSoftMissingConfig(t *testing.T) {
+	tmpDir := t.TempDir() // intentionally no config.yaml
+
+	// Reset env + globals so this test doesn't leak into / from siblings.
+	t.Setenv("SBOMHUB_API_URL", "")
+	t.Setenv("SBOMHUB_API_KEY", "")
+	saveURL, saveKey := apiURL, apiKey
+	t.Cleanup(func() { apiURL, apiKey = saveURL, saveKey })
+
+	// Sub-test 1: CLI flag layer only.
+	apiURL = "https://flag.example.com"
+	apiKey = "sbh_flag"
+	cfg, err := resolveCredentials(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveCredentials() error = %v, want nil with flags + no config", err)
+	}
+	if cfg.APIURL != "https://flag.example.com" || cfg.APIKey != "sbh_flag" {
+		t.Errorf("flags not applied: APIURL=%q APIKey=%q", cfg.APIURL, cfg.APIKey)
+	}
+
+	// Sub-test 2: env layer only. (Clear the flag globals.)
+	apiURL, apiKey = "", ""
+	t.Setenv("SBOMHUB_API_URL", "https://env.example.com")
+	t.Setenv("SBOMHUB_API_KEY", "sbh_env")
+	cfg, err = resolveCredentials(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveCredentials() error = %v, want nil with env + no config", err)
+	}
+	if cfg.APIURL != "https://env.example.com" || cfg.APIKey != "sbh_env" {
+		t.Errorf("env not applied: APIURL=%q APIKey=%q", cfg.APIURL, cfg.APIKey)
+	}
+}
+
+// TestResolveCredentials_Precedence asserts the documented order
+// CLI flag > env > config file > default. A regression here means a CI
+// runner trying to override a stale ~/.sbomhub/config.yaml with --api-url
+// would silently keep talking to the wrong API.
+func TestResolveCredentials_Precedence(t *testing.T) {
+	tmpDir := t.TempDir()
+	if err := config.Save(&config.Config{
+		APIURL: "https://file.example.com",
+		APIKey: "sbh_file",
+	}, tmpDir); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	saveURL, saveKey := apiURL, apiKey
+	t.Cleanup(func() { apiURL, apiKey = saveURL, saveKey })
+
+	// File + env: env wins over file.
+	apiURL, apiKey = "", ""
+	t.Setenv("SBOMHUB_API_URL", "https://env.example.com")
+	t.Setenv("SBOMHUB_API_KEY", "sbh_env")
+	cfg, err := resolveCredentials(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveCredentials() error = %v", err)
+	}
+	if cfg.APIURL != "https://env.example.com" || cfg.APIKey != "sbh_env" {
+		t.Errorf("env should beat file: APIURL=%q APIKey=%q", cfg.APIURL, cfg.APIKey)
+	}
+
+	// File + env + flag: flag wins over both.
+	apiURL = "https://flag.example.com"
+	apiKey = "sbh_flag"
+	cfg, err = resolveCredentials(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveCredentials() error = %v", err)
+	}
+	if cfg.APIURL != "https://flag.example.com" || cfg.APIKey != "sbh_flag" {
+		t.Errorf("flag should beat env and file: APIURL=%q APIKey=%q", cfg.APIURL, cfg.APIKey)
+	}
+
+	// File only (no env, no flag): file value is used unchanged.
+	apiURL, apiKey = "", ""
+	t.Setenv("SBOMHUB_API_URL", "")
+	t.Setenv("SBOMHUB_API_KEY", "")
+	cfg, err = resolveCredentials(tmpDir)
+	if err != nil {
+		t.Fatalf("resolveCredentials() error = %v", err)
+	}
+	if cfg.APIURL != "https://file.example.com" || cfg.APIKey != "sbh_file" {
+		t.Errorf("file value lost when no env/flag: APIURL=%q APIKey=%q", cfg.APIURL, cfg.APIKey)
 	}
 }
 

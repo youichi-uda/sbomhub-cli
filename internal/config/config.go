@@ -14,7 +14,14 @@ type Config struct {
 	APIKey string `yaml:"api_key"`
 }
 
-// Load loads configuration from the specified directory
+// DefaultAPIURL is the URL used when neither config nor CLI/env provides
+// one. Exported so callers (login, doctor) can format identical hints.
+const DefaultAPIURL = "https://api.sbomhub.app"
+
+// Load loads configuration from the specified directory. Missing files are
+// reported as an error — callers that want to operate without a config
+// file (e.g. CI runners that pass credentials via flags or environment
+// variables only) should use LoadOrDefault instead.
 func Load(configDir string) (*Config, error) {
 	configPath := filepath.Join(configDir, "config.yaml")
 
@@ -33,10 +40,35 @@ func Load(configDir string) (*Config, error) {
 
 	// デフォルト値
 	if cfg.APIURL == "" {
-		cfg.APIURL = "https://api.sbomhub.app"
+		cfg.APIURL = DefaultAPIURL
 	}
 
 	return &cfg, nil
+}
+
+// LoadOrDefault is the fail-soft variant of Load: when the config file is
+// missing, an empty *Config (with DefaultAPIURL applied) is returned with
+// a nil error. Parse errors on an existing file are still propagated.
+//
+// This exists so noninteractive flows (`--api-url` / `--api-key` flags or
+// SBOMHUB_API_URL / SBOMHUB_API_KEY env vars) keep working on systems
+// where the operator never ran `sbomhub login` — e.g. ephemeral CI
+// runners. Callers are expected to layer their own flag/env overrides on
+// top of the returned config and validate the final result themselves.
+func LoadOrDefault(configDir string) (*Config, error) {
+	cfg, err := Load(configDir)
+	if err == nil {
+		return cfg, nil
+	}
+
+	configPath := filepath.Join(configDir, "config.yaml")
+	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
+		// Treat "no file" as "empty cfg" so callers can still honour
+		// CLI flags / env vars. Any other Load error (parse failure,
+		// permission denied on an existing file, etc.) bubbles up.
+		return &Config{APIURL: DefaultAPIURL}, nil
+	}
+	return nil, err
 }
 
 // Save saves configuration to the specified directory
