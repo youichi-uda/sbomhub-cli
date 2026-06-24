@@ -445,6 +445,78 @@ func TestFormatScanVulnSummary_UnknownNotDropped(t *testing.T) {
 	}
 }
 
+// TestFormatScanVulnSummary_ServerTotalZeroButBucketsPopulated verifies
+// the Codex R6 finding 2 fix: when the server returns total=0 but one or
+// more per-severity buckets are non-zero (partial response, streamed
+// scan, or an older server that omits the total field), the formatter
+// must compute the total from the buckets and surface those findings —
+// NOT fall back to "なし ✅".
+//
+// Before the fix, the guard was `if total == 0 && kev == 0 && u == 0`,
+// which let a `Critical=1, Total=0` response render as "なし ✅", silently
+// hiding the most severe possible finding.
+func TestFormatScanVulnSummary_ServerTotalZeroButBucketsPopulated(t *testing.T) {
+	cases := []struct {
+		name    string
+		summary *api.VulnerabilitySummary
+		wantHas string // substring that MUST appear
+		wantNot string // substring that MUST NOT appear
+	}{
+		{
+			name: "total=0 + critical=1 surfaces critical",
+			summary: &api.VulnerabilitySummary{
+				Critical: 1, Total: 0,
+			},
+			wantHas: "1 Critical",
+			wantNot: "なし",
+		},
+		{
+			name: "total=0 + high=2 + medium=3 surfaces both",
+			summary: &api.VulnerabilitySummary{
+				High: 2, Medium: 3, Total: 0,
+			},
+			wantHas: "2 High",
+			wantNot: "なし",
+		},
+		{
+			name: "total=0 + low=1 surfaces low",
+			summary: &api.VulnerabilitySummary{
+				Low: 1, Total: 0,
+			},
+			wantHas: "1 Low",
+			wantNot: "なし",
+		},
+		{
+			name: "all buckets zero + total=0 still says なし",
+			summary: &api.VulnerabilitySummary{
+				Total: 0,
+			},
+			wantHas: "なし",
+		},
+		{
+			name: "all buckets zero + total>0 still says なし (we trust the buckets)",
+			// Pathological server: claims findings exist but does not
+			// itemize them. We render "なし" because the per-severity
+			// breakdown is what the operator actually consumes.
+			summary: &api.VulnerabilitySummary{
+				Total: 42,
+			},
+			wantHas: "なし",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatScanVulnSummary(nil, tc.summary)
+			if tc.wantHas != "" && !strings.Contains(got, tc.wantHas) {
+				t.Errorf("formatScanVulnSummary() = %q, want substring %q", got, tc.wantHas)
+			}
+			if tc.wantNot != "" && strings.Contains(got, tc.wantNot) {
+				t.Errorf("formatScanVulnSummary() = %q, must not contain %q (server total=0 short-circuit hid real findings)", got, tc.wantNot)
+			}
+		})
+	}
+}
+
 // TestRunScan_FailOnRequiresWaitForScan verifies the Codex R3 fix: when
 // `--fail-on` is set, passing `--wait-for-scan=false` must be rejected at
 // startup with a usage error. Before the fix, the combination silently
