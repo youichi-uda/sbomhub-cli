@@ -257,6 +257,52 @@ func TestDoctor_AuthFails(t *testing.T) {
 	}
 }
 
+// TestDoctor_AuthForbidden covers Codex R12 P2: when the auth-verify endpoint
+// returns 403 (api_key passes authentication but lacks tenant / scope
+// authorization), `sbomhub doctor` must report FAIL — otherwise the operator
+// gets a green doctor while every real CLI call (scan / upload / projects)
+// fails the same 403. Before the fix, 403 fell through to the default WARN
+// arm and the doctor exited 0.
+func TestDoctor_AuthForbidden(t *testing.T) {
+	dir := t.TempDir()
+	resetCredentialGlobals(t)
+	clearCredentialEnv(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/health":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		case "/api/v1/cli/projects":
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"tenant access denied"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	writeDoctorConfig(t, dir, srv.URL, "sbh_validkeynoaccess")
+	results := doctorChecks(dir, newTestHTTPClient(), false, false)
+
+	if reach := findResult(results, "api-reachability"); reach == nil || reach.status != doctorOK {
+		t.Errorf("expected reachability OK, got %+v", reach)
+	}
+	auth := findResult(results, "auth-verify")
+	if auth == nil || auth.status != doctorFail {
+		t.Errorf("expected auth-verify FAIL on 403, got %+v", auth)
+	}
+	if auth != nil && !strings.Contains(auth.message, "403") {
+		t.Errorf("expected auth-verify message to mention 403 status, got: %s", auth.message)
+	}
+
+	// runDoctorWith must return an error so main exits 1.
+	var buf bytes.Buffer
+	if err := runDoctorWith(&buf, dir, newTestHTTPClient(), false, false, false); err == nil {
+		t.Errorf("runDoctorWith returned nil despite 403 FAIL; output:\n%s", buf.String())
+	}
+}
+
 func TestDoctor_APIUnreachable(t *testing.T) {
 	dir := t.TempDir()
 	resetCredentialGlobals(t)

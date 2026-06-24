@@ -368,6 +368,19 @@ func doctorChecks(configDir string, client *http.Client, apiKeyFromFlag, apiURLF
 				message: "認証失敗 (401) — api_key が無効・失効しています。 `sbomhub login` で再設定してください",
 				detail:  fmt.Sprintf("url=%s body=%s", verifyURL, truncateBody(body)),
 			})
+		case status == http.StatusForbidden:
+			// 403 = api_key is valid (passed authentication) but the
+			// resolved principal lacks authorization for the tenant /
+			// scope. Treat as FAIL: every subsequent CLI call against
+			// this endpoint will also 403, so reporting [OK] / [WARN]
+			// here would let `doctor` exit 0 while the rest of the
+			// product is unusable (Codex R12 P2).
+			results = append(results, doctorResult{
+				name:    "auth-verify",
+				status:  doctorFail,
+				message: "認証失敗 (403) — api_key は有効ですが tenant / scope に対する access 権限がありません。 server 側の tenant 設定や role 割当を確認してください",
+				detail:  fmt.Sprintf("url=%s body=%s", verifyURL, truncateBody(body)),
+			})
 		default:
 			results = append(results, doctorResult{
 				name:    "auth-verify",
