@@ -243,6 +243,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	var summary *api.VulnerabilitySummary
 	var scanTimedOut bool
 	var scanFailedMsg string
+	var scanLastFetchedAt time.Time
 	if scanWaitForScan {
 		// Bind the polling loop's deadline to a context so the in-flight
 		// HTTP request can be cancelled the moment --wait-timeout expires
@@ -250,7 +251,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		// the only thing in effect before this — meaning --wait-timeout=10s
 		// could still hang for up to 60s on a slow server.
 		ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
-		summary, scanTimedOut, scanFailedMsg = waitForScanCompletion(ctx, client, result.ProjectID, result.SBOMID)
+		summary, scanTimedOut, scanFailedMsg, scanLastFetchedAt = waitForScanCompletion(ctx, client, result.ProjectID, result.SBOMID)
 		cancel()
 	}
 
@@ -263,7 +264,18 @@ func runScan(cmd *cobra.Command, args []string) error {
 	// 操作者には stderr で警告を残す。
 	if failOnLevel == severity.LevelNone {
 		if scanTimedOut {
-			fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが --wait-timeout %s 以内に完了しませんでした。 表示している件数は中間値です。\n", scanWaitTimeout)
+			// Codex R5 fix: when polling timed out we now return the most
+			// recently observed status snapshot (if any), so the counts in
+			// the result box above are real partial counts rather than the
+			// upload response's zeros. Spell that out in the warning so the
+			// operator knows what they are looking at — and call out the
+			// "no successful poll" case separately so a zero count box does
+			// not get conflated with "snapshot from t=X".
+			if !scanLastFetchedAt.IsZero() {
+				fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが --wait-timeout %s 以内に完了しませんでした。 最後の取得時点 (%s) の暫定 counts を表示しています。\n", scanWaitTimeout, scanLastFetchedAt.Format(time.RFC3339))
+			} else {
+				fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが --wait-timeout %s 以内に完了しませんでした。 暫定 counts は取得できませんでした。\n", scanWaitTimeout)
+			}
 		} else if scanFailedMsg != "" {
 			fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが失敗しました: %s\n", scanFailedMsg)
 		}
@@ -331,9 +343,15 @@ func runScan(cmd *cobra.Command, args []string) error {
 // to --wait-timeout in runScan). Polling cadence is --poll-interval.
 // Returns:
 //
-//   - summary:        latest counts on success (status=completed)
+//   - summary:        latest counts on success (status=completed); on
+//     timeout, the most-recently observed counts (Codex R5 fix); nil only
+//     when no poll ever returned a valid response before ctx fired.
 //   - timedOut:       true if ctx fired before a terminal state was seen
 //   - failedErrorMsg: non-empty if server reported the scan failed
+//   - lastFetchedAt:  wall-clock timestamp of the most recent successful
+//     poll; zero time.Time when no poll ever succeeded. Caller surfaces
+//     this to the operator alongside the timeout warning so the partial
+//     counts are clearly labelled as a snapshot rather than a final tally.
 //
 // On transient API errors the function logs a brief notice and keeps
 // polling rather than aborting; the network may flap mid-CI and we
@@ -341,7 +359,15 @@ func runScan(cmd *cobra.Command, args []string) error {
 // only exception is when the error is itself caused by ctx cancellation —
 // that surfaces as a clean timeout instead of a noisy "retry until clock
 // catches up" loop (Codex R4 finding 2).
-func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, sbomID string) (summary *api.VulnerabilitySummary, timedOut bool, failedErrorMsg string) {
+//
+// Codex R5 fix: previously this function returned summary=nil on the
+// timeout path, which caused runScan -> printResultBox -> formatScanVulnSummary
+// to fall back to the canonical upload response's zero counts. The result
+// box rendered "なし ✅" right next to the "scan timed out, intermediate
+// counts shown" warning — actively misleading. We now keep the latest
+// successful snapshot and return it so the operator sees the real partial
+// numbers and the warning is consistent with the box content.
+func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, sbomID string) (summary *api.VulnerabilitySummary, timedOut bool, failedErrorMsg string, lastFetchedAt time.Time) {
 	tick := scanPollInterval
 	if tick <= 0 {
 		tick = 5 * time.Second
@@ -350,9 +376,11 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 	fmt.Printf("⏳ サーバ側脆弱性スキャン待機中 (timeout=%s, interval=%s)...\n", scanWaitTimeout, tick)
 
 	startTime := time.Now()
+	var latest *api.VulnerabilitySummary
+	var latestAt time.Time
 	for {
 		if ctx.Err() != nil {
-			return nil, true, ""
+			return latest, true, "", latestAt
 		}
 
 		status, err := client.GetScanStatus(ctx, projectID, sbomID)
@@ -361,7 +389,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 			// mid-request) treat it as a clean timeout — not a transient
 			// API error to retry past the deadline.
 			if ctx.Err() != nil {
-				return nil, true, ""
+				return latest, true, "", latestAt
 			}
 			fmt.Printf("   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
 		} else {
@@ -373,11 +401,18 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 				status.Vulnerabilities.Unknown,
 				status.Vulnerabilities.KEV, status.Vulnerabilities.Total)
 
+			// Snapshot by value, not by &status.Vulnerabilities — `status`
+			// is rebound each loop iteration; keeping a pointer into the
+			// previous iteration's struct would silently mutate or alias.
+			snap := status.Vulnerabilities
+			latest = &snap
+			latestAt = time.Now()
+
 			switch status.Status {
 			case "completed":
-				return &status.Vulnerabilities, false, ""
+				return latest, false, "", latestAt
 			case "failed":
-				return &status.Vulnerabilities, false, fallbackString(status.Error, "unspecified server-side scan failure")
+				return latest, false, fallbackString(status.Error, "unspecified server-side scan failure"), latestAt
 			}
 		}
 
@@ -388,7 +423,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil, true, ""
+			return latest, true, "", latestAt
 		case <-timer.C:
 		}
 	}

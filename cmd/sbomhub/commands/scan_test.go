@@ -55,7 +55,7 @@ func TestWaitForScanCompletion_Completes(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
 	defer cancel()
-	summary, timedOut, failedMsg := waitForScanCompletion(ctx, client, projectID, sbomID)
+	summary, timedOut, failedMsg, lastFetchedAt := waitForScanCompletion(ctx, client, projectID, sbomID)
 	if timedOut {
 		t.Fatalf("waitForScanCompletion timed out unexpectedly (hits=%d)", atomic.LoadInt32(&hits))
 	}
@@ -64,6 +64,9 @@ func TestWaitForScanCompletion_Completes(t *testing.T) {
 	}
 	if summary == nil {
 		t.Fatal("summary is nil on completion")
+	}
+	if lastFetchedAt.IsZero() {
+		t.Error("lastFetchedAt is zero on completion; expected the timestamp of the terminal poll")
 	}
 	if summary.Critical != 2 || summary.High != 3 || summary.Total != 5 {
 		t.Errorf("summary = %+v, want critical=2 high=3 total=5", *summary)
@@ -99,9 +102,9 @@ func TestWaitForScanCompletion_TimesOut(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
 	defer cancel()
-	summary, timedOut, failedMsg := waitForScanCompletion(ctx, client, "p", "s")
+	summary, timedOut, failedMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
 	if !timedOut {
-		t.Errorf("expected timeout, got summary=%v failedMsg=%q", summary, failedMsg)
+		t.Errorf("expected timeout, got summary=%+v failedMsg=%q", summary, failedMsg)
 	}
 }
 
@@ -129,12 +132,132 @@ func TestWaitForScanCompletion_Failed(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
 	defer cancel()
-	_, timedOut, failedMsg := waitForScanCompletion(ctx, client, "p", "s")
+	_, timedOut, failedMsg, _ := waitForScanCompletion(ctx, client, "p", "s")
 	if timedOut {
 		t.Error("expected failed path, not timeout")
 	}
 	if failedMsg != "nvd: rate limited" {
 		t.Errorf("failedMsg = %q, want %q", failedMsg, "nvd: rate limited")
+	}
+}
+
+// TestWaitForScanCompletion_TimeoutPreservesPartialCounts verifies the
+// Codex R5 fix: when polling times out after one or more successful
+// status fetches, the function must return the most recent VulnerabilitySummary
+// snapshot (NOT nil) together with the timestamp of that fetch. Before
+// the fix, timeout discarded the snapshot, runScan fell back to the
+// upload response's zero counts, and the result box rendered "なし ✅"
+// next to the timeout warning — silently hiding real partial findings.
+func TestWaitForScanCompletion_TimeoutPreservesPartialCounts(t *testing.T) {
+	const projectID = "33333333-3333-3333-3333-333333333333"
+	const sbomID = "44444444-4444-4444-4444-444444444444"
+
+	// Server hits 1..2 return a running snapshot with real counts; hits
+	// 3+ block until the test's ctx cancels them. This forces the loop to
+	// observe a non-empty snapshot before timeout fires.
+	hung := make(chan struct{})
+	t.Cleanup(func() { close(hung) })
+
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		if n <= 2 {
+			resp := api.ScanStatusResponse{
+				Status:    "running",
+				SbomID:    sbomID,
+				ProjectID: projectID,
+				Vulnerabilities: api.VulnerabilitySummary{
+					Critical: 1, High: 2, Medium: 0, Low: 0, KEV: 1, Total: 3,
+				},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		// Hang until ctx cancels or the test ends.
+		select {
+		case <-r.Context().Done():
+		case <-hung:
+		}
+	}))
+	defer server.Close()
+
+	client := api.NewClient(server.URL, "test-key")
+
+	// Tight ctx deadline so the test finishes fast, but long enough for
+	// the first two polls (10ms interval) to land.
+	scanWaitTimeout = 300 * time.Millisecond
+	scanPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		scanWaitTimeout = 5 * time.Minute
+		scanPollInterval = 5 * time.Second
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+	defer cancel()
+
+	before := time.Now()
+	summary, timedOut, failedMsg, lastFetchedAt := waitForScanCompletion(ctx, client, projectID, sbomID)
+	after := time.Now()
+
+	if !timedOut {
+		t.Fatalf("expected timeout, got summary=%+v failedMsg=%q", summary, failedMsg)
+	}
+	if failedMsg != "" {
+		t.Errorf("failedMsg = %q, want empty (timeout path)", failedMsg)
+	}
+	if summary == nil {
+		t.Fatal("summary is nil on timeout — partial counts were discarded (Codex R5 regression)")
+	}
+	if summary.Critical != 1 || summary.High != 2 || summary.KEV != 1 || summary.Total != 3 {
+		t.Errorf("summary = %+v, want critical=1 high=2 kev=1 total=3 (latest running snapshot)", *summary)
+	}
+	if lastFetchedAt.IsZero() {
+		t.Error("lastFetchedAt is zero; expected the timestamp of the last successful poll")
+	}
+	if lastFetchedAt.Before(before) || lastFetchedAt.After(after) {
+		t.Errorf("lastFetchedAt=%s out of bounds [%s, %s]", lastFetchedAt, before, after)
+	}
+	if got := atomic.LoadInt32(&hits); got < 2 {
+		t.Errorf("server hits=%d, want >=2 (loop should poll at least the two non-hung responses)", got)
+	}
+}
+
+// TestWaitForScanCompletion_TimeoutNoSuccessfulPoll covers the edge case
+// where ctx fires before any GetScanStatus call returns successfully —
+// summary must be nil and lastFetchedAt must be the zero time so callers
+// can distinguish "no snapshot at all" from "stale snapshot from t=X".
+func TestWaitForScanCompletion_TimeoutNoSuccessfulPoll(t *testing.T) {
+	// Server hangs forever — never writes a response.
+	hung := make(chan struct{})
+	t.Cleanup(func() { close(hung) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-hung:
+		}
+	}))
+	defer server.Close()
+
+	client := api.NewClient(server.URL, "test-key")
+
+	scanWaitTimeout = 80 * time.Millisecond
+	scanPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		scanWaitTimeout = 5 * time.Minute
+		scanPollInterval = 5 * time.Second
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+	defer cancel()
+	summary, timedOut, _, lastFetchedAt := waitForScanCompletion(ctx, client, "p", "s")
+	if !timedOut {
+		t.Fatal("expected timeout")
+	}
+	if summary != nil {
+		t.Errorf("summary = %+v, want nil when no poll ever returned", *summary)
+	}
+	if !lastFetchedAt.IsZero() {
+		t.Errorf("lastFetchedAt = %s, want zero time when no poll ever returned", lastFetchedAt)
 	}
 }
 
@@ -174,7 +297,7 @@ func TestWaitForScanCompletion_ContextCancelAbortsHungRequest(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, timedOut, _ := waitForScanCompletion(ctx, client, "p", "s")
+	_, timedOut, _, _ := waitForScanCompletion(ctx, client, "p", "s")
 	elapsed := time.Since(start)
 
 	if !timedOut {
