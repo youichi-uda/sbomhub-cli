@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Go Version](https://img.shields.io/badge/go-1.22+-00ADD8)
 
-A command-line tool for SBOMHub. Wraps SBOM generation tools like Syft, Trivy, and cdxgen to generate and upload SBOMs to SBOMHub in a single command.
+SBOMHub CLI: a command-line tool that takes you from SBOM generation through upload — and, in upcoming releases, on to VEX export and CRA report drafting — in a single command, so you can meet the EU CRA 2026-09 deadline. Wraps SBOM generators (Syft, Trivy, cdxgen) and pairs with the self-host SBOMHub server.
 
 ## Supported Formats
 
@@ -44,8 +44,11 @@ scoop install sbomhub
 ### Initial Setup
 
 ```bash
-# Login (browser auth or API key input)
-sbomhub login
+# Recommended: connect to your self-host SBOMHub
+sbomhub login --url http://localhost:8080 --api-key sbh_xxxxx
+
+# The SaaS edition (sbomhub.app / api.sbomhub.app) was sunset in 2026-06.
+# Self-host (Docker Compose) is the only supported deployment going forward.
 
 # Check configuration
 sbomhub config
@@ -85,6 +88,16 @@ sbomhub check ./sbom.json
 sbomhub projects list
 ```
 
+## Roadmap (M1 and beyond)
+
+The following commands are planned for M1–M2 to round out CRA 2026-09 readiness. Every one of them is built on an AI-drafts-with-human-approval model (no auto-approval).
+
+- `sbomhub triage` — interactive triage of Critical/High vulnerabilities, with handoff to AI VEX drafts
+- `sbomhub vex export` — export approved VEX statements as CycloneDX VEX / CSAF (for CRA submission)
+- `sbomhub cra draft` — generate a CRA vulnerability report draft from SBOM + VEX + audit log
+
+Details: [`sbomhub-internal/planning/PRODUCT_REBOOT_PLAN.md`](https://github.com/youichi-uda/sbomhub) (internal; an external roadmap doc will land in M1 when the plan goes public).
+
 ## CI/CD Integration
 
 ### GitHub Actions
@@ -95,6 +108,7 @@ sbomhub projects list
 
 - name: Scan and upload SBOM
   env:
+    SBOMHUB_API_URL: ${{ secrets.SBOMHUB_API_URL }}  # e.g. https://sbomhub.internal.example.com
     SBOMHUB_API_KEY: ${{ secrets.SBOMHUB_API_KEY }}
   run: sbomhub scan . --project ${{ github.repository }} --fail-on critical
 ```
@@ -107,6 +121,7 @@ sbom_scan:
     - curl -fsSL https://sbomhub.app/install.sh | sh
     - sbomhub scan . --project ${CI_PROJECT_NAME} --fail-on critical
   variables:
+    SBOMHUB_API_URL: ${SBOMHUB_API_URL}  # e.g. https://sbomhub.internal.example.com
     SBOMHUB_API_KEY: ${SBOMHUB_API_KEY}
 ```
 
@@ -115,8 +130,9 @@ sbom_scan:
 ### Global Configuration (~/.sbomhub/config.yaml)
 
 ```yaml
-api_url: https://api.sbomhub.app
-api_key: sk_xxxxxxxxxxxxx
+# Default for self-host SBOMHub (Docker Compose)
+api_url: http://localhost:8080
+api_key: sbh_xxxxxxxxxxxxx
 ```
 
 ### Project Configuration (.sbomhub.yaml)
