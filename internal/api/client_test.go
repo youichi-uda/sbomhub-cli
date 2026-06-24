@@ -265,16 +265,22 @@ func TestGetScanStatus(t *testing.T) {
 			t.Errorf("Authorization = %q, want Bearer test-key", auth)
 		}
 
-		resp := ScanStatusResponse{
-			Status:    "completed",
-			SbomID:    sbomID,
-			ProjectID: projectID,
-			Vulnerabilities: VulnerabilitySummary{
-				Critical: 2, High: 3, Medium: 5, Low: 7, Unknown: 1, Total: 18,
-			},
-		}
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(resp)
+		// Server emits the canonical scan-status shape; KEV is the
+		// orthogonal bucket introduced by Codex R1 fix.
+		_, _ = w.Write([]byte(`{
+			"status":     "completed",
+			"sbom_id":    "` + sbomID + `",
+			"project_id": "` + projectID + `",
+			"vulnerabilities": {
+				"critical": 2,
+				"high":     3,
+				"medium":   5,
+				"low":      7,
+				"unknown":  1,
+				"kev":      4,
+				"total":    18
+			}
+		}`))
 	}))
 	defer server.Close()
 
@@ -291,6 +297,12 @@ func TestGetScanStatus(t *testing.T) {
 	}
 	if got.Vulnerabilities.Total != 18 {
 		t.Errorf("Total = %d, want 18", got.Vulnerabilities.Total)
+	}
+	// Codex R1 fix regression guard: the CLI must decode the new `kev`
+	// bucket so `--fail-on kev` can read it from scan-status. Before the
+	// fix this field did not exist on the struct and silently dropped.
+	if got.Vulnerabilities.KEV != 4 {
+		t.Errorf("KEV = %d, want 4 (server response must round-trip into VulnerabilitySummary.KEV)", got.Vulnerabilities.KEV)
 	}
 }
 

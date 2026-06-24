@@ -44,8 +44,15 @@ scoop install sbomhub
 ### 初期設定
 
 ```bash
-# 推奨: self-host SBOMHub に接続
-sbomhub login --url http://localhost:8080 --api-key sbh_xxxxx
+# 推奨: self-host SBOMHub に接続 (対話式に API Key と API URL を入力)
+sbomhub login
+#   API Key: sbh_xxxxx
+#   API URL [https://api.sbomhub.app]: http://localhost:8080
+# → 入力内容を ~/.sbomhub/config.yaml に保存
+
+# 非対話 (CI 等) ではグローバルフラグまたは環境変数で渡せる:
+#   sbomhub --api-url http://localhost:8080 --api-key sbh_xxxxx scan .
+#   SBOMHUB_API_KEY=sbh_xxxxx sbomhub scan . --api-url http://localhost:8080
 
 # SaaS 版 (sbomhub.app / api.sbomhub.app) は 2026-06 にサンセット済。
 # 以降は self-host (Docker Compose) を前提とする。

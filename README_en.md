@@ -44,8 +44,15 @@ scoop install sbomhub
 ### Initial Setup
 
 ```bash
-# Recommended: connect to your self-host SBOMHub
-sbomhub login --url http://localhost:8080 --api-key sbh_xxxxx
+# Recommended: connect to your self-host SBOMHub (interactive prompts)
+sbomhub login
+#   API Key: sbh_xxxxx
+#   API URL [https://api.sbomhub.app]: http://localhost:8080
+# → writes the answers into ~/.sbomhub/config.yaml
+
+# For non-interactive (CI) use, pass them as global flags or env vars:
+#   sbomhub --api-url http://localhost:8080 --api-key sbh_xxxxx scan .
+#   SBOMHUB_API_KEY=sbh_xxxxx sbomhub scan . --api-url http://localhost:8080
 
 # The SaaS edition (sbomhub.app / api.sbomhub.app) was sunset in 2026-06.
 # Self-host (Docker Compose) is the only supported deployment going forward.

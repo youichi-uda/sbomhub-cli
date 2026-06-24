@@ -33,7 +33,7 @@ func TestWaitForScanCompletion_Completes(t *testing.T) {
 		if n >= 2 {
 			resp.Status = "completed"
 			resp.Vulnerabilities = api.VulnerabilitySummary{
-				Critical: 2, High: 3, Medium: 0, Low: 0, Total: 5,
+				Critical: 2, High: 3, Medium: 0, Low: 0, KEV: 1, Total: 5,
 			}
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -62,6 +62,12 @@ func TestWaitForScanCompletion_Completes(t *testing.T) {
 	}
 	if summary.Critical != 2 || summary.High != 3 || summary.Total != 5 {
 		t.Errorf("summary = %+v, want critical=2 high=3 total=5", *summary)
+	}
+	// Codex R1 fix regression guard: KEV bucket must round-trip from the
+	// server response through the polling loop so --fail-on kev has a
+	// non-zero count to evaluate downstream in runScan.
+	if summary.KEV != 1 {
+		t.Errorf("summary.KEV = %d, want 1 (waitForScanCompletion must propagate KEV from scan-status)", summary.KEV)
 	}
 }
 

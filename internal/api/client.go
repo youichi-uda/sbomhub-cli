@@ -307,12 +307,20 @@ func getString(m map[string]interface{}, key string) string {
 // VulnerabilitySummary aggregates vulnerability counts by severity for a
 // single SBOM. It mirrors the API-side `VulnerabilitySummaryCount` type
 // in apps/api/internal/handler/sbom.go — keep them in sync.
+//
+// `KEV` is orthogonal to CVSS severity (a KEV-listed CVE also counts in
+// its CRITICAL/HIGH/etc. bucket) and is the authoritative source for
+// `sbomhub scan --fail-on kev`. Older servers that do not emit this field
+// will leave it at zero, in which case `--fail-on kev` is effectively a
+// no-op against that server — operators who need the threshold should run
+// against an api built from the same Trust Rescue R1 commit or later.
 type VulnerabilitySummary struct {
 	Critical int `json:"critical"`
 	High     int `json:"high"`
 	Medium   int `json:"medium"`
 	Low      int `json:"low"`
 	Unknown  int `json:"unknown"`
+	KEV      int `json:"kev"`
 	Total    int `json:"total"`
 }
 

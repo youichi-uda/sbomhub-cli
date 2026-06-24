@@ -253,12 +253,18 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return &scanExitError{code: exitAPIError, msg: "スキャン結果の取得に失敗しました"}
 	}
 
+	// Codex R1 fix: KEV is sourced from the scan-status response (server
+	// joins vulnerabilities.in_kev). The canonical upload endpoint does
+	// NOT populate result.KEVCount — relying on it left `--fail-on kev`
+	// silently never tripping. Older servers (pre Trust Rescue R1) that
+	// omit the field will report KEV=0, in which case --fail-on kev is a
+	// no-op against that deployment.
 	counts := severity.Counts{
 		Critical: summary.Critical,
 		High:     summary.High,
 		Medium:   summary.Medium,
 		Low:      summary.Low,
-		KEV:      result.KEVCount, // KEV は upload-time の SBOM ボディ由来。 サーバ側 scan-status は CVSS 別の count なので別経路。
+		KEV:      summary.KEV,
 	}
 	if severity.ShouldFail(counts, failOnLevel) {
 		return &scanExitError{
@@ -301,11 +307,11 @@ func waitForScanCompletion(client *api.Client, projectID, sbomID string) (summar
 			fmt.Printf("   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
 		} else {
 			elapsed := scanWaitTimeout - remaining
-			fmt.Printf("   状態: %-9s 経過: %4s / %s  (critical=%d high=%d medium=%d low=%d total=%d)\n",
+			fmt.Printf("   状態: %-9s 経過: %4s / %s  (critical=%d high=%d medium=%d low=%d kev=%d total=%d)\n",
 				status.Status, elapsed.Round(time.Second), scanWaitTimeout,
 				status.Vulnerabilities.Critical, status.Vulnerabilities.High,
 				status.Vulnerabilities.Medium, status.Vulnerabilities.Low,
-				status.Vulnerabilities.Total)
+				status.Vulnerabilities.KEV, status.Vulnerabilities.Total)
 
 			switch status.Status {
 			case "completed":
@@ -367,21 +373,27 @@ func countComponents(sbomData []byte) int {
 // those are zero today because the canonical upload endpoint does not
 // return counts, but keeping the fallback preserves graceful behaviour
 // against future server versions.
+//
+// KEV count: when scan-status `summary` is available we trust its KEV
+// bucket (joined server-side against vulnerabilities.in_kev). When only
+// the legacy `result.KEVCount` is available we fall back to it; that
+// field is left at zero by the canonical upload endpoint today, so the
+// fallback is effectively "no KEV info" rather than authoritative.
 func formatScanVulnSummary(result *api.UploadResult, summary *api.VulnerabilitySummary) string {
-	c, h, m, l, total := 0, 0, 0, 0, 0
+	c, h, m, l, kev, total := 0, 0, 0, 0, 0, 0
 	if summary != nil {
-		c, h, m, l, total = summary.Critical, summary.High, summary.Medium, summary.Low, summary.Total
+		c, h, m, l, kev, total = summary.Critical, summary.High, summary.Medium, summary.Low, summary.KEV, summary.Total
 	} else if result != nil {
-		c, h, m, l, total = result.Critical, result.High, result.Medium, result.Low, result.VulnerabilityCount
+		c, h, m, l, kev, total = result.Critical, result.High, result.Medium, result.Low, result.KEVCount, result.VulnerabilityCount
 	}
 
-	if total == 0 && (result == nil || result.KEVCount == 0) {
+	if total == 0 && kev == 0 {
 		return "なし ✅"
 	}
 
 	parts := []string{}
-	if result != nil && result.KEVCount > 0 {
-		parts = append(parts, fmt.Sprintf("%d KEV 🔥", result.KEVCount))
+	if kev > 0 {
+		parts = append(parts, fmt.Sprintf("%d KEV 🔥", kev))
 	}
 	if c > 0 {
 		parts = append(parts, fmt.Sprintf("%d Critical", c))
