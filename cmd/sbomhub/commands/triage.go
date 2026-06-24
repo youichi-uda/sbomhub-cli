@@ -128,7 +128,11 @@ under_investigation fallback for every draft (CI template mode).
 Exit codes:
   0  正常終了 / success (including the AI-disabled fallback path)
   1  ユーザーが [q]uit / user quit mid-loop
-  3  API / 設定エラー / API or configuration error`,
+  3  恒久エラー / permanent API or configuration error (401 / 403 / 404 /
+     422 — read-only API key, missing project, unauthorized triage call)
+  4  一時エラー / transient API failure (429 / 5xx — retry recommended).
+     Returned when at least one per-vuln call failed transiently AND
+     no permanent failure occurred (permanent wins when both are present)`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runTriage,
 }
@@ -286,6 +290,21 @@ func runTriageLoop(ctx context.Context, client *api.Client, opts triageOpts) err
 	underInvestigation := 0
 	aiDisabledNotified := false
 
+	// M1 Codex review #F21: previously every per-vuln API failure was
+	// logged, counted as `skipped`, and the loop continued — at the end
+	// runTriageLoop unconditionally returned nil so CI saw a green exit
+	// even when RequireWrite 403 / triage limiter 429 silently rejected
+	// every draft. We now track permanent (401/403/404/422) vs transient
+	// (429/5xx) failures so the loop can surface a non-zero exit at the
+	// end without aborting mid-run (preserves the "best effort triage"
+	// UX — the operator still gets the summary for whatever DID succeed).
+	//
+	// AI-disabled remains exit 0 because the operator's BYOK config is
+	// the resolution, not a CI retry, and the server still persists a
+	// paper-trail draft.
+	permanentFailures := 0
+	transientFailures := 0
+
 	for i, v := range vulns {
 		fmt.Fprintf(opts.stdout, "\n[%d/%d] %s\n", i+1, len(vulns), formatVulnHeader(v))
 
@@ -330,12 +349,16 @@ func runTriageLoop(ctx context.Context, client *api.Client, opts triageOpts) err
 			continue
 		}
 		if err != nil {
-			// Any other failure — permanent or transient — is logged
-			// and the loop continues. We do NOT fail the whole run on
-			// a per-vuln server error; the operator can re-run later
-			// for the unprocessed entries. This matches the "best
-			// effort triage" UX of the issue.
+			// M1 Codex review #F21: the loop still continues on a
+			// per-vuln failure so the operator gets best-effort
+			// progress, but we now classify the failure so the final
+			// exit code can distinguish "this CI run is fine, just
+			// retry tomorrow" (transient) from "your API key cannot
+			// do this thing" (permanent). Network / unclassified
+			// errors fall into the transient bucket because the
+			// operator's correct response is the same (retry).
 			fmt.Fprintf(opts.stderr, "  triage 失敗: %v\n", err)
+			classifyTriageFailure(err, &permanentFailures, &transientFailures)
 			skipped++
 			continue
 		}
@@ -395,7 +418,14 @@ func runTriageLoop(ctx context.Context, client *api.Client, opts triageOpts) err
 			EditedJustification: editedJustification,
 			EditedDetail:        editedDetail,
 		}); err != nil {
+			// M1 Codex review #F21: same classification as the
+			// per-vuln triage call above. RequireWrite 403 on a
+			// read-scoped API key lands here for every decision PUT
+			// when the operator forgot to mint a write key; without
+			// this counter the loop would exit 0 with "everything
+			// skipped" and the operator would never know.
 			fmt.Fprintf(opts.stderr, "  decision 保存失敗: %v\n", err)
+			classifyTriageFailure(err, &permanentFailures, &transientFailures)
 			skipped++
 			continue
 		}
@@ -417,7 +447,73 @@ func runTriageLoop(ctx context.Context, client *api.Client, opts triageOpts) err
 	}
 
 	printTriageSummary(opts.stdout, len(vulns), len(vulns), approved, edited, rejected, skipped, underInvestigation)
+
+	// M1 Codex review #F21: surface non-zero exit when any per-vuln
+	// API failure was observed. Permanent wins over transient because
+	// the operator's correct response differs: permanent means "fix
+	// config" (no retry will help), transient means "retry later" (the
+	// CI job can simply be re-run). Both share the "best effort" loop
+	// behaviour above so the partial summary is still printed; only
+	// the exit code changes.
+	if permanentFailures > 0 {
+		return &triageExitError{
+			code: 3,
+			msg:  fmt.Sprintf("%d 件の脆弱性が恒久エラーで処理失敗しました (permanent: 401 / 403 / 404 / 422 — fix --api-key / project / role)", permanentFailures),
+		}
+	}
+	if transientFailures > 0 {
+		return &triageExitError{
+			code: 4,
+			msg:  fmt.Sprintf("%d 件の脆弱性が一時エラーで処理失敗しました (transient: 429 / 5xx — retry recommended)", transientFailures),
+		}
+	}
 	return nil
+}
+
+// classifyTriageFailure buckets a per-vuln API failure into permanent
+// vs transient by consulting the typed *api.TriageError (and the
+// shared *api.APIError on the off chance the future scan-status-style
+// client extends here). Unclassified / network errors fall into the
+// transient bucket because the operator's correct response (retry) is
+// the same.
+//
+// M1 Codex review #F21: extracted into a helper so both call sites
+// (RunTriage failure + DecideDraft failure) share the exact same
+// classification. Drift between the two would defeat the exit-code
+// contract — e.g. 403 on RunTriage marked permanent but 403 on
+// DecideDraft marked transient would produce an apparent "transient
+// outage" exit when the underlying problem is a read-only API key.
+func classifyTriageFailure(err error, permanent *int, transient *int) {
+	if err == nil {
+		return
+	}
+	var apiErr *api.TriageError
+	if errors.As(err, &apiErr) {
+		switch {
+		case apiErr.IsAIDisabled():
+			// Should never reach here — the AI-disabled branches above
+			// short-circuit before classifyTriageFailure runs. Treat as
+			// transient defensively so a future regression that drops
+			// the short-circuit does not inflate permanentFailures.
+			*transient++
+		case apiErr.IsPermanent():
+			*permanent++
+		case apiErr.IsTransient():
+			*transient++
+		default:
+			// Unknown 4xx that the helpers do not classify (e.g. a
+			// 418, a future 451) — treat as permanent because the
+			// operator's response is "fix something", not "retry".
+			*permanent++
+		}
+		return
+	}
+	// Network failures, JSON parse errors, context.Canceled, etc. —
+	// the operator's correct response is retry-or-investigate, so
+	// they go into the transient bucket. The summary line printed
+	// above still surfaces the underlying error so the operator can
+	// see whether it's worth retrying.
+	*transient++
 }
 
 // formatVulnHeader produces the first line of the per-vuln block,

@@ -215,6 +215,12 @@ func (e *TriageError) IsAIDisabled() bool {
 // missing draft). 429 is intentionally treated as transient (not
 // permanent) to match the same R13 classification the scan polling
 // loop uses.
+//
+// 503 from llm.DisabledError is also explicitly excluded — that path
+// has its own IsAIDisabled() classifier and the per-vuln runTriageLoop
+// already short-circuits on it (the operator's BYOK config is the
+// fix, not a CLI retry). Treating it as permanent would inflate the
+// permanent-failure exit code (M1 Codex review #F21).
 func (e *TriageError) IsPermanent() bool {
 	if e == nil {
 		return false
@@ -222,7 +228,41 @@ func (e *TriageError) IsPermanent() bool {
 	if e.StatusCode == http.StatusTooManyRequests {
 		return false
 	}
+	if e.StatusCode == http.StatusServiceUnavailable {
+		// AI-disabled / overloaded path — handled by IsAIDisabled / the
+		// caller's transient bucket, not permanent.
+		return false
+	}
 	return e.StatusCode >= 400 && e.StatusCode < 500
+}
+
+// IsTransient reports whether the error is a transient failure the
+// operator can resolve by retrying — 429 (rate limit) and 5xx (server
+// error / upstream blip). The bucket is symmetric with IsPermanent so
+// runTriageLoop can categorise each failure into exactly one of:
+// AI-disabled (caller-handled), permanent, transient, or otherwise.
+//
+// M1 Codex review #F21: this helper exists so the CLI's triage loop
+// can distinguish "the server is broken right now, retry tomorrow"
+// (transient → exit 4) from "the operator's API key cannot do this
+// thing, fix config" (permanent → exit 3) — silently swallowing both
+// as "skipped" used to make CI green on 403/429 storms.
+func (e *TriageError) IsTransient() bool {
+	if e == nil {
+		return false
+	}
+	if e.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	// 503 stays exclusively in the AI-disabled lane — see IsAIDisabled.
+	// The caller branches on IsAIDisabled first, so a 503 that escapes
+	// that branch is by definition NOT the BYOK case; but to keep the
+	// classification disjoint we let the caller decide rather than
+	// double-counting here.
+	if e.StatusCode == http.StatusServiceUnavailable {
+		return false
+	}
+	return e.StatusCode >= 500 && e.StatusCode < 600
 }
 
 // decodeTriageError builds a TriageError from a non-2xx response body.

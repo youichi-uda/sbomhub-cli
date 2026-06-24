@@ -678,6 +678,359 @@ func TestSummarizeReachability(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// F21 regression — `sbomhub triage` must surface non-zero exit codes when
+// per-vuln API failures occur, so CI cannot silently green-light a triage
+// run that persisted nothing
+// ----------------------------------------------------------------------------
+//
+// Codex M1 round 12 #F21: before this fix the loop logged every per-vuln
+// RunTriage / DecideDraft failure, counted it as `skipped`, and returned
+// nil unconditionally at the end. That meant:
+//   - a read-scoped API key (RequireWrite 403 on every triage/run call)
+//     produced exit 0 with "skipped: N", and
+//   - the triage concurrency limiter (429 on every call) also produced
+//     exit 0,
+// so CI workflows like `sbomhub triage --non-interactive` ran clean
+// while ZERO drafts or decisions were persisted. The fix introduces:
+//   - exit code 3 for permanent failures (401 / 403 / 404 / 422)
+//   - exit code 4 for transient failures (429 / 5xx)
+// Both classifications are unit-tested below; permanent wins when both
+// occur in the same run because the operator's correct response (fix
+// config) differs from transient (retry).
+//
+// The AI-disabled path (TestTriageLoop_AIDisabledServerPersisted /
+// _AIDisabledFallback above) stays exit 0 — the server still persists a
+// paper-trail draft and the operator's resolution is BYOK config, not a
+// CI retry.
+
+// TestTriageLoop_PermanentFailures_ExitCode3 — when every RunTriage
+// returns 403 (RequireWrite gate from a read-only API key), the loop
+// must NOT exit 0. Pins the F21 fix at the per-vuln-call boundary.
+func TestTriageLoop_PermanentFailures_ExitCode3(t *testing.T) {
+	tf := newTriageFakeServer(t, threeVulns())
+	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {
+		return http.StatusForbidden, map[string]string{
+			"error": "forbidden",
+		}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      true,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               strings.NewReader(""),
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+
+	exitErr, ok := err.(*triageExitError)
+	if !ok {
+		t.Fatalf("F21: err = %v (%T), want *triageExitError with exit code 3", err, err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Errorf("F21: ExitCode = %d, want 3 (permanent failures must NOT exit 0)", exitErr.ExitCode())
+	}
+	if !strings.Contains(exitErr.Error(), "恒久") && !strings.Contains(exitErr.Error(), "permanent") {
+		t.Errorf("F21: error message must mention permanent, got %q", exitErr.Error())
+	}
+	// Summary must still be printed so the operator can see what (if
+	// anything) succeeded — F21 explicitly preserves the best-effort UX.
+	if !strings.Contains(stdout.String(), "Triage 結果") {
+		t.Errorf("F21: summary must still be printed on permanent failure: %s", stdout.String())
+	}
+	// No decisions persisted because triage/run failed for every vuln.
+	if got := atomic.LoadInt32(&tf.decisionHits); got != 0 {
+		t.Errorf("decisionHits = %d, want 0 (every triage/run failed)", got)
+	}
+}
+
+// TestTriageLoop_TransientFailures_ExitCode4 — when every RunTriage
+// returns 429 (triage concurrency limiter / rate limit storm), the
+// loop must exit with code 4 so CI can distinguish "retry tomorrow"
+// from "fix config" (code 3). Mirrors the permanent test.
+func TestTriageLoop_TransientFailures_ExitCode4(t *testing.T) {
+	tf := newTriageFakeServer(t, threeVulns())
+	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {
+		// Mix 429 and 503-not-AI-disabled (server overload) to make
+		// sure both transient species land in the same bucket. We
+		// deliberately avoid the AI-disabled 503-with-reason path
+		// here — that path stays exit 0 (TestTriageLoop_AIDisabled*).
+		if call%2 == 1 {
+			return http.StatusTooManyRequests, map[string]string{
+				"error": "too many requests",
+			}
+		}
+		return http.StatusBadGateway, map[string]string{
+			"error": "upstream timeout",
+		}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      true,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               strings.NewReader(""),
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+
+	exitErr, ok := err.(*triageExitError)
+	if !ok {
+		t.Fatalf("F21: err = %v (%T), want *triageExitError with exit code 4", err, err)
+	}
+	if exitErr.ExitCode() != 4 {
+		t.Errorf("F21: ExitCode = %d, want 4 (transient failures must surface as retry-recommended)", exitErr.ExitCode())
+	}
+	if !strings.Contains(exitErr.Error(), "一時") && !strings.Contains(exitErr.Error(), "transient") {
+		t.Errorf("F21: error message must mention transient, got %q", exitErr.Error())
+	}
+}
+
+// TestTriageLoop_AllAIDisabled_ExitCode0 — the existing AI-disabled
+// fallback path MUST remain exit 0 even after the F21 fix. This is a
+// belt-and-braces regression test alongside the long-form
+// TestTriageLoop_AIDisabledServerPersisted / _AIDisabledFallback that
+// pins the per-vuln behaviour: the F21 classifier short-circuits on
+// AIDisabled / IsAIDisabled() before consulting permanent / transient,
+// so a BYOK-not-configured server cannot inflate exit codes.
+func TestTriageLoop_AllAIDisabled_ExitCode0(t *testing.T) {
+	tf := newTriageFakeServer(t, threeVulns())
+	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {
+		// New-server shape (AIDisabled=true with server-persisted
+		// draft). The legacy 503 path is covered separately by
+		// TestTriageLoop_AIDisabledFallback above.
+		draftID := fakeDraftID(call)
+		return http.StatusCreated, map[string]interface{}{
+			"draft": map[string]interface{}{
+				"id":               draftID,
+				"project_id":       "00000000-0000-0000-0000-000000000aaa",
+				"component_id":     "00000000-0000-0000-0000-0000000000bb",
+				"vulnerability_id": fakeVulnID(call),
+				"cve_id":           fakeCVE(call),
+				"state":            "under_investigation",
+				"provider":         "disabled",
+				"decision":         "pending",
+			},
+			"clamped":     false,
+			"threshold":   0.7,
+			"ai_disabled": true,
+		}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      true,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               strings.NewReader(""),
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+	if err != nil {
+		t.Fatalf("F21: AI-disabled fallback must remain exit 0, got %v", err)
+	}
+}
+
+// TestTriageLoop_MixedSuccessAndPermanent_ExitCode3 — when a run mixes
+// successful and permanent-failed vulns, exit code 3 must still surface
+// (permanent wins over success). This is the most realistic regression:
+// a read-only API key might still satisfy /triage/run (no RequireWrite
+// on that route... wait, it does have RequireWrite, but a CLI that
+// happens to have ONE 403 amongst 99 successes should still trip CI).
+//
+// The fake server returns 403 only for the second vuln; the first and
+// third succeed and persist their draft via the decision PUT.
+func TestTriageLoop_MixedSuccessAndPermanent_ExitCode3(t *testing.T) {
+	tf := newTriageFakeServer(t, threeVulns())
+	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {
+		if call == 2 {
+			return http.StatusForbidden, map[string]string{
+				"error": "forbidden",
+			}
+		}
+		return http.StatusCreated, defaultRunResp(call)
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      true,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               strings.NewReader(""),
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+
+	exitErr, ok := err.(*triageExitError)
+	if !ok {
+		t.Fatalf("F21: err = %v (%T), want *triageExitError (permanent must win over partial success)", err, err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Errorf("F21: ExitCode = %d, want 3 (one permanent failure in a mixed run must surface)", exitErr.ExitCode())
+	}
+	// Two successes still produced decision PUTs — the loop continued
+	// past the 403, exactly as the best-effort UX requires.
+	if got := atomic.LoadInt32(&tf.decisionHits); got != 2 {
+		t.Errorf("decisionHits = %d, want 2 (loop must continue past the permanent failure)", got)
+	}
+}
+
+// TestTriageLoop_DecideDraftPermanent_ExitCode3 — verifies the second
+// classification site (DecideDraft failure) wires the same exit code
+// machinery as RunTriage. Without this companion test, a regression
+// that updated the RunTriage classifier without the DecideDraft one
+// would mask 403 on the decision PUT path.
+func TestTriageLoop_DecideDraftPermanent_ExitCode3(t *testing.T) {
+	tf := newTriageFakeServer(t, []api.VulnerabilityRecord{
+		{ID: fakeVulnID(1), CVEID: fakeCVE(1), Severity: "HIGH"},
+	})
+	tf.decisionResp = func(call int, draftID string, body []byte) (int, interface{}) {
+		return http.StatusForbidden, map[string]string{
+			"error": "forbidden",
+		}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      true,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               strings.NewReader(""),
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+
+	exitErr, ok := err.(*triageExitError)
+	if !ok {
+		t.Fatalf("F21: err = %v (%T), want *triageExitError (decide 403 must surface)", err, err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Errorf("F21: ExitCode = %d, want 3 (DecideDraft permanent failure)", exitErr.ExitCode())
+	}
+}
+
+// TestClassifyTriageFailure_F21 unit-tests the helper directly so the
+// per-status classification stays pinned even if the call sites get
+// refactored. The matrix mirrors api.TriageError.IsPermanent /
+// IsTransient + the network-error default.
+func TestClassifyTriageFailure_F21(t *testing.T) {
+	cases := []struct {
+		name        string
+		err         error
+		wantPermInc int
+		wantTranInc int
+	}{
+		{
+			name: "401 unauthorized → permanent",
+			err: &api.TriageError{
+				StatusCode: http.StatusUnauthorized,
+			},
+			wantPermInc: 1,
+		},
+		{
+			name: "403 forbidden → permanent",
+			err: &api.TriageError{
+				StatusCode: http.StatusForbidden,
+			},
+			wantPermInc: 1,
+		},
+		{
+			name: "404 not found → permanent",
+			err: &api.TriageError{
+				StatusCode: http.StatusNotFound,
+			},
+			wantPermInc: 1,
+		},
+		{
+			name: "422 unprocessable → permanent",
+			err: &api.TriageError{
+				StatusCode: http.StatusUnprocessableEntity,
+			},
+			wantPermInc: 1,
+		},
+		{
+			name: "429 too many → transient",
+			err: &api.TriageError{
+				StatusCode: http.StatusTooManyRequests,
+			},
+			wantTranInc: 1,
+		},
+		{
+			name: "500 server → transient",
+			err: &api.TriageError{
+				StatusCode: http.StatusInternalServerError,
+			},
+			wantTranInc: 1,
+		},
+		{
+			name: "502 bad gateway → transient",
+			err: &api.TriageError{
+				StatusCode: http.StatusBadGateway,
+			},
+			wantTranInc: 1,
+		},
+		{
+			name: "503 AI disabled → transient (defensive — caller short-circuits)",
+			err: &api.TriageError{
+				StatusCode: http.StatusServiceUnavailable,
+				Reason:     "no LLM provider configured",
+			},
+			wantTranInc: 1,
+		},
+		{
+			name: "418 unknown 4xx → permanent (operator must fix)",
+			err: &api.TriageError{
+				StatusCode: 418,
+			},
+			wantPermInc: 1,
+		},
+		{
+			name:        "network error → transient",
+			err:         io.ErrUnexpectedEOF,
+			wantTranInc: 1,
+		},
+		{
+			name: "nil err → no-op",
+			err:  nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			perm, tran := 0, 0
+			classifyTriageFailure(tc.err, &perm, &tran)
+			if perm != tc.wantPermInc {
+				t.Errorf("permanent inc = %d, want %d", perm, tc.wantPermInc)
+			}
+			if tran != tc.wantTranInc {
+				t.Errorf("transient inc = %d, want %d", tran, tc.wantTranInc)
+			}
+		})
+	}
+}
+
 // --- helpers ------------------------------------------------------
 
 func bufioReaderFrom(s string) *bufio.Reader {
