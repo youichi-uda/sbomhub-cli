@@ -569,15 +569,81 @@ type VulnerabilityRecord struct {
 	Source      string  `json:"source,omitempty"`
 }
 
+// listVulnerabilitiesPageSize is the per-page request size the CLI uses
+// when paging /api/v1/projects/:id/vulnerabilities. M1 Codex review #F26:
+// the server now caps `?limit=` at 500 (handler.VulnsMaxLimit) and returns
+// 400 on out-of-band values, so the CLI requests pages at the maximum
+// allowed size to minimise the round-trip count while staying within the
+// server's clamp.
+//
+// ※要確認: keep this in sync with sbomhub/apps/api/internal/handler/sbom.go
+// VulnsMaxLimit (500). If the server raises the cap, the CLI can be
+// updated independently, but a value above the server's cap will start
+// returning 400 on the first request.
+const listVulnerabilitiesPageSize = 500
+
+// listVulnerabilitiesMaxPages is a defensive ceiling on the number of
+// pages the CLI is willing to fetch before erroring out. At 500 rows per
+// page this caps the CLI at 100,000 vulnerabilities per project, which
+// is well above any realistic Japanese SMB inventory and serves only as
+// a runaway guard if the server starts ignoring the truncation signal
+// (returning full pages forever). Hit ceiling → return whatever we have
+// + an error so the operator can investigate rather than the CLI
+// looping forever.
+//
+// ※要確認: 200 pages is arbitrary; tune once we have real-world fleet
+// data. A value too low would silently truncate; too high lets a buggy
+// server keep the CLI hung.
+const listVulnerabilitiesMaxPages = 200
+
 // ListVulnerabilities returns the project's vulnerabilities so the
 // triage CLI can iterate over them.
 //
-// The server returns a JSON array directly (see handler.GetVulnerabilities
-// — it `c.JSON(http.StatusOK, vulns)` the slice without an enveloping
-// `{ "vulnerabilities": [...] }`). We decode the bare array shape
-// accordingly.
+// M1 Codex review #F26: the server now paginates responses with
+// `?limit=&offset=` (default 100, max 500). The CLI pages through using
+// listVulnerabilitiesPageSize per request and stops when either:
+//   - a page returns fewer rows than the requested page size (canonical
+//     "no more rows" signal for offset-based pagination), or
+//   - listVulnerabilitiesMaxPages is reached (defensive ceiling).
+//
+// The server returns a bare JSON array per page (no envelope) so the
+// existing Web UI fetch path keeps working unchanged. We retain the
+// enveloped-shape fallback for forward compatibility with a future
+// server that may switch to `{ "vulnerabilities": [...] }` — but the
+// fallback only applies to single-page responses (a server that
+// switches to envelopes would also have to add a paging cursor, at
+// which point this client needs an update).
 func (c *Client) ListVulnerabilities(ctx context.Context, projectID string) ([]VulnerabilityRecord, error) {
-	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/vulnerabilities", c.baseURL, projectID)
+	all := make([]VulnerabilityRecord, 0, listVulnerabilitiesPageSize)
+	offset := 0
+	for page := 0; page < listVulnerabilitiesMaxPages; page++ {
+		batch, err := c.listVulnerabilitiesPage(ctx, projectID, listVulnerabilitiesPageSize, offset)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+		// Server returned fewer rows than the page size → end of the
+		// dataset. This is the canonical offset-pagination "no more
+		// rows" signal because the server does not (yet) emit a
+		// has_more / next_cursor envelope.
+		if len(batch) < listVulnerabilitiesPageSize {
+			return all, nil
+		}
+		offset += len(batch)
+	}
+	// Defensive ceiling — should be unreachable in practice for realistic
+	// inventories. We return the partial result + an error so the operator
+	// can decide whether to act on what was fetched.
+	return all, fmt.Errorf("vulnerabilities ページング上限 (%d ページ × %d 件) 到達: サーバーがページング終端を返していない可能性があります",
+		listVulnerabilitiesMaxPages, listVulnerabilitiesPageSize)
+}
+
+// listVulnerabilitiesPage fetches a single (limit, offset) page from the
+// server. Extracted from ListVulnerabilities so the paging loop stays
+// readable and so tests can drive the per-page decode independently.
+func (c *Client) listVulnerabilitiesPage(ctx context.Context, projectID string, limit, offset int) ([]VulnerabilityRecord, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/vulnerabilities?limit=%d&offset=%d",
+		c.baseURL, projectID, limit, offset)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {

@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -417,5 +418,119 @@ func TestListVulnerabilities_EnvelopedShape(t *testing.T) {
 	}
 	if len(vulns) != 1 || vulns[0].ID != "v1" {
 		t.Errorf("got %+v", vulns)
+	}
+}
+
+// TestListVulnerabilities_Pagination_F26 pins the M1 Codex review #F26
+// contract: when the server paginates responses (default 100, max 500
+// — handler.VulnsMaxLimit), the CLI MUST page through transparently
+// rather than only fetching the first page. Without this loop, a
+// project with > listVulnerabilitiesPageSize matched vulns would be
+// silently truncated and `sbomhub triage` would skip the tail.
+//
+// Server behaviour: page 1 returns 500 rows + offset=0, page 2 returns
+// 200 rows + offset=500 (truncated). CLI must request both and stitch
+// the result into a 700-row slice.
+func TestListVulnerabilities_Pagination_F26(t *testing.T) {
+	const pageSize = 500
+	const tailSize = 200
+	const totalExpected = pageSize + tailSize
+
+	var pageRequests []int // captures the `offset=` value for each request
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The CLI sends `?limit=500&offset=N` — verify the limit clamp and
+		// record the offset so the test can assert paging progressed.
+		q := r.URL.Query()
+		if got := q.Get("limit"); got != "500" {
+			t.Errorf("F26: page request must use ?limit=500, got %q", got)
+		}
+		offsetStr := q.Get("offset")
+		var offset int
+		_, _ = fmt.Sscanf(offsetStr, "%d", &offset)
+		pageRequests = append(pageRequests, offset)
+
+		var rows []map[string]interface{}
+		switch offset {
+		case 0:
+			// First page: full pageSize rows so the CLI knows to ask again.
+			for i := 0; i < pageSize; i++ {
+				rows = append(rows, map[string]interface{}{
+					"id":     fmt.Sprintf("v%d", i),
+					"cve_id": fmt.Sprintf("CVE-2024-%04d", i),
+				})
+			}
+		case pageSize:
+			// Second page: tail (< pageSize) so the CLI knows to stop.
+			for i := 0; i < tailSize; i++ {
+				rows = append(rows, map[string]interface{}{
+					"id":     fmt.Sprintf("v%d", pageSize+i),
+					"cve_id": fmt.Sprintf("CVE-2024-%04d", pageSize+i),
+				})
+			}
+		default:
+			t.Errorf("F26: unexpected offset request %d (server emits only 0 and %d)",
+				offset, pageSize)
+		}
+		_ = json.NewEncoder(w).Encode(rows)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	vulns, err := client.ListVulnerabilities(context.Background(), "p")
+	if err != nil {
+		t.Fatalf("F26: ListVulnerabilities returned error: %v", err)
+	}
+	if len(vulns) != totalExpected {
+		t.Errorf("F26: stitched result len = %d, want %d (paging truncated the result?)",
+			len(vulns), totalExpected)
+	}
+	if len(pageRequests) != 2 {
+		t.Errorf("F26: expected 2 page requests, got %d (offsets=%v)",
+			len(pageRequests), pageRequests)
+	}
+	if len(pageRequests) >= 1 && pageRequests[0] != 0 {
+		t.Errorf("F26: first page request must use offset=0, got %d", pageRequests[0])
+	}
+	if len(pageRequests) >= 2 && pageRequests[1] != pageSize {
+		t.Errorf("F26: second page request must use offset=%d, got %d",
+			pageSize, pageRequests[1])
+	}
+	// Verify the tail row landed (regression-proof against a loop that
+	// asks for the second page but discards its body).
+	if len(vulns) >= totalExpected {
+		want := fmt.Sprintf("v%d", totalExpected-1)
+		if vulns[totalExpected-1].ID != want {
+			t.Errorf("F26: last row ID = %q, want %q (tail page may have been dropped)",
+				vulns[totalExpected-1].ID, want)
+		}
+	}
+}
+
+// TestListVulnerabilities_SinglePage_NoExtraRequest pins the early-stop
+// optimisation that complements TestListVulnerabilities_Pagination_F26:
+// when the first page returns fewer rows than the page size, the CLI
+// MUST stop immediately and not issue a second request. Without this,
+// a tiny project would still trip the second page round-trip for
+// nothing.
+func TestListVulnerabilities_SinglePage_NoExtraRequest(t *testing.T) {
+	var requestCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		// Return a tiny page (< listVulnerabilitiesPageSize) so the CLI
+		// knows there's nothing more to fetch.
+		_, _ = w.Write([]byte(`[{"id":"v1","cve_id":"CVE-2024-1"},{"id":"v2","cve_id":"CVE-2024-2"}]`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "k")
+	vulns, err := client.ListVulnerabilities(context.Background(), "p")
+	if err != nil {
+		t.Fatalf("ListVulnerabilities: %v", err)
+	}
+	if len(vulns) != 2 {
+		t.Errorf("got %d vulns, want 2", len(vulns))
+	}
+	if requestCount != 1 {
+		t.Errorf("F26: short page must trigger exactly 1 request, got %d", requestCount)
 	}
 }
