@@ -266,6 +266,126 @@ func TestFormatScanVulnSummary_UnknownNotDropped(t *testing.T) {
 	}
 }
 
+// TestRunScan_FailOnRequiresWaitForScan verifies the Codex R3 fix: when
+// `--fail-on` is set, passing `--wait-for-scan=false` must be rejected at
+// startup with a usage error. Before the fix, the combination silently
+// succeeded (exit 0) after upload because the threshold check was
+// short-circuited — letting critical findings slip past a gated CI.
+//
+// We drive runScan directly with the package globals (the same surface
+// cobra binds onto), so we exercise the real guard path without standing
+// up a fake server: the guard fires before any API call.
+func TestRunScan_FailOnRequiresWaitForScan(t *testing.T) {
+	saveFailOn, saveWait := scanFailOn, scanWaitForScan
+	t.Cleanup(func() {
+		scanFailOn = saveFailOn
+		scanWaitForScan = saveWait
+	})
+
+	cases := []struct {
+		name        string
+		failOn      string
+		waitForScan bool
+		wantErr     bool
+		wantSubstr  string // expected fragment in the error message
+	}{
+		{
+			name:        "fail-on high + wait-for-scan=false rejected",
+			failOn:      "high",
+			waitForScan: false,
+			wantErr:     true,
+			wantSubstr:  "--fail-on requires --wait-for-scan=true",
+		},
+		{
+			name:        "fail-on critical + wait-for-scan=false rejected",
+			failOn:      "critical",
+			waitForScan: false,
+			wantErr:     true,
+			wantSubstr:  "--fail-on requires --wait-for-scan=true",
+		},
+		{
+			name:        "fail-on kev + wait-for-scan=false rejected",
+			failOn:      "kev",
+			waitForScan: false,
+			wantErr:     true,
+			wantSubstr:  "--fail-on requires --wait-for-scan=true",
+		},
+		{
+			name:        "invalid --fail-on value still rejected (precedence: value check first)",
+			failOn:      "bogus",
+			waitForScan: false,
+			wantErr:     true,
+			wantSubstr:  "--fail-on の値が不正です",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scanFailOn = tc.failOn
+			scanWaitForScan = tc.waitForScan
+
+			// Point at a path that exists so we get past the os.Stat
+			// guard and reach the --fail-on/--wait-for-scan check.
+			err := runScan(scanCmd, []string{t.TempDir()})
+			if tc.wantErr && err == nil {
+				t.Fatalf("runScan returned nil, want error containing %q", tc.wantSubstr)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("runScan returned err=%v, want nil", err)
+			}
+			if tc.wantErr && !strings.Contains(err.Error(), tc.wantSubstr) {
+				t.Errorf("runScan err = %q, want substring %q", err.Error(), tc.wantSubstr)
+			}
+		})
+	}
+}
+
+// TestRunScan_FailOnGuardAllowsValidCombos verifies the inverse of the
+// R3 guard: combinations that are spec-legal must NOT be rejected at the
+// startup check (they may fail later for unrelated reasons like missing
+// credentials, but the --fail-on/--wait-for-scan invariant should be
+// satisfied). We assert by checking that the error, if any, is not the
+// guard message.
+func TestRunScan_FailOnGuardAllowsValidCombos(t *testing.T) {
+	saveFailOn, saveWait := scanFailOn, scanWaitForScan
+	t.Cleanup(func() {
+		scanFailOn = saveFailOn
+		scanWaitForScan = saveWait
+	})
+
+	cases := []struct {
+		name        string
+		failOn      string
+		waitForScan bool
+	}{
+		{"fail-on high + wait-for-scan=true ok", "high", true},
+		{"fail-on critical + wait-for-scan=true ok", "critical", true},
+		// --fail-on unset means the guard is irrelevant regardless of
+		// the wait-for-scan value.
+		{"no fail-on + wait-for-scan=false ok", "", false},
+		{"no fail-on + wait-for-scan=true ok", "", true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			scanFailOn = tc.failOn
+			scanWaitForScan = tc.waitForScan
+
+			// dry-run avoids needing real credentials / API server;
+			// the guard runs before the dry-run short-circuit so this
+			// still exercises it.
+			saveDry := scanDryRun
+			scanDryRun = true
+			t.Cleanup(func() { scanDryRun = saveDry })
+
+			err := runScan(scanCmd, []string{t.TempDir()})
+			if err != nil && strings.Contains(err.Error(), "--fail-on requires --wait-for-scan=true") {
+				t.Errorf("guard fired on valid combo: err=%v", err)
+			}
+		})
+	}
+}
+
 // TestScanExitError_ExitCode verifies the scanExitError contract that
 // main.go relies on for exit-code routing.
 func TestScanExitError_ExitCode(t *testing.T) {

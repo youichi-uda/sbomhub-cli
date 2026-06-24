@@ -85,10 +85,10 @@ func init() {
 	scanCmd.Flags().StringVarP(&scanTool, "tool", "t", "", "使用するツール (syft/trivy/cdxgen, デフォルト: 自動検出)")
 	scanCmd.Flags().StringVarP(&scanFormat, "format", "f", "cyclonedx", "出力フォーマット (cyclonedx/spdx)")
 	scanCmd.Flags().StringVarP(&scanOutput, "output", "o", "", "ローカルにも保存するファイルパス")
-	scanCmd.Flags().StringVar(&scanFailOn, "fail-on", "", "指定した重大度以上の脆弱性で exit 1 (critical/high/medium/low/kev)")
+	scanCmd.Flags().StringVar(&scanFailOn, "fail-on", "", "指定した重大度以上の脆弱性で exit 1 (critical/high/medium/low/kev)。 --wait-for-scan=true (default) が必須")
 	scanCmd.Flags().BoolVar(&scanDryRun, "dry-run", false, "アップロードせずSBOM生成のみ")
 	scanCmd.Flags().BoolVar(&scanNotify, "notify", false, "脆弱性検出時に通知")
-	scanCmd.Flags().BoolVar(&scanWaitForScan, "wait-for-scan", true, "アップロード後にサーバ側の脆弱性スキャン完了を待つ (--fail-on 使用時の必須条件)")
+	scanCmd.Flags().BoolVar(&scanWaitForScan, "wait-for-scan", true, "アップロード後にサーバ側の脆弱性スキャン完了を待つ (--fail-on と併用する場合は true 必須、 false を渡すと起動拒否)")
 	scanCmd.Flags().DurationVar(&scanWaitTimeout, "wait-timeout", 5*time.Minute, "サーバ側スキャン完了を待つ最大時間")
 	scanCmd.Flags().DurationVar(&scanPollInterval, "poll-interval", 5*time.Second, "スキャン状態の polling 間隔")
 }
@@ -117,6 +117,18 @@ func runScan(cmd *cobra.Command, args []string) error {
 		if failOnLevel == severity.LevelNone {
 			return fmt.Errorf("--fail-on の値が不正です: %q (有効値: critical/high/medium/low/kev)", scanFailOn)
 		}
+	}
+
+	// Codex R3 fix: --fail-on requires waiting for the server-side
+	// vulnerability scan to finish — that is the only path that produces
+	// the severity counts the threshold check evaluates against. If the
+	// user (or a CI template) passes --wait-for-scan=false alongside
+	// --fail-on we previously silently returned success (exit 0) after
+	// upload, which let critical findings slip past a gated pipeline.
+	// Fail-fast at startup with a usage error so the misconfiguration is
+	// obvious instead of fail-soft into a green build.
+	if failOnLevel != severity.LevelNone && !scanWaitForScan {
+		return fmt.Errorf("--fail-on requires --wait-for-scan=true; either drop --wait-for-scan=false (it defaults to true) or remove --fail-on")
 	}
 
 	fmt.Printf("📦 スキャン開始: %s\n", absPath)
@@ -230,9 +242,15 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	// Defensive guard: runScan's startup check already rejects
+	// --fail-on with --wait-for-scan=false, so this branch should be
+	// unreachable. Kept as a safety net so future refactors can't
+	// silently re-introduce the fail-soft slip-through.
 	if !scanWaitForScan {
-		printInfo("--wait-for-scan=false のため、 サーバ側スキャン完了を待たずに終了します (--fail-on は評価されません)")
-		return nil
+		return &scanExitError{
+			code: exitAPIError,
+			msg:  "--fail-on requires --wait-for-scan=true (internal invariant violated)",
+		}
 	}
 
 	if scanTimedOut {
