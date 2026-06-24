@@ -214,6 +214,76 @@ func TestDecideDraft_BodyShape(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// F22 regression — IsAIDisabled() must require the server's known reason
+// string, not any 503. A generic gateway 503 should land in IsTransient
+// so a real upstream outage cannot be silently mis-classified as "BYOK
+// not configured" and silently succeed in CI.
+// ----------------------------------------------------------------------------
+
+// TestTriageError_IsAIDisabled_503GenericNotMatch_F22 — a 503 with a
+// generic message (e.g. an upstream gateway 503 page or a stock
+// "Service Unavailable" body) must NOT be classified as AI-disabled.
+// Before this fix, every 503 was treated as the BYOK fallback and
+// silently exit-0'd in the CLI loop.
+func TestTriageError_IsAIDisabled_503GenericNotMatch_F22(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+	}{
+		{"generic Service Unavailable", "Service Unavailable"},
+		{"upstream gateway timeout", "upstream connect error"},
+		{"empty message", ""},
+		{"some other 503", "database is starting up"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			te := &TriageError{
+				StatusCode: http.StatusServiceUnavailable,
+				Message:    tc.message,
+			}
+			if te.IsAIDisabled() {
+				t.Errorf("F22: 503 with generic message %q must NOT be IsAIDisabled (silently mis-classified as BYOK off)", tc.message)
+			}
+			if !te.IsTransient() {
+				t.Errorf("F22: 503 with generic message %q must be IsTransient (gateway outage / overload)", tc.message)
+			}
+			if te.IsPermanent() {
+				t.Errorf("F22: 503 with generic message %q must NOT be IsPermanent", tc.message)
+			}
+		})
+	}
+}
+
+// TestTriageError_IsAIDisabled_503KnownReasonMatch_F22 — the legacy
+// BYOK-not-configured server reply (503 + the exact "AI features are
+// disabled" string) must still flag IsAIDisabled=true so the CLI can
+// fall back to under_investigation cleanly when talking to an older
+// server that has not yet shipped the F4 2xx+ai_disabled fix.
+func TestTriageError_IsAIDisabled_503KnownReasonMatch_F22(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+	}{
+		{"canonical disabled error", "AI features are disabled"},
+		{"BYOK not configured variant", "BYOK key not configured"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			te := &TriageError{
+				StatusCode: http.StatusServiceUnavailable,
+				Message:    tc.message,
+			}
+			if !te.IsAIDisabled() {
+				t.Errorf("F22: 503 with known reason %q must remain IsAIDisabled for legacy server compat", tc.message)
+			}
+			if te.IsTransient() {
+				t.Errorf("F22: 503 known reason must NOT also be transient (would double-count)")
+			}
+		})
+	}
+}
+
 // TestListVulnerabilities_BareArray verifies that the server's bare
 // JSON array shape decodes correctly (the canonical handler returns
 // `[...]` not `{"vulnerabilities":[...]}`).

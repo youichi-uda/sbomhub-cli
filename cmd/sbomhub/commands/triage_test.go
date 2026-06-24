@@ -1031,6 +1031,56 @@ func TestClassifyTriageFailure_F21(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// F22 regression — generic 503 from /triage/run must NOT be classified as
+// AI-disabled. Before this fix the CLI silently swallowed real upstream
+// outages as "BYOK fallback" and exited 0; CI runs with zero persisted
+// drafts looked green.
+// ----------------------------------------------------------------------------
+
+// TestTriageLoop_503GatewayError_ExitCode4_F22 — the server returns a
+// generic 503 (overload / gateway timeout / pgx connection refused)
+// for every triage/run call. Loop must classify these as transient and
+// exit 4, NOT silently exit 0 as the legacy AI-disabled fallback.
+func TestTriageLoop_503GatewayError_ExitCode4_F22(t *testing.T) {
+	tf := newTriageFakeServer(t, threeVulns())
+	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {
+		// 503 without the "AI features are disabled" reason — must be
+		// treated as a real outage, not the BYOK fallback.
+		return http.StatusServiceUnavailable, map[string]string{
+			"error": "Service Unavailable",
+		}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+
+	// stdin must NOT be consulted — we are not prompting on failures.
+	stdin := strings.NewReader("")
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      true,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               stdin,
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+	exitErr, ok := err.(*triageExitError)
+	if !ok {
+		t.Fatalf("F22: err = %v (%T), want *triageExitError (generic 503 must surface, not silently exit 0)", err, err)
+	}
+	if exitErr.ExitCode() != 4 {
+		t.Errorf("F22: ExitCode = %d, want 4 (generic 503 = transient outage, not AI-disabled)", exitErr.ExitCode())
+	}
+	// The AI-disabled hint MUST NOT be printed — this is not the BYOK
+	// fallback case and showing the hint would mislead the operator.
+	if strings.Contains(stderr.String(), "APIキー未設定") {
+		t.Errorf("F22: AI-disabled hint shown for a generic 503 outage — operator misdirection: %s", stderr.String())
+	}
+}
+
 // --- helpers ------------------------------------------------------
 
 func bufioReaderFrom(s string) *bufio.Reader {

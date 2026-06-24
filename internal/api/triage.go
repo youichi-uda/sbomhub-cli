@@ -29,6 +29,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 )
 
 // ----------------------------------------------------------------------------
@@ -203,11 +204,51 @@ func (e *TriageError) Error() string {
 	return fmt.Sprintf("triage API %s %s -> %d: %s", e.Method, e.URL, e.StatusCode, e.Raw)
 }
 
-// IsAIDisabled reports whether the server replied 503 from llm.DisabledError —
-// the BYOK-not-configured case. When true the CLI falls back to recording
-// the vuln as `under_investigation` and prints the "API キー未設定" hint.
+// aiDisabledReasonMarkers are the substrings (case-insensitive) we
+// recognise as the legacy BYOK-not-configured signal on a 503 response.
+// F19 moved the canonical AI-disabled path onto 2xx + ai_disabled=true,
+// so this list only catches OLD servers that still emit
+// llm.DisabledError on 503. Anything else on 503 is a real outage and
+// must classify as transient (see IsTransient).
+//
+// ※要確認: kept in lower-case for case-insensitive substring match.
+// The exact server reason text was `"AI features are disabled"` (with
+// reason `"no LLM provider configured"`) per the legacy DisabledError.
+// Synonyms ("BYOK key not configured") guard against minor copy edits.
+var aiDisabledReasonMarkers = []string{
+	"ai features are disabled",
+	"byok key not configured",
+	"byok not configured",
+}
+
+// IsAIDisabled reports whether the server signalled the BYOK-not-configured
+// fallback path. The canonical M1 server returns this on a 2xx response
+// with TriageRunResult.AIDisabled=true — the CLI does not consult this
+// helper on the 2xx success path (it inspects AIDisabled directly).
+//
+// M1 Codex review #F22: legacy server compatibility — a server that
+// has not yet shipped the F19 2xx+ai_disabled change still returns 503
+// from llm.DisabledError. We accept that legacy shape only when the
+// response carries the known reason text. Any other 503 is treated as
+// a transient outage (gateway timeout, pgx connection refused, server
+// overload) and surfaces through IsTransient → exit code 4. Previously
+// every 503 was silently swallowed as "AI off" and CI exited 0 with
+// zero persisted drafts on a real outage.
 func (e *TriageError) IsAIDisabled() bool {
-	return e != nil && e.StatusCode == http.StatusServiceUnavailable
+	if e == nil || e.StatusCode != http.StatusServiceUnavailable {
+		return false
+	}
+	// Lower-case once so the substring match is case-insensitive across
+	// Message + Reason + Raw — the server has historically emitted the
+	// reason text in any of the three slots depending on whether the
+	// JSON body parsed cleanly.
+	hay := strings.ToLower(e.Message + " " + e.Reason + " " + e.Raw)
+	for _, m := range aiDisabledReasonMarkers {
+		if strings.Contains(hay, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsPermanent reports whether the error is a permanent 4xx that the
@@ -216,11 +257,11 @@ func (e *TriageError) IsAIDisabled() bool {
 // permanent) to match the same R13 classification the scan polling
 // loop uses.
 //
-// 503 from llm.DisabledError is also explicitly excluded — that path
-// has its own IsAIDisabled() classifier and the per-vuln runTriageLoop
-// already short-circuits on it (the operator's BYOK config is the
-// fix, not a CLI retry). Treating it as permanent would inflate the
-// permanent-failure exit code (M1 Codex review #F21).
+// 503 is never permanent — it is either AI-disabled (handled by
+// IsAIDisabled / the per-vuln short-circuit) or a transient outage
+// (handled by IsTransient). Treating it as permanent would inflate the
+// permanent-failure exit code on a legitimate retry case (M1 Codex
+// review #F21, #F22).
 func (e *TriageError) IsPermanent() bool {
 	if e == nil {
 		return false
@@ -229,8 +270,8 @@ func (e *TriageError) IsPermanent() bool {
 		return false
 	}
 	if e.StatusCode == http.StatusServiceUnavailable {
-		// AI-disabled / overloaded path — handled by IsAIDisabled / the
-		// caller's transient bucket, not permanent.
+		// AI-disabled (legacy) vs transient outage — both handled
+		// elsewhere, never as permanent.
 		return false
 	}
 	return e.StatusCode >= 400 && e.StatusCode < 500
@@ -247,6 +288,13 @@ func (e *TriageError) IsPermanent() bool {
 // (transient → exit 4) from "the operator's API key cannot do this
 // thing, fix config" (permanent → exit 3) — silently swallowing both
 // as "skipped" used to make CI green on 403/429 storms.
+//
+// M1 Codex review #F22: a 503 with no recognised AI-disabled marker
+// is now classified transient. Previously this helper returned false
+// for every 503 because IsAIDisabled was assumed to swallow them all;
+// after the strict IsAIDisabled check, real upstream outages (pgx
+// connection refused, gateway timeout, server overload) reach this
+// helper and must surface as exit 4.
 func (e *TriageError) IsTransient() bool {
 	if e == nil {
 		return false
@@ -254,13 +302,13 @@ func (e *TriageError) IsTransient() bool {
 	if e.StatusCode == http.StatusTooManyRequests {
 		return true
 	}
-	// 503 stays exclusively in the AI-disabled lane — see IsAIDisabled.
-	// The caller branches on IsAIDisabled first, so a 503 that escapes
-	// that branch is by definition NOT the BYOK case; but to keep the
-	// classification disjoint we let the caller decide rather than
-	// double-counting here.
 	if e.StatusCode == http.StatusServiceUnavailable {
-		return false
+		// AI-disabled (legacy) wins via IsAIDisabled() and the per-vuln
+		// short-circuit; everything else on 503 is a real outage that
+		// the operator can resolve by retrying. F22: previously this
+		// returned false unconditionally for 503 and the failure was
+		// silently dropped.
+		return !e.IsAIDisabled()
 	}
 	return e.StatusCode >= 500 && e.StatusCode < 600
 }
