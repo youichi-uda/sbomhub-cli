@@ -43,6 +43,14 @@ func TestShouldFail(t *testing.T) {
 		{"kev presence fires kev threshold", Counts{KEV: 1}, LevelKEV, true},
 		{"kev presence at critical threshold fires", Counts{KEV: 1}, LevelCritical, true},
 		{"low at medium threshold does not fire", Counts{Low: 1}, LevelMedium, false},
+		// Codex R2 regression: Unknown is reported but MUST NOT fail any
+		// threshold. The justification (data-quality bucket, not CRA risk)
+		// is documented on Counts.Unknown.
+		{"unknown alone at low threshold does not fire", Counts{Unknown: 7}, LevelLow, false},
+		{"unknown alone at high threshold does not fire", Counts{Unknown: 7}, LevelHigh, false},
+		{"unknown alone at critical threshold does not fire", Counts{Unknown: 7}, LevelCritical, false},
+		{"unknown alone at kev threshold does not fire", Counts{Unknown: 7}, LevelKEV, false},
+		{"unknown + critical still fires on critical via the critical bucket", Counts{Unknown: 7, Critical: 1}, LevelCritical, true},
 	}
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {

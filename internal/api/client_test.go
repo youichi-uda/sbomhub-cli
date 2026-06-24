@@ -304,6 +304,14 @@ func TestGetScanStatus(t *testing.T) {
 	if got.Vulnerabilities.KEV != 4 {
 		t.Errorf("KEV = %d, want 4 (server response must round-trip into VulnerabilitySummary.KEV)", got.Vulnerabilities.KEV)
 	}
+	// Codex R2 fix regression guard: the `unknown` bucket must round-trip
+	// too. Before the fix the scan-status response decoded fine into
+	// VulnerabilitySummary.Unknown but scan.go's downstream aggregation
+	// dropped it, so a scan whose only findings were `unknown` rendered
+	// as "なし ✅" — silently hiding the data-quality finding.
+	if got.Vulnerabilities.Unknown != 1 {
+		t.Errorf("Unknown = %d, want 1 (server response must round-trip into VulnerabilitySummary.Unknown)", got.Vulnerabilities.Unknown)
+	}
 }
 
 // TestGetScanStatusError exercises the transient-error path. The CLI

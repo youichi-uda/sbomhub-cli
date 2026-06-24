@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -220,6 +221,48 @@ func TestResolveCredentials_Precedence(t *testing.T) {
 	}
 	if cfg.APIURL != "https://file.example.com" || cfg.APIKey != "sbh_file" {
 		t.Errorf("file value lost when no env/flag: APIURL=%q APIKey=%q", cfg.APIURL, cfg.APIKey)
+	}
+}
+
+// TestFormatScanVulnSummary_UnknownNotDropped verifies the Codex R2
+// second fix: a scan whose only findings live in the `unknown` bucket
+// must NOT render as "なし ✅". Before the fix the formatter only
+// inspected critical/high/medium/low/kev, so an N-Unknown scan looked
+// clean — silently hiding the data-quality finding from the operator.
+func TestFormatScanVulnSummary_UnknownNotDropped(t *testing.T) {
+	cases := []struct {
+		name    string
+		summary *api.VulnerabilitySummary
+		wantHas string
+		wantNot string
+	}{
+		{
+			name:    "unknown only",
+			summary: &api.VulnerabilitySummary{Unknown: 5, Total: 5},
+			wantHas: "5 Unknown",
+			wantNot: "なし",
+		},
+		{
+			name:    "unknown + critical both shown",
+			summary: &api.VulnerabilitySummary{Critical: 2, Unknown: 3, Total: 5},
+			wantHas: "3 Unknown",
+		},
+		{
+			name:    "all zero still says なし",
+			summary: &api.VulnerabilitySummary{},
+			wantHas: "なし",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatScanVulnSummary(nil, tc.summary)
+			if tc.wantHas != "" && !strings.Contains(got, tc.wantHas) {
+				t.Errorf("formatScanVulnSummary() = %q, want substring %q", got, tc.wantHas)
+			}
+			if tc.wantNot != "" && strings.Contains(got, tc.wantNot) {
+				t.Errorf("formatScanVulnSummary() = %q, must not contain %q (Unknown was dropped)", got, tc.wantNot)
+			}
+		})
 	}
 }
 

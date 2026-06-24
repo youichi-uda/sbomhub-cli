@@ -42,11 +42,20 @@ func Parse(s string) Level {
 
 // Counts holds vulnerability counts by severity bucket. Mirrors the JSON
 // shape returned by the API's scan-status endpoint.
+//
+// `Unknown` represents vulnerabilities the server could not map to a CVSS
+// severity (data quality gap, NVD enrichment lag, etc.). It is reported
+// to the operator for visibility but is intentionally NOT considered by
+// ShouldFail — promoting "unknown" to a CI-blocking signal would punish
+// users for upstream data gaps rather than real risk. The presence of a
+// nonzero Unknown bucket should still surface in CLI output so the
+// operator can investigate; see scan.go formatScanVulnSummary.
 type Counts struct {
 	Critical int
 	High     int
 	Medium   int
 	Low      int
+	Unknown  int
 	KEV      int
 }
 

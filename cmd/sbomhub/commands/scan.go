@@ -266,12 +266,13 @@ func runScan(cmd *cobra.Command, args []string) error {
 		High:     summary.High,
 		Medium:   summary.Medium,
 		Low:      summary.Low,
+		Unknown:  summary.Unknown,
 		KEV:      summary.KEV,
 	}
 	if severity.ShouldFail(counts, failOnLevel) {
 		return &scanExitError{
 			code: exitThresholdExceeded,
-			msg:  fmt.Sprintf("--fail-on %s: 指定された重大度以上の脆弱性が検出されました (critical=%d high=%d medium=%d low=%d kev=%d)", scanFailOn, counts.Critical, counts.High, counts.Medium, counts.Low, counts.KEV),
+			msg:  fmt.Sprintf("--fail-on %s: 指定された重大度以上の脆弱性が検出されました (critical=%d high=%d medium=%d low=%d unknown=%d kev=%d)", scanFailOn, counts.Critical, counts.High, counts.Medium, counts.Low, counts.Unknown, counts.KEV),
 		}
 	}
 
@@ -309,10 +310,11 @@ func waitForScanCompletion(client *api.Client, projectID, sbomID string) (summar
 			fmt.Printf("   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
 		} else {
 			elapsed := scanWaitTimeout - remaining
-			fmt.Printf("   状態: %-9s 経過: %4s / %s  (critical=%d high=%d medium=%d low=%d kev=%d total=%d)\n",
+			fmt.Printf("   状態: %-9s 経過: %4s / %s  (critical=%d high=%d medium=%d low=%d unknown=%d kev=%d total=%d)\n",
 				status.Status, elapsed.Round(time.Second), scanWaitTimeout,
 				status.Vulnerabilities.Critical, status.Vulnerabilities.High,
 				status.Vulnerabilities.Medium, status.Vulnerabilities.Low,
+				status.Vulnerabilities.Unknown,
 				status.Vulnerabilities.KEV, status.Vulnerabilities.Total)
 
 			switch status.Status {
@@ -381,15 +383,25 @@ func countComponents(sbomData []byte) int {
 // the legacy `result.KEVCount` is available we fall back to it; that
 // field is left at zero by the canonical upload endpoint today, so the
 // fallback is effectively "no KEV info" rather than authoritative.
+//
+// Unknown count (Codex R2 fix): the server-side scan-status emits an
+// `unknown` bucket for vulnerabilities the enrichment pipeline could not
+// map to a CVSS severity (NVD lag, missing CVSS vector, etc.). Earlier
+// versions of this function dropped that bucket, so a scan with N
+// "unknown" CVEs and zero across critical/high/medium/low rendered as
+// "なし ✅" — silently hiding real findings from the operator. We now
+// surface the count alongside the rated buckets. It is intentionally NOT
+// fed into severity.ShouldFail (see severity.Counts doc).
 func formatScanVulnSummary(result *api.UploadResult, summary *api.VulnerabilitySummary) string {
-	c, h, m, l, kev, total := 0, 0, 0, 0, 0, 0
+	c, h, m, l, u, kev, total := 0, 0, 0, 0, 0, 0, 0
 	if summary != nil {
-		c, h, m, l, kev, total = summary.Critical, summary.High, summary.Medium, summary.Low, summary.KEV, summary.Total
+		c, h, m, l, u, kev, total = summary.Critical, summary.High, summary.Medium, summary.Low, summary.Unknown, summary.KEV, summary.Total
 	} else if result != nil {
+		// UploadResult has no Unknown field today; leave u=0 in the fallback.
 		c, h, m, l, kev, total = result.Critical, result.High, result.Medium, result.Low, result.KEVCount, result.VulnerabilityCount
 	}
 
-	if total == 0 && kev == 0 {
+	if total == 0 && kev == 0 && u == 0 {
 		return "なし ✅"
 	}
 
@@ -408,6 +420,9 @@ func formatScanVulnSummary(result *api.UploadResult, summary *api.VulnerabilityS
 	}
 	if l > 0 {
 		parts = append(parts, fmt.Sprintf("%d Low", l))
+	}
+	if u > 0 {
+		parts = append(parts, fmt.Sprintf("%d Unknown", u))
 	}
 	if len(parts) == 0 {
 		return "なし ✅"
