@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -351,10 +352,18 @@ type ScanStatusResponse struct {
 //
 // Trust Rescue P1 #12: this is the contract that lets the CLI block a CI
 // job on --fail-on <severity>.
-func (c *Client) GetScanStatus(projectID, sbomID string) (*ScanStatusResponse, error) {
+//
+// Codex R4 fix: the caller-supplied ctx is bound to the HTTP request via
+// http.NewRequestWithContext so that --wait-timeout (modeled as
+// context.WithTimeout in scan.go's waitForScanCompletion) actually aborts
+// an in-flight request. Without the context binding the only timeout in
+// effect was the Client.httpClient default 60s, so --wait-timeout=10s
+// still hung for up to 60s on a slow server — violating the documented
+// timeout contract.
+func (c *Client) GetScanStatus(ctx context.Context, projectID, sbomID string) (*ScanStatusResponse, error) {
 	url := fmt.Sprintf("%s/api/v1/projects/%s/sboms/%s/scan-status", c.baseURL, projectID, sbomID)
 
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}

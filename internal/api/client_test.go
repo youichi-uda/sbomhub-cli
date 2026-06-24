@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestNewClient(t *testing.T) {
@@ -285,7 +287,7 @@ func TestGetScanStatus(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "test-key")
-	got, err := client.GetScanStatus(projectID, sbomID)
+	got, err := client.GetScanStatus(context.Background(), projectID, sbomID)
 	if err != nil {
 		t.Fatalf("GetScanStatus() error = %v", err)
 	}
@@ -325,8 +327,44 @@ func TestGetScanStatusError(t *testing.T) {
 	defer server.Close()
 
 	client := NewClient(server.URL, "test-key")
-	if _, err := client.GetScanStatus("p", "s"); err == nil {
+	if _, err := client.GetScanStatus(context.Background(), "p", "s"); err == nil {
 		t.Error("GetScanStatus() expected error for 500 response")
+	}
+}
+
+// TestGetScanStatusContextCancel verifies the Codex R4 finding 2 fix:
+// GetScanStatus must honor caller-supplied context cancellation by
+// aborting an in-flight HTTP request. The fix wires the ctx through
+// http.NewRequestWithContext so that --wait-timeout (modeled as
+// context.WithTimeout in scan.go) actually short-circuits a hung server.
+//
+// Before the fix the only timeout in effect was Client.httpClient default
+// 60s, so a 100ms --wait-timeout would still hang for ~60s.
+func TestGetScanStatusContextCancel(t *testing.T) {
+	// Server intentionally hangs forever (until the test's HTTP request
+	// is cancelled). We hold the handler open via the request's own
+	// context so we don't leak goroutines after the test exits.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := client.GetScanStatus(ctx, "p", "s")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Error("GetScanStatus() expected error when ctx cancels mid-request")
+	}
+	// 60s default httpClient.Timeout would put us in the 5-60s range
+	// without the fix. Allow generous slack, but reject anything that
+	// suggests the ctx was ignored.
+	if elapsed > 2*time.Second {
+		t.Errorf("GetScanStatus took %s with a 100ms ctx — request not bound via http.NewRequestWithContext (Codex R4 finding 2 regression)", elapsed)
 	}
 }
 

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -243,7 +244,14 @@ func runScan(cmd *cobra.Command, args []string) error {
 	var scanTimedOut bool
 	var scanFailedMsg string
 	if scanWaitForScan {
-		summary, scanTimedOut, scanFailedMsg = waitForScanCompletion(client, result.ProjectID, result.SBOMID)
+		// Bind the polling loop's deadline to a context so the in-flight
+		// HTTP request can be cancelled the moment --wait-timeout expires
+		// (Codex R4 finding 2). The httpClient default 60s timeout was
+		// the only thing in effect before this — meaning --wait-timeout=10s
+		// could still hang for up to 60s on a slow server.
+		ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+		summary, scanTimedOut, scanFailedMsg = waitForScanCompletion(ctx, client, result.ProjectID, result.SBOMID)
+		cancel()
 	}
 
 	// 結果表示
@@ -319,17 +327,21 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 // waitForScanCompletion polls GET /api/v1/projects/:id/sboms/:sbom_id/scan-status
 // until it reports a terminal state ("completed" or "failed"), or until
-// --wait-timeout elapses. Polling cadence is --poll-interval. Returns:
+// the supplied ctx is cancelled (typically via context.WithTimeout bound
+// to --wait-timeout in runScan). Polling cadence is --poll-interval.
+// Returns:
 //
 //   - summary:        latest counts on success (status=completed)
-//   - timedOut:       true if the timeout fired first
+//   - timedOut:       true if ctx fired before a terminal state was seen
 //   - failedErrorMsg: non-empty if server reported the scan failed
 //
 // On transient API errors the function logs a brief notice and keeps
 // polling rather than aborting; the network may flap mid-CI and we
-// prefer to ride that out within the user's wait-timeout budget.
-func waitForScanCompletion(client *api.Client, projectID, sbomID string) (summary *api.VulnerabilitySummary, timedOut bool, failedErrorMsg string) {
-	deadline := time.Now().Add(scanWaitTimeout)
+// prefer to ride that out within the user's wait-timeout budget. The
+// only exception is when the error is itself caused by ctx cancellation —
+// that surfaces as a clean timeout instead of a noisy "retry until clock
+// catches up" loop (Codex R4 finding 2).
+func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, sbomID string) (summary *api.VulnerabilitySummary, timedOut bool, failedErrorMsg string) {
 	tick := scanPollInterval
 	if tick <= 0 {
 		tick = 5 * time.Second
@@ -337,17 +349,23 @@ func waitForScanCompletion(client *api.Client, projectID, sbomID string) (summar
 
 	fmt.Printf("⏳ サーバ側脆弱性スキャン待機中 (timeout=%s, interval=%s)...\n", scanWaitTimeout, tick)
 
+	startTime := time.Now()
 	for {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
+		if ctx.Err() != nil {
 			return nil, true, ""
 		}
 
-		status, err := client.GetScanStatus(projectID, sbomID)
+		status, err := client.GetScanStatus(ctx, projectID, sbomID)
 		if err != nil {
+			// If the error is because ctx was cancelled (deadline hit
+			// mid-request) treat it as a clean timeout — not a transient
+			// API error to retry past the deadline.
+			if ctx.Err() != nil {
+				return nil, true, ""
+			}
 			fmt.Printf("   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
 		} else {
-			elapsed := scanWaitTimeout - remaining
+			elapsed := time.Since(startTime)
 			fmt.Printf("   状態: %-9s 経過: %4s / %s  (critical=%d high=%d medium=%d low=%d unknown=%d kev=%d total=%d)\n",
 				status.Status, elapsed.Round(time.Second), scanWaitTimeout,
 				status.Vulnerabilities.Critical, status.Vulnerabilities.High,
@@ -363,11 +381,16 @@ func waitForScanCompletion(client *api.Client, projectID, sbomID string) (summar
 			}
 		}
 
-		sleep := tick
-		if sleep > remaining {
-			sleep = remaining
+		// Sleep until next poll tick or ctx cancellation, whichever
+		// comes first. select prevents a fixed-tick Sleep from outliving
+		// the timeout.
+		timer := time.NewTimer(tick)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, true, ""
+		case <-timer.C:
 		}
-		time.Sleep(sleep)
 	}
 }
 

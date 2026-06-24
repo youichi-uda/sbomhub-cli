@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -52,7 +53,9 @@ func TestWaitForScanCompletion_Completes(t *testing.T) {
 		scanPollInterval = 5 * time.Second
 	})
 
-	summary, timedOut, failedMsg := waitForScanCompletion(client, projectID, sbomID)
+	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+	defer cancel()
+	summary, timedOut, failedMsg := waitForScanCompletion(ctx, client, projectID, sbomID)
 	if timedOut {
 		t.Fatalf("waitForScanCompletion timed out unexpectedly (hits=%d)", atomic.LoadInt32(&hits))
 	}
@@ -94,7 +97,9 @@ func TestWaitForScanCompletion_TimesOut(t *testing.T) {
 		scanPollInterval = 5 * time.Second
 	})
 
-	summary, timedOut, failedMsg := waitForScanCompletion(client, "p", "s")
+	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+	defer cancel()
+	summary, timedOut, failedMsg := waitForScanCompletion(ctx, client, "p", "s")
 	if !timedOut {
 		t.Errorf("expected timeout, got summary=%v failedMsg=%q", summary, failedMsg)
 	}
@@ -122,12 +127,63 @@ func TestWaitForScanCompletion_Failed(t *testing.T) {
 		scanPollInterval = 5 * time.Second
 	})
 
-	_, timedOut, failedMsg := waitForScanCompletion(client, "p", "s")
+	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+	defer cancel()
+	_, timedOut, failedMsg := waitForScanCompletion(ctx, client, "p", "s")
 	if timedOut {
 		t.Error("expected failed path, not timeout")
 	}
 	if failedMsg != "nvd: rate limited" {
 		t.Errorf("failedMsg = %q, want %q", failedMsg, "nvd: rate limited")
+	}
+}
+
+// TestWaitForScanCompletion_ContextCancelAbortsHungRequest verifies the
+// Codex R4 finding 2 fix: when the context fires while an HTTP request
+// is hung (server never writes a response), the polling loop returns
+// timedOut=true within a few ms of the context deadline — NOT after the
+// httpClient default 60s. Before the fix the GetScanStatus request was
+// not bound to ctx, so --wait-timeout=10s could still hang for up to
+// 60s on a slow server.
+func TestWaitForScanCompletion_ContextCancelAbortsHungRequest(t *testing.T) {
+	// Server intentionally hangs forever — never writes a response.
+	hung := make(chan struct{})
+	t.Cleanup(func() { close(hung) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-hung:
+		}
+	}))
+	defer server.Close()
+
+	client := api.NewClient(server.URL, "test-key")
+
+	// Set the package-level wait timeout high enough that, if the HTTP
+	// request were bound to httpClient.Timeout (the broken behavior) the
+	// test would observe a much longer elapsed time. The actual deadline
+	// we care about is the ctx below.
+	scanWaitTimeout = 10 * time.Second
+	scanPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		scanWaitTimeout = 5 * time.Minute
+		scanPollInterval = 5 * time.Second
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, timedOut, _ := waitForScanCompletion(ctx, client, "p", "s")
+	elapsed := time.Since(start)
+
+	if !timedOut {
+		t.Errorf("expected timeout when ctx cancels mid-request")
+	}
+	// Allow generous slack but reject the "waited the full 60s httpClient
+	// default" failure mode (and anything close to it).
+	if elapsed > 2*time.Second {
+		t.Errorf("waitForScanCompletion took %s with a 100ms ctx — HTTP request is not bound to ctx (Codex R4 finding 2 regression)", elapsed)
 	}
 }
 
