@@ -1146,6 +1146,358 @@ func TestRunScan_PermanentScanStatusErrorReturnsExit3(t *testing.T) {
 	}
 }
 
+// TestComputeScanStatus verifies the canonical scan_status string
+// produced for every (waitForScan, dryRun, timeout, failed, apiErr,
+// summary) combination. This is the value the GitHub Action wrapper and
+// downstream automation branch on, so a regression here directly breaks
+// the action.yml outputs contract.
+func TestComputeScanStatus(t *testing.T) {
+	cases := []struct {
+		name string
+		in   scanFinalState
+		want string
+	}{
+		{
+			name: "dry-run always reports skipped",
+			in:   scanFinalState{dryRun: true, waitForScan: true},
+			want: "skipped",
+		},
+		{
+			name: "--wait-for-scan=false reports skipped",
+			in:   scanFinalState{waitForScan: false},
+			want: "skipped",
+		},
+		{
+			name: "permanent API error reports unknown (status truly unknowable)",
+			in:   scanFinalState{waitForScan: true, scanAPIErrMsg: "HTTP 401"},
+			want: "unknown",
+		},
+		{
+			name: "server-side scan failed reports failed",
+			in:   scanFinalState{waitForScan: true, scanFailedMsg: "nvd: rate limited"},
+			want: "failed",
+		},
+		{
+			name: "timeout with snapshot reports running (last seen state)",
+			in: scanFinalState{
+				waitForScan:  true,
+				scanTimedOut: true,
+				summary:      &api.VulnerabilitySummary{High: 1, Total: 1},
+			},
+			want: "running",
+		},
+		{
+			name: "timeout without snapshot reports unknown (no signal)",
+			in:   scanFinalState{waitForScan: true, scanTimedOut: true},
+			want: "unknown",
+		},
+		{
+			name: "clean completion reports completed",
+			in: scanFinalState{
+				waitForScan: true,
+				summary:     &api.VulnerabilitySummary{},
+			},
+			want: "completed",
+		},
+		{
+			name: "completion with findings reports completed",
+			in: scanFinalState{
+				waitForScan: true,
+				summary:     &api.VulnerabilitySummary{Critical: 2, KEV: 1, Total: 2},
+			},
+			want: "completed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := computeScanStatus(tc.in); got != tc.want {
+				t.Errorf("computeScanStatus(%+v) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildScanJSONResult_Schema verifies the JSON payload contract: 4
+// top-level keys (sbom_id / project_id / component_count /
+// vulnerability_summary) that entrypoint.sh's jq paths read, plus the
+// auxiliary keys (project_name / project_created / format / url /
+// scan_status / fail_on) downstream automation relies on. Without this
+// guard a struct-field rename or json tag drift would silently break the
+// GitHub Action wrapper.
+func TestBuildScanJSONResult_Schema(t *testing.T) {
+	high := "high"
+	in := scanFinalState{
+		componentCount: 42,
+		format:         "cyclonedx",
+		uploadResult: &api.UploadResult{
+			SBOMID:         "sbom-uuid",
+			ProjectID:      "project-uuid",
+			ProjectName:    "my-app",
+			ProjectCreated: true,
+			URL:            "https://sbomhub.app/projects/project-uuid",
+		},
+		summary: &api.VulnerabilitySummary{
+			Critical: 1, High: 2, Medium: 3, Low: 4, Unknown: 5, KEV: 1, Total: 15,
+		},
+		waitForScan:     true,
+		failOnStr:       high,
+		failOnTriggered: true,
+		exitCode:        exitThresholdExceeded,
+	}
+	got := buildScanJSONResult(in)
+
+	// Round-trip through JSON to verify both the struct shape AND the
+	// json tags actually produce the documented wire keys.
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+
+	// Top-level keys entrypoint.sh consumes via jq must all be present.
+	wantKeys := []string{
+		"sbom_id", "project_id", "project_name", "project_created",
+		"component_count", "format", "url", "scan_status",
+		"vulnerability_summary", "fail_on",
+	}
+	for _, k := range wantKeys {
+		if _, ok := decoded[k]; !ok {
+			t.Errorf("JSON missing key %q (entrypoint.sh consumer); got keys=%v", k, decoded)
+		}
+	}
+
+	// vulnerability_summary nested keys.
+	vs, ok := decoded["vulnerability_summary"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("vulnerability_summary is not an object: %T", decoded["vulnerability_summary"])
+	}
+	wantSubKeys := []string{"critical", "high", "medium", "low", "kev", "unknown", "total"}
+	for _, k := range wantSubKeys {
+		if _, ok := vs[k]; !ok {
+			t.Errorf("vulnerability_summary missing sub-key %q; got %v", k, vs)
+		}
+	}
+
+	// fail_on nested keys.
+	fo, ok := decoded["fail_on"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("fail_on is not an object: %T", decoded["fail_on"])
+	}
+	for _, k := range []string{"threshold", "triggered", "exit_code"} {
+		if _, ok := fo[k]; !ok {
+			t.Errorf("fail_on missing sub-key %q; got %v", k, fo)
+		}
+	}
+
+	// Spot-check critical values so a future bug that produces the
+	// correct schema with wrong data still trips.
+	if decoded["sbom_id"] != "sbom-uuid" {
+		t.Errorf("sbom_id = %v, want sbom-uuid", decoded["sbom_id"])
+	}
+	if decoded["project_id"] != "project-uuid" {
+		t.Errorf("project_id = %v, want project-uuid", decoded["project_id"])
+	}
+	if cc, _ := decoded["component_count"].(float64); int(cc) != 42 {
+		t.Errorf("component_count = %v, want 42", decoded["component_count"])
+	}
+	if decoded["scan_status"] != "completed" {
+		t.Errorf("scan_status = %v, want completed", decoded["scan_status"])
+	}
+	if fo["threshold"] != "high" {
+		t.Errorf("fail_on.threshold = %v, want \"high\"", fo["threshold"])
+	}
+	if fo["triggered"] != true {
+		t.Errorf("fail_on.triggered = %v, want true", fo["triggered"])
+	}
+	if ec, _ := fo["exit_code"].(float64); int(ec) != exitThresholdExceeded {
+		t.Errorf("fail_on.exit_code = %v, want %d", fo["exit_code"], exitThresholdExceeded)
+	}
+	// Total is the local CVSS-only sum (1+2+3+4+5 = 15, NOT 15+1 KEV).
+	if tot, _ := vs["total"].(float64); int(tot) != 15 {
+		t.Errorf("vulnerability_summary.total = %v, want 15 (CVSS-only sum, KEV is orthogonal)", vs["total"])
+	}
+}
+
+// TestBuildScanJSONResult_NullThreshold verifies that omitting --fail-on
+// produces threshold=null in the JSON (NOT the empty-string sentinel),
+// so `jq -e '.fail_on.threshold'` consumers can branch on configuration
+// without overloading "".
+func TestBuildScanJSONResult_NullThreshold(t *testing.T) {
+	in := scanFinalState{
+		componentCount: 0,
+		format:         "cyclonedx",
+		uploadResult: &api.UploadResult{
+			SBOMID: "s", ProjectID: "p",
+		},
+		summary:     &api.VulnerabilitySummary{},
+		waitForScan: true,
+		failOnStr:   "", // no --fail-on supplied
+		exitCode:    exitSuccess,
+	}
+	got := buildScanJSONResult(in)
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	if !strings.Contains(string(raw), `"threshold":null`) {
+		t.Errorf("JSON did not encode null threshold: %s", string(raw))
+	}
+}
+
+// TestBuildScanJSONResult_Scenarios drives the schema builder across the
+// scenarios called out by Wave epsilon: clean / critical detected / scan
+// timeout / scan failed. Each scenario asserts the scan_status, the
+// per-severity counts, and the fail_on.exit_code so a regression in any
+// branch of the runScan switch is caught here without needing to invoke
+// the full pipeline.
+func TestBuildScanJSONResult_Scenarios(t *testing.T) {
+	cases := []struct {
+		name           string
+		in             scanFinalState
+		wantStatus     string
+		wantExitCode   int
+		wantCritical   int
+		wantTriggered  bool
+		wantNotInTotal int // negative count means total must be != this value
+	}{
+		{
+			name: "clean scan: 0 findings, no fail-on, exit 0",
+			in: scanFinalState{
+				componentCount: 10,
+				format:         "cyclonedx",
+				uploadResult:   &api.UploadResult{SBOMID: "s", ProjectID: "p"},
+				summary:        &api.VulnerabilitySummary{},
+				waitForScan:    true,
+				exitCode:       exitSuccess,
+			},
+			wantStatus:   "completed",
+			wantExitCode: exitSuccess,
+		},
+		{
+			name: "critical detected + fail-on critical triggers exit 1",
+			in: scanFinalState{
+				componentCount: 100,
+				format:         "cyclonedx",
+				uploadResult:   &api.UploadResult{SBOMID: "s", ProjectID: "p"},
+				summary:        &api.VulnerabilitySummary{Critical: 3, High: 1, Total: 4},
+				waitForScan:    true,
+				failOnStr:      "critical",
+				failOnTriggered: true,
+				exitCode:        exitThresholdExceeded,
+			},
+			wantStatus:    "completed",
+			wantExitCode:  exitThresholdExceeded,
+			wantCritical:  3,
+			wantTriggered: true,
+		},
+		{
+			name: "scan timeout (with partial snapshot): status=running, exit=2",
+			in: scanFinalState{
+				componentCount: 50,
+				format:         "cyclonedx",
+				uploadResult:   &api.UploadResult{SBOMID: "s", ProjectID: "p"},
+				summary:        &api.VulnerabilitySummary{High: 2, Total: 2},
+				waitForScan:    true,
+				scanTimedOut:   true,
+				failOnStr:      "high",
+				exitCode:       exitScanTimeout,
+			},
+			wantStatus:   "running",
+			wantExitCode: exitScanTimeout,
+		},
+		{
+			name: "server-side scan failed: status=failed, exit=2",
+			in: scanFinalState{
+				componentCount: 5,
+				format:         "cyclonedx",
+				uploadResult:   &api.UploadResult{SBOMID: "s", ProjectID: "p"},
+				scanFailedMsg:  "nvd unreachable",
+				waitForScan:    true,
+				failOnStr:      "high",
+				exitCode:       exitScanTimeout,
+			},
+			wantStatus:   "failed",
+			wantExitCode: exitScanTimeout,
+		},
+		{
+			name: "permanent API error during polling: status=unknown, exit=3",
+			in: scanFinalState{
+				componentCount: 5,
+				format:         "cyclonedx",
+				uploadResult:   &api.UploadResult{SBOMID: "s", ProjectID: "p"},
+				scanAPIErrMsg:  "HTTP 401 unauthorized",
+				waitForScan:    true,
+				exitCode:       exitAPIError,
+			},
+			wantStatus:   "unknown",
+			wantExitCode: exitAPIError,
+		},
+		{
+			name: "--wait-for-scan=false: status=skipped, exit=0",
+			in: scanFinalState{
+				componentCount: 5,
+				format:         "cyclonedx",
+				uploadResult:   &api.UploadResult{SBOMID: "s", ProjectID: "p"},
+				waitForScan:    false,
+				exitCode:       exitSuccess,
+			},
+			wantStatus:   "skipped",
+			wantExitCode: exitSuccess,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildScanJSONResult(tc.in)
+			if got.ScanStatus != tc.wantStatus {
+				t.Errorf("ScanStatus = %q, want %q", got.ScanStatus, tc.wantStatus)
+			}
+			if got.FailOn.ExitCode != tc.wantExitCode {
+				t.Errorf("FailOn.ExitCode = %d, want %d", got.FailOn.ExitCode, tc.wantExitCode)
+			}
+			if tc.wantCritical > 0 && got.VulnerabilitySummary.Critical != tc.wantCritical {
+				t.Errorf("VulnerabilitySummary.Critical = %d, want %d", got.VulnerabilitySummary.Critical, tc.wantCritical)
+			}
+			if tc.wantTriggered && !got.FailOn.Triggered {
+				t.Errorf("FailOn.Triggered = false, want true")
+			}
+			// Component count must survive every code path (it's
+			// computed pre-upload from the local SBOM).
+			if got.ComponentCount != tc.in.componentCount {
+				t.Errorf("ComponentCount = %d, want %d", got.ComponentCount, tc.in.componentCount)
+			}
+		})
+	}
+}
+
+// TestBuildScanJSONResult_NilUploadResult covers the dry-run / pre-upload
+// failure path: uploadResult may be nil but the schema must still encode
+// without panicking and surface ScanStatus="skipped".
+func TestBuildScanJSONResult_NilUploadResult(t *testing.T) {
+	in := scanFinalState{
+		componentCount: 7,
+		format:         "cyclonedx",
+		uploadResult:   nil,
+		summary:        nil,
+		waitForScan:    true,
+		dryRun:         true,
+		exitCode:       exitSuccess,
+	}
+	got := buildScanJSONResult(in)
+	if got.ScanStatus != "skipped" {
+		t.Errorf("ScanStatus = %q, want \"skipped\" (dry-run)", got.ScanStatus)
+	}
+	if got.ComponentCount != 7 {
+		t.Errorf("ComponentCount = %d, want 7", got.ComponentCount)
+	}
+	// Marshal must not panic and must produce valid JSON.
+	if _, err := json.Marshal(got); err != nil {
+		t.Errorf("Marshal() error = %v on nil uploadResult", err)
+	}
+}
+
 // TestScanExitError_ExitCode verifies the scanExitError contract that
 // main.go relies on for exit-code routing.
 func TestScanExitError_ExitCode(t *testing.T) {

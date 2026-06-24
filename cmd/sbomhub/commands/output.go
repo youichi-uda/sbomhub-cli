@@ -34,44 +34,62 @@ func InitOutputConfig(quiet, verbose, jsonOutput bool) {
 	globalOutput.JSON = jsonOutput
 }
 
-// Print prints a message (respects quiet mode)
+// humanWriter returns the writer for human-readable output. In JSON
+// mode it returns ErrWriter (typically os.Stderr) so that stdout is
+// reserved exclusively for the JSON payload — otherwise the human-
+// friendly progress lines would corrupt downstream `jq` consumers.
+// Outside of JSON mode it returns Writer (typically os.Stdout) as
+// before.
+func (o *OutputConfig) humanWriter() io.Writer {
+	if o.JSON {
+		return o.ErrWriter
+	}
+	return o.Writer
+}
+
+// Print prints a message (respects quiet mode). Routes to stderr in
+// JSON mode so stdout stays clean for the JSON payload.
 func (o *OutputConfig) Print(format string, args ...interface{}) {
 	if o.Quiet {
 		return
 	}
-	fmt.Fprintf(o.Writer, format, args...)
+	fmt.Fprintf(o.humanWriter(), format, args...)
 }
 
-// Println prints a message with newline (respects quiet mode)
+// Println prints a message with newline (respects quiet mode). Routes
+// to stderr in JSON mode so stdout stays clean for the JSON payload.
 func (o *OutputConfig) Println(args ...interface{}) {
 	if o.Quiet {
 		return
 	}
-	fmt.Fprintln(o.Writer, args...)
+	fmt.Fprintln(o.humanWriter(), args...)
 }
 
-// PrintSuccess prints a success message (respects quiet mode)
+// PrintSuccess prints a success message (respects quiet mode). Routes
+// to stderr in JSON mode so stdout stays clean for the JSON payload.
 func (o *OutputConfig) PrintSuccess(format string, args ...interface{}) {
 	if o.Quiet {
 		return
 	}
-	fmt.Fprintf(o.Writer, "✓ "+format+"\n", args...)
+	fmt.Fprintf(o.humanWriter(), "✓ "+format+"\n", args...)
 }
 
-// PrintInfo prints an info message (respects quiet mode)
+// PrintInfo prints an info message (respects quiet mode). Routes to
+// stderr in JSON mode so stdout stays clean for the JSON payload.
 func (o *OutputConfig) PrintInfo(format string, args ...interface{}) {
 	if o.Quiet {
 		return
 	}
-	fmt.Fprintf(o.Writer, format+"\n", args...)
+	fmt.Fprintf(o.humanWriter(), format+"\n", args...)
 }
 
-// PrintVerbose prints a verbose message (only in verbose mode)
+// PrintVerbose prints a verbose message (only in verbose mode). Routes
+// to stderr in JSON mode so stdout stays clean for the JSON payload.
 func (o *OutputConfig) PrintVerbose(format string, args ...interface{}) {
 	if !o.Verbose {
 		return
 	}
-	fmt.Fprintf(o.Writer, "[DEBUG] "+format+"\n", args...)
+	fmt.Fprintf(o.humanWriter(), "[DEBUG] "+format+"\n", args...)
 }
 
 // PrintError prints an error message (always printed)

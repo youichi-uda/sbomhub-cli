@@ -45,6 +45,197 @@ type scanExitError struct {
 func (e *scanExitError) Error() string { return e.msg }
 func (e *scanExitError) ExitCode() int { return e.code }
 
+// scanJSONResult is the canonical schema for `sbomhub scan --json`.
+// Keep this in sync with sbomhub-internal/draft-sbomhub-action/entrypoint.sh
+// jq paths and with the action.yml outputs contract — consumers (the
+// GitHub Action wrapper, CI templates, downstream automation) treat this
+// as the contract.
+//
+// Schema rationale per field:
+//
+//   - SBOMID / ProjectID: server-assigned UUIDs from the canonical upload
+//     endpoint. Empty when the run never reached upload (dry-run, early
+//     config error before upload).
+//   - ProjectName / ProjectCreated: surface name + whether get-or-create
+//     created a fresh project so CI logs can report it without an extra
+//     GET. ProjectName may be empty when --project was passed as a UUID
+//     (we don't round-trip a GET to fetch the name; see UploadSBOM).
+//   - ComponentCount: count of components in the local SBOM (CycloneDX
+//     `components[]` length, or SPDX `packages[]`). Computed before
+//     upload so it survives polling errors.
+//   - Format: "cyclonedx" / "spdx" — echoes --format.
+//   - URL: web UI link for the project; best-effort from API base URL.
+//   - ScanStatus: one of:
+//     "completed" — server-side scan reached terminal state without error
+//     "failed"    — server-side scan errored (Vulnerabilities may be partial)
+//     "running"   — wait-timeout fired while server still scanning (we
+//     observed at least one snapshot before timing out)
+//     "unknown"   — no signal at all (--wait-timeout with no successful
+//     poll, or permanent 4xx fast-fail during polling)
+//     "skipped"   — --wait-for-scan=false OR --dry-run skipped the loop
+//   - VulnerabilitySummary: per-severity counts. KEV is the orthogonal
+//     "any CISA Known Exploited CVE" bucket (also counted in its CVSS
+//     bucket). Total is the sum of c/h/m/l/u (NOT including KEV to avoid
+//     double-counting against the CVSS buckets).
+//   - FailOn: echoes the --fail-on threshold the run was configured with
+//     (null when unset), whether the threshold tripped, and the exit code
+//     the process will return. ExitCode mirrors the documented set:
+//     0 success / 1 threshold exceeded / 2 scan timeout or server failure
+//     / 3 API or config error.
+type scanJSONResult struct {
+	SBOMID               string              `json:"sbom_id"`
+	ProjectID            string              `json:"project_id"`
+	ProjectName          string              `json:"project_name"`
+	ProjectCreated       bool                `json:"project_created"`
+	ComponentCount       int                 `json:"component_count"`
+	Format               string              `json:"format"`
+	URL                  string              `json:"url"`
+	ScanStatus           string              `json:"scan_status"`
+	VulnerabilitySummary scanJSONVulnSummary `json:"vulnerability_summary"`
+	FailOn               scanJSONFailOn      `json:"fail_on"`
+}
+
+// scanJSONVulnSummary mirrors api.VulnerabilitySummary but pins JSON
+// field naming and ordering for stable wire output. Total is computed
+// locally as c+h+m+l+u (CVSS-rated buckets only) rather than trusting
+// the server's `total` field — matches the formatScanVulnSummary
+// rationale: a server that emits per-bucket counts but leaves `total`
+// at zero (older API, streamed/partial response) would otherwise
+// produce a misleading total=0 in --json output while the human box
+// shows real findings.
+type scanJSONVulnSummary struct {
+	Critical int `json:"critical"`
+	High     int `json:"high"`
+	Medium   int `json:"medium"`
+	Low      int `json:"low"`
+	KEV      int `json:"kev"`
+	Unknown  int `json:"unknown"`
+	Total    int `json:"total"`
+}
+
+// scanJSONFailOn carries the --fail-on configuration + outcome.
+// Threshold is *string so the JSON encodes `null` when --fail-on was
+// not supplied — consumers can use `jq -e '.fail_on.threshold'` to
+// branch on "was a threshold configured" without overloading the
+// empty-string sentinel.
+type scanJSONFailOn struct {
+	Threshold *string `json:"threshold"`
+	Triggered bool    `json:"triggered"`
+	ExitCode  int     `json:"exit_code"`
+}
+
+// scanFinalState captures every output of the scan/upload/poll pipeline
+// that buildScanJSONResult needs. Centralising the inputs keeps the
+// helper unit-testable (we can construct a scanFinalState directly in
+// tests without standing up a fake server or invoking the real scanner)
+// and keeps the JSON builder pure — no globals, no I/O.
+type scanFinalState struct {
+	componentCount  int
+	format          string
+	uploadResult    *api.UploadResult
+	summary         *api.VulnerabilitySummary
+	waitForScan     bool
+	dryRun          bool
+	scanTimedOut    bool
+	scanFailedMsg   string
+	scanAPIErrMsg   string
+	failOnStr       string // original CLI value, empty when not set
+	failOnTriggered bool
+	exitCode        int
+}
+
+// computeScanStatus maps the final pipeline state to one of the
+// canonical scan_status values. Order matters: API error wins over
+// timeout (a permanent 4xx tells us the polling endpoint is broken,
+// status is unknowable), and timeout-with-snapshot reports "running"
+// (the last server observation) rather than "unknown" so consumers can
+// distinguish "we saw progress but didn't wait long enough" from "we
+// never saw anything".
+func computeScanStatus(in scanFinalState) string {
+	if in.dryRun {
+		return "skipped"
+	}
+	if !in.waitForScan {
+		return "skipped"
+	}
+	if in.scanAPIErrMsg != "" {
+		return "unknown"
+	}
+	if in.scanFailedMsg != "" {
+		return "failed"
+	}
+	if in.scanTimedOut {
+		if in.summary != nil {
+			return "running"
+		}
+		return "unknown"
+	}
+	if in.summary != nil {
+		return "completed"
+	}
+	return "unknown"
+}
+
+// buildScanJSONResult assembles the canonical --json payload from the
+// final pipeline state. Pure function: no globals, no I/O — the
+// emission to stdout happens in runScan.
+func buildScanJSONResult(in scanFinalState) scanJSONResult {
+	r := scanJSONResult{
+		ComponentCount: in.componentCount,
+		Format:         in.format,
+		ScanStatus:     computeScanStatus(in),
+	}
+
+	if in.uploadResult != nil {
+		r.SBOMID = in.uploadResult.SBOMID
+		r.ProjectID = in.uploadResult.ProjectID
+		r.ProjectName = in.uploadResult.ProjectName
+		r.ProjectCreated = in.uploadResult.ProjectCreated
+		r.URL = in.uploadResult.URL
+		// If summary is nil, fall back to legacy UploadResult counts
+		// (canonical upload endpoint leaves them at zero today, but
+		// preserve the path for future server versions that populate
+		// counts on the upload response).
+		if in.summary == nil && (in.uploadResult.Critical+in.uploadResult.High+in.uploadResult.Medium+in.uploadResult.Low+in.uploadResult.KEVCount > 0) {
+			r.VulnerabilitySummary = scanJSONVulnSummary{
+				Critical: in.uploadResult.Critical,
+				High:     in.uploadResult.High,
+				Medium:   in.uploadResult.Medium,
+				Low:      in.uploadResult.Low,
+				KEV:      in.uploadResult.KEVCount,
+				Total:    in.uploadResult.Critical + in.uploadResult.High + in.uploadResult.Medium + in.uploadResult.Low,
+			}
+		}
+	}
+
+	if in.summary != nil {
+		r.VulnerabilitySummary = scanJSONVulnSummary{
+			Critical: in.summary.Critical,
+			High:     in.summary.High,
+			Medium:   in.summary.Medium,
+			Low:      in.summary.Low,
+			KEV:      in.summary.KEV,
+			Unknown:  in.summary.Unknown,
+			// Compute total locally from CVSS buckets — see schema doc
+			// rationale. KEV is orthogonal (already counted in c/h/m/l),
+			// so it is intentionally NOT added.
+			Total: in.summary.Critical + in.summary.High + in.summary.Medium + in.summary.Low + in.summary.Unknown,
+		}
+	}
+
+	r.FailOn = scanJSONFailOn{
+		Threshold: nil,
+		Triggered: in.failOnTriggered,
+		ExitCode:  in.exitCode,
+	}
+	if in.failOnStr != "" {
+		s := in.failOnStr
+		r.FailOn.Threshold = &s
+	}
+
+	return r
+}
+
 var (
 	scanProject      string
 	scanTool         string
@@ -96,6 +287,37 @@ func init() {
 }
 
 func runScan(cmd *cobra.Command, args []string) error {
+	out := GetOutputConfig()
+	outputJSON := out.IsJSON()
+
+	// scanPrintf routes the legacy bare fmt.Printf progress lines to
+	// stderr when --json is on (so stdout stays clean for the JSON
+	// payload) and to stdout otherwise. Equivalent to out.Print but
+	// preserves the existing format-string call sites without forcing
+	// every line through the Quiet check (these are progress markers,
+	// not user-facing data; --quiet still suppresses them via
+	// out.Print's check downstream when consumers migrate).
+	scanPrintf := func(format string, a ...interface{}) {
+		if out.Quiet {
+			return
+		}
+		w := os.Stdout
+		if outputJSON {
+			w = os.Stderr
+		}
+		fmt.Fprintf(w, format, a...)
+	}
+	scanPrintln := func() {
+		if out.Quiet {
+			return
+		}
+		w := os.Stdout
+		if outputJSON {
+			w = os.Stderr
+		}
+		fmt.Fprintln(w)
+	}
+
 	// スキャン対象パスの決定
 	scanPath := "."
 	if len(args) > 0 {
@@ -133,8 +355,8 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--fail-on requires --wait-for-scan=true; either drop --wait-for-scan=false (it defaults to true) or remove --fail-on")
 	}
 
-	fmt.Printf("📦 スキャン開始: %s\n", absPath)
-	fmt.Println()
+	scanPrintf("📦 スキャン開始: %s\n", absPath)
+	scanPrintln()
 
 	// スキャナーの選択
 	s, err := scanner.New(scanTool)
@@ -142,7 +364,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("スキャナーの初期化に失敗しました: %w", err)
 	}
 
-	fmt.Printf("🔍 ツール: %s\n", s.Name())
+	scanPrintf("🔍 ツール: %s\n", s.Name())
 
 	// スキャン実行
 	startTime := time.Now()
@@ -152,12 +374,12 @@ func runScan(cmd *cobra.Command, args []string) error {
 	}
 	elapsed := time.Since(startTime)
 
-	fmt.Printf("⏱️  スキャン時間: %s\n", elapsed.Round(time.Millisecond))
+	scanPrintf("⏱️  スキャン時間: %s\n", elapsed.Round(time.Millisecond))
 
 	// コンポーネント数を表示
 	componentCount := countComponents(sbomData)
-	fmt.Printf("📋 コンポーネント数: %d\n", componentCount)
-	fmt.Println()
+	scanPrintf("📋 コンポーネント数: %d\n", componentCount)
+	scanPrintln()
 
 	// ローカル保存
 	if scanOutput != "" {
@@ -170,6 +392,20 @@ func runScan(cmd *cobra.Command, args []string) error {
 	// dry-runならここで終了
 	if scanDryRun {
 		printInfo("--dry-run が指定されているため、アップロードをスキップしました")
+		if outputJSON {
+			// Emit a minimal JSON payload so automation parsing
+			// stdout still gets a stable shape. scan_status="skipped"
+			// signals "no server-side scan was attempted".
+			res := buildScanJSONResult(scanFinalState{
+				componentCount: componentCount,
+				format:         scanFormat,
+				dryRun:         true,
+				waitForScan:    scanWaitForScan,
+				failOnStr:      scanFailOn,
+				exitCode:       exitSuccess,
+			})
+			_ = out.PrintJSON(res)
+		}
 		return nil
 	}
 
@@ -230,7 +466,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("📤 アップロード中: プロジェクト '%s'\n", projectName)
+	scanPrintf("📤 アップロード中: プロジェクト '%s'\n", projectName)
 
 	// アップロード。 projectExplicit=false (= dir-basename fallback) のときは
 	// UploadSBOM は projectName が UUID 形式であっても ID として扱わず、
@@ -240,9 +476,9 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return &scanExitError{code: exitAPIError, msg: fmt.Sprintf("アップロードに失敗しました: %v", err)}
 	}
 
-	fmt.Println()
+	scanPrintln()
 	printSuccess("アップロード完了！")
-	fmt.Println()
+	scanPrintln()
 
 	// Codex R4 finding 1 fix: poll whenever --wait-for-scan is true,
 	// regardless of --fail-on. The flag's help text promises to wait for
@@ -274,40 +510,127 @@ func runScan(cmd *cobra.Command, args []string) error {
 		cancel()
 	}
 
-	// 結果表示
-	printResultBox(componentCount, result, summary)
-
-	// Codex R7 fix: scan-status polling hit a permanent client-side error
-	// (typically 401/403 from bad auth, or 404 from a server that does
-	// not implement scan-status). Fast-fail with exit-3 (API error)
-	// regardless of --fail-on — a broken polling endpoint means we cannot
-	// trust ANY downstream counts, so the only honest signal is "the
-	// polling contract is broken; fix config or upgrade the server".
+	// Compute the final state of the run. From this point we have a
+	// single linear path: figure out the exit error (if any), build the
+	// JSON payload (or print the result box) once, then return.
 	//
-	// This runs BEFORE the failOnLevel==None / threshold branches below,
-	// so even a `sbomhub scan .` with no threshold still surfaces the
-	// permanent error via a non-zero exit code (rather than swallowing it
-	// into a green "no fail-on configured, returning 0" path).
-	if scanAPIErrMsg != "" {
-		return &scanExitError{
+	// We intentionally compute exitErr BEFORE emitting output so the
+	// JSON payload can include the documented `fail_on.exit_code` value
+	// — consumers (the GitHub Action wrapper, downstream automation)
+	// rely on stdout-JSON being a complete snapshot rather than needing
+	// to inspect the process exit code separately.
+	var (
+		exitErr         error
+		failOnTriggered bool
+		exitCode        = exitSuccess
+	)
+
+	switch {
+	case scanAPIErrMsg != "":
+		// Codex R7 fix: scan-status polling hit a permanent client-side
+		// error (typically 401/403 from bad auth, or 404 from a server
+		// that does not implement scan-status). Fast-fail with exit-3
+		// (API error) regardless of --fail-on — a broken polling
+		// endpoint means we cannot trust ANY downstream counts.
+		exitCode = exitAPIError
+		exitErr = &scanExitError{
 			code: exitAPIError,
 			msg:  fmt.Sprintf("scan-status polling aborted: %s", scanAPIErrMsg),
 		}
+
+	case failOnLevel == severity.LevelNone:
+		// No threshold configured. --wait-for-scan timeout / failure
+		// is surfaced as a stderr warning but does not block CI.
+		exitCode = exitSuccess
+
+	case !scanWaitForScan:
+		// Defensive guard: the startup check already rejects --fail-on
+		// with --wait-for-scan=false; this branch is unreachable except
+		// under future refactor regression.
+		exitCode = exitAPIError
+		exitErr = &scanExitError{
+			code: exitAPIError,
+			msg:  "--fail-on requires --wait-for-scan=true (internal invariant violated)",
+		}
+
+	case scanTimedOut:
+		// Timeout under --fail-on: do NOT trip the threshold (false
+		// negative tolerated, false positive avoided). Surface exit-2
+		// so CI can branch on it explicitly.
+		exitCode = exitScanTimeout
+		exitErr = &scanExitError{
+			code: exitScanTimeout,
+			msg:  fmt.Sprintf("--wait-timeout %s 以内にサーバ側脆弱性スキャンが完了しませんでした。 --fail-on は評価されていません", scanWaitTimeout),
+		}
+
+	case scanFailedMsg != "":
+		exitCode = exitScanTimeout
+		exitErr = &scanExitError{
+			code: exitScanTimeout,
+			msg:  fmt.Sprintf("サーバ側脆弱性スキャンが失敗しました: %s。 --fail-on は評価されていません", scanFailedMsg),
+		}
+
+	case summary == nil:
+		exitCode = exitAPIError
+		exitErr = &scanExitError{code: exitAPIError, msg: "スキャン結果の取得に失敗しました"}
+
+	default:
+		// Codex R1 fix: KEV is sourced from the scan-status response.
+		counts := severity.Counts{
+			Critical: summary.Critical,
+			High:     summary.High,
+			Medium:   summary.Medium,
+			Low:      summary.Low,
+			Unknown:  summary.Unknown,
+			KEV:      summary.KEV,
+		}
+		if severity.ShouldFail(counts, failOnLevel) {
+			failOnTriggered = true
+			exitCode = exitThresholdExceeded
+			exitErr = &scanExitError{
+				code: exitThresholdExceeded,
+				msg:  fmt.Sprintf("--fail-on %s: 指定された重大度以上の脆弱性が検出されました (critical=%d high=%d medium=%d low=%d unknown=%d kev=%d)", scanFailOn, counts.Critical, counts.High, counts.Medium, counts.Low, counts.Unknown, counts.KEV),
+			}
+		}
 	}
 
-	// --fail-on の判定がなければここで終了。
-	// --wait-for-scan で timeout / failure が起きていても、 閾値設定がない
-	// 以上 CI を exit 2 で止めるべきではない (false positive 回避)。 ただし
-	// 操作者には stderr で警告を残す。
-	if failOnLevel == severity.LevelNone {
+	// Build the final JSON snapshot. Computed even when --json is off
+	// so a future refactor can log it for debugging / telemetry without
+	// changing the call site.
+	finalState := scanFinalState{
+		componentCount:  componentCount,
+		format:          scanFormat,
+		uploadResult:    result,
+		summary:         summary,
+		waitForScan:     scanWaitForScan,
+		dryRun:          false,
+		scanTimedOut:    scanTimedOut,
+		scanFailedMsg:   scanFailedMsg,
+		scanAPIErrMsg:   scanAPIErrMsg,
+		failOnStr:       scanFailOn,
+		failOnTriggered: failOnTriggered,
+		exitCode:        exitCode,
+	}
+
+	// Emit either the JSON payload (machine consumers — GitHub Action,
+	// CI templates, downstream tooling) or the human result box. Never
+	// both: stdout must stay parseable for jq.
+	if outputJSON {
+		jsonResult := buildScanJSONResult(finalState)
+		_ = out.PrintJSON(jsonResult)
+	} else {
+		printResultBox(componentCount, result, summary)
+	}
+
+	// Operator warnings always go to stderr (independent of --json mode)
+	// so CI logs surface context even when stdout is being captured for
+	// JSON parsing.
+	if exitErr == nil && failOnLevel == severity.LevelNone {
 		if scanTimedOut {
-			// Codex R5 fix: when polling timed out we now return the most
-			// recently observed status snapshot (if any), so the counts in
-			// the result box above are real partial counts rather than the
-			// upload response's zeros. Spell that out in the warning so the
-			// operator knows what they are looking at — and call out the
-			// "no successful poll" case separately so a zero count box does
-			// not get conflated with "snapshot from t=X".
+			// Codex R5 fix: when polling timed out we now return the
+			// most recently observed status snapshot (if any). Surface
+			// the snapshot timestamp so operators know whether they're
+			// looking at partial counts or nothing at all.
 			if !scanLastFetchedAt.IsZero() {
 				fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが --wait-timeout %s 以内に完了しませんでした。 最後の取得時点 (%s) の暫定 counts を表示しています。\n", scanWaitTimeout, scanLastFetchedAt.Format(time.RFC3339))
 			} else {
@@ -316,62 +639,9 @@ func runScan(cmd *cobra.Command, args []string) error {
 		} else if scanFailedMsg != "" {
 			fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが失敗しました: %s\n", scanFailedMsg)
 		}
-		return nil
 	}
 
-	// Defensive guard: runScan's startup check already rejects
-	// --fail-on with --wait-for-scan=false, so this branch should be
-	// unreachable. Kept as a safety net so future refactors can't
-	// silently re-introduce the fail-soft slip-through.
-	if !scanWaitForScan {
-		return &scanExitError{
-			code: exitAPIError,
-			msg:  "--fail-on requires --wait-for-scan=true (internal invariant violated)",
-		}
-	}
-
-	if scanTimedOut {
-		// 設計判断: timeout 時は --fail-on は trip させない。 false negative
-		// (本当はあった脆弱性を見逃す) は許容、 false positive (clean な
-		// CI を不当に止める) は避ける。 ユーザーは exit 2 を見て CI 側で
-		// 明示的に判断する。
-		return &scanExitError{
-			code: exitScanTimeout,
-			msg:  fmt.Sprintf("--wait-timeout %s 以内にサーバ側脆弱性スキャンが完了しませんでした。 --fail-on は評価されていません", scanWaitTimeout),
-		}
-	}
-	if scanFailedMsg != "" {
-		return &scanExitError{
-			code: exitScanTimeout,
-			msg:  fmt.Sprintf("サーバ側脆弱性スキャンが失敗しました: %s。 --fail-on は評価されていません", scanFailedMsg),
-		}
-	}
-	if summary == nil {
-		return &scanExitError{code: exitAPIError, msg: "スキャン結果の取得に失敗しました"}
-	}
-
-	// Codex R1 fix: KEV is sourced from the scan-status response (server
-	// joins vulnerabilities.in_kev). The canonical upload endpoint does
-	// NOT populate result.KEVCount — relying on it left `--fail-on kev`
-	// silently never tripping. Older servers (pre Trust Rescue R1) that
-	// omit the field will report KEV=0, in which case --fail-on kev is a
-	// no-op against that deployment.
-	counts := severity.Counts{
-		Critical: summary.Critical,
-		High:     summary.High,
-		Medium:   summary.Medium,
-		Low:      summary.Low,
-		Unknown:  summary.Unknown,
-		KEV:      summary.KEV,
-	}
-	if severity.ShouldFail(counts, failOnLevel) {
-		return &scanExitError{
-			code: exitThresholdExceeded,
-			msg:  fmt.Sprintf("--fail-on %s: 指定された重大度以上の脆弱性が検出されました (critical=%d high=%d medium=%d low=%d unknown=%d kev=%d)", scanFailOn, counts.Critical, counts.High, counts.Medium, counts.Low, counts.Unknown, counts.KEV),
-		}
-	}
-
-	return nil
+	return exitErr
 }
 
 // waitForScanCompletion polls GET /api/v1/projects/:id/sboms/:sbom_id/scan-status
@@ -444,7 +714,16 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 		tick = 5 * time.Second
 	}
 
-	fmt.Printf("⏳ サーバ側脆弱性スキャン待機中 (timeout=%s, interval=%s)...\n", scanWaitTimeout, tick)
+	// Progress prints route to stderr in --json mode so stdout stays
+	// parseable for the JSON payload emitted by runScan.
+	progressW := func() *os.File {
+		if GetOutputConfig().IsJSON() {
+			return os.Stderr
+		}
+		return os.Stdout
+	}
+
+	fmt.Fprintf(progressW(), "⏳ サーバ側脆弱性スキャン待機中 (timeout=%s, interval=%s)...\n", scanWaitTimeout, tick)
 
 	startTime := time.Now()
 	var latest *api.VulnerabilitySummary
@@ -478,7 +757,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 			var apiErr *api.APIError
 			if errors.As(err, &apiErr) {
 				if !apiErr.IsRetryable() {
-					fmt.Printf("   ✗ scan-status 取得エラー (HTTP %d): 永続的なエラーのため即座に中断します\n", apiErr.StatusCode)
+					fmt.Fprintf(progressW(), "   ✗ scan-status 取得エラー (HTTP %d): 永続的なエラーのため即座に中断します\n", apiErr.StatusCode)
 					return latest, false, "", fmt.Sprintf("HTTP %d %s: %s", apiErr.StatusCode, apiErr.URL, strings.TrimSpace(apiErr.Message)), latestAt
 				}
 				// Retryable (429 / 5xx). Honour Retry-After when the
@@ -490,18 +769,18 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 					nextSleep = apiErr.RetryAfter
 				}
 				if apiErr.StatusCode == 429 {
-					fmt.Printf("   ⚠️  scan-status rate limited (HTTP 429), retrying after %s...\n", nextSleep.Round(time.Second))
+					fmt.Fprintf(progressW(), "   ⚠️  scan-status rate limited (HTTP 429), retrying after %s...\n", nextSleep.Round(time.Second))
 				} else {
-					fmt.Printf("   ⚠️  scan-status server error (HTTP %d), retrying after %s...\n", apiErr.StatusCode, nextSleep.Round(time.Second))
+					fmt.Fprintf(progressW(), "   ⚠️  scan-status server error (HTTP %d), retrying after %s...\n", apiErr.StatusCode, nextSleep.Round(time.Second))
 				}
 			} else {
 				// Non-APIError transient (network flap, JSON parse
 				// glitch, …): log and keep polling within ctx budget.
-				fmt.Printf("   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
+				fmt.Fprintf(progressW(), "   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
 			}
 		} else {
 			elapsed := time.Since(startTime)
-			fmt.Printf("   状態: %-9s 経過: %4s / %s  (critical=%d high=%d medium=%d low=%d unknown=%d kev=%d total=%d)\n",
+			fmt.Fprintf(progressW(), "   状態: %-9s 経過: %4s / %s  (critical=%d high=%d medium=%d low=%d unknown=%d kev=%d total=%d)\n",
 				status.Status, elapsed.Round(time.Second), scanWaitTimeout,
 				status.Vulnerabilities.Critical, status.Vulnerabilities.High,
 				status.Vulnerabilities.Medium, status.Vulnerabilities.Low,
