@@ -61,33 +61,99 @@ type sbomUploadResponse struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// looksLikeUUID reports whether s matches the canonical 8-4-4-4-12 hex
+// UUID format (RFC 4122 string form, case-insensitive). It is intentionally
+// strict: anything else — including names that happen to contain hyphens —
+// is treated as a project NAME by UploadSBOM, preserving the get-or-create
+// semantics for the legacy `--project my-app` form.
+//
+// We do strict format matching rather than pulling in github.com/google/uuid
+// to keep the CLI's dependency surface minimal (the project's go.mod has
+// cobra + yaml only).
+func looksLikeUUID(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // UploadSBOM uploads an SBOM to SBOMHub.
 //
 // Wire contract (Trust Rescue 9.3.1 / #9, BREAKING):
-//   - Step 1: resolve `projectName` to a tenant-scoped project ID by calling
-//     POST /api/v1/cli/projects, which has get-or-create semantics
-//     (CLIService.GetOrCreateProject on the server side).
+//   - Step 1: resolve `projectRef` to a tenant-scoped project ID. The flag
+//     `sbomhub scan --project` accepts EITHER a project name OR a project
+//     UUID per its help text. If `projectRef` parses as a canonical UUID
+//     (8-4-4-4-12 hex per RFC 4122) we treat it as the project ID directly
+//     and skip the get-or-create call. Otherwise we POST to
+//     /api/v1/cli/projects, which has get-or-create semantics on the
+//     server side (CLIService.GetOrCreateProject).
 //   - Step 2: POST the raw SBOM bytes to /api/v1/projects/{id}/sbom — the
 //     canonical endpoint protected by MultiAuth that the web UI also uses.
 //     Content-Type is `application/json` because both CycloneDX-JSON and
 //     SPDX-JSON parse as JSON and the server auto-detects which by the
 //     body's `bomFormat` / `spdxVersion` field.
 //
+// Codex R6 fix (Finding 1): before this change, passing a UUID via
+// `--project <uuid>` was silently routed through CreateProject, which would
+// create a new project whose NAME was the literal UUID string (because no
+// existing project had that name). SBOMs then attached to the wrong (newly
+// created) project. With the UUID short-circuit the operator gets the
+// behaviour the help text already promised.
+//
 // The legacy multipart POST /api/v1/cli/upload still exists with a Sunset of
 // 2026-09-24, but new requests MUST go through the canonical endpoint so the
 // product has one source of truth on auth + tenant scoping.
-func (c *Client) UploadSBOM(projectName string, sbomData []byte, format string) (*UploadResult, error) {
-	// Step 1: get-or-create the project so we have a stable :id to POST to.
-	project, projectCreated, err := c.CreateProject(projectName, "")
-	if err != nil {
-		return nil, fmt.Errorf("プロジェクト解決エラー: %w", err)
-	}
-	if project == nil || project.ID == "" {
-		return nil, fmt.Errorf("APIがプロジェクトIDを返しませんでした")
+func (c *Client) UploadSBOM(projectRef string, sbomData []byte, format string) (*UploadResult, error) {
+	// Step 1: resolve projectRef to a project ID.
+	//
+	// If projectRef is a canonical UUID, treat it as the ID directly — no
+	// CreateProject round-trip, and crucially no risk of accidentally
+	// creating a new project whose NAME is the UUID string. If the UUID is
+	// invalid (no such project in this tenant) the canonical upload
+	// endpoint will return 4xx and surface that to the operator.
+	//
+	// If projectRef is a name, fall through to the get-or-create call as
+	// before.
+	var (
+		projectID      string
+		projectName    string
+		projectCreated bool
+	)
+	if looksLikeUUID(projectRef) {
+		projectID = projectRef
+		// We don't have the project's display name without an extra
+		// GET; leave it empty — UploadResult.ProjectName is only used
+		// for cosmetic output and the CLI prints the user-supplied
+		// projectRef itself in the "アップロード中" line.
+		projectName = ""
+		projectCreated = false
+	} else {
+		project, created, err := c.CreateProject(projectRef, "")
+		if err != nil {
+			return nil, fmt.Errorf("プロジェクト解決エラー: %w", err)
+		}
+		if project == nil || project.ID == "" {
+			return nil, fmt.Errorf("APIがプロジェクトIDを返しませんでした")
+		}
+		projectID = project.ID
+		projectName = project.Name
+		projectCreated = created
 	}
 
 	// Step 2: POST raw body to the canonical SBOM upload endpoint.
-	url := fmt.Sprintf("%s/api/v1/projects/%s/sbom", c.baseURL, project.ID)
+	url := fmt.Sprintf("%s/api/v1/projects/%s/sbom", c.baseURL, projectID)
 	req, err := http.NewRequest("POST", url, bytes.NewReader(sbomData))
 	if err != nil {
 		return nil, err
@@ -124,7 +190,7 @@ func (c *Client) UploadSBOM(projectName string, sbomData []byte, format string) 
 	result := &UploadResult{
 		Success:        true,
 		ProjectID:      sbomResp.ProjectID,
-		ProjectName:    project.Name,
+		ProjectName:    projectName,
 		ProjectCreated: projectCreated,
 		SBOMID:         sbomResp.ID,
 		Format:         sbomResp.Format,

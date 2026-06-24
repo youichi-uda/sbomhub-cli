@@ -124,6 +124,104 @@ func TestUploadSBOM(t *testing.T) {
 	}
 }
 
+// TestUploadSBOM_ProjectRefIsUUID verifies the Codex R6 finding 1 fix:
+// when `--project` is given a canonical UUID, UploadSBOM must treat it as
+// the existing project's ID and skip CreateProject entirely. Before the
+// fix the UUID was passed to CreateProject as a NAME, which then created
+// a brand-new project whose name happened to be the UUID string —
+// attaching the SBOM to the wrong project.
+func TestUploadSBOM_ProjectRefIsUUID(t *testing.T) {
+	const projectID = "12345678-1234-1234-1234-1234567890ab"
+	const sbomID = "00000000-0000-0000-0000-000000000def"
+
+	var (
+		createProjectHits int
+		uploadHits        int
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/api/v1/cli/projects":
+			createProjectHits++
+			// We do NOT expect this branch to be reached when the
+			// caller passes a UUID. Still respond so a regression
+			// produces a useful diff rather than a hang.
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(CreateProjectResponse{
+				Project: &Project{ID: "wrong-id", Name: projectID},
+				Created: true,
+			})
+
+		case r.Method == "POST" && r.URL.Path == "/api/v1/projects/"+projectID+"/sbom":
+			uploadHits++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":         sbomID,
+				"project_id": projectID,
+				"format":     "cyclonedx",
+				"version":    "1.4",
+				"created_at": "2026-06-24T00:00:00Z",
+			})
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	sbomData := []byte(`{"bomFormat": "CycloneDX", "specVersion": "1.4"}`)
+	result, err := client.UploadSBOM(projectID, sbomData, "cyclonedx")
+	if err != nil {
+		t.Fatalf("UploadSBOM() error = %v", err)
+	}
+
+	if createProjectHits != 0 {
+		t.Errorf("CreateProject called %d times for UUID --project; want 0 (Codex R6 finding 1 regression)", createProjectHits)
+	}
+	if uploadHits != 1 {
+		t.Errorf("POST /projects/{id}/sbom called %d times, want 1", uploadHits)
+	}
+	if result.ProjectID != projectID {
+		t.Errorf("ProjectID = %q, want %q (UUID must round-trip as the upload target)", result.ProjectID, projectID)
+	}
+	if result.ProjectCreated {
+		t.Error("ProjectCreated should be false when --project was an existing UUID (no create happened)")
+	}
+}
+
+// TestLooksLikeUUID covers the strict UUID detector used by UploadSBOM to
+// disambiguate name vs ID in `--project`. The negative cases are the
+// load-bearing ones — anything that returns true here will skip
+// CreateProject and be sent as `/api/v1/projects/{value}/sbom`.
+func TestLooksLikeUUID(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want bool
+	}{
+		{"canonical lowercase", "12345678-1234-1234-1234-1234567890ab", true},
+		{"canonical uppercase", "12345678-1234-1234-1234-1234567890AB", true},
+		{"mixed case", "12345678-ABcd-1234-EfAb-1234567890ab", true},
+		{"empty string", "", false},
+		{"plain name", "my-app", false},
+		{"hyphenated name", "my-cool-project", false},
+		{"too short", "12345678-1234-1234-1234-1234567890a", false},
+		{"too long", "12345678-1234-1234-1234-1234567890abc", false},
+		{"wrong hyphen positions", "1234567-81234-1234-1234-1234567890ab1", false},
+		{"non-hex char", "12345678-1234-1234-1234-1234567890ag", false},
+		{"all hyphens swapped to underscores", "12345678_1234_1234_1234_1234567890ab", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := looksLikeUUID(tc.in); got != tc.want {
+				t.Errorf("looksLikeUUID(%q) = %v, want %v", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestUploadSBOMError verifies the upload step's error path. The canonical
 // endpoint should fail loudly on 401 with the server's error body surfaced
 // so the operator can debug auth / tenant misconfiguration.

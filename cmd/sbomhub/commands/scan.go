@@ -82,7 +82,7 @@ Exit codes:
 func init() {
 	rootCmd.AddCommand(scanCmd)
 
-	scanCmd.Flags().StringVarP(&scanProject, "project", "p", "", "プロジェクト名またはID")
+	scanCmd.Flags().StringVarP(&scanProject, "project", "p", "", "プロジェクト名 または UUID (UUID 形式なら既存プロジェクトの ID として扱い、 名前形式なら get-or-create)")
 	scanCmd.Flags().StringVarP(&scanTool, "tool", "t", "", "使用するツール (syft/trivy/cdxgen, デフォルト: 自動検出)")
 	scanCmd.Flags().StringVarP(&scanFormat, "format", "f", "cyclonedx", "出力フォーマット (cyclonedx/spdx)")
 	scanCmd.Flags().StringVarP(&scanOutput, "output", "o", "", "ローカルにも保存するファイルパス")
@@ -488,16 +488,30 @@ func countComponents(sbomData []byte) int {
 // "なし ✅" — silently hiding real findings from the operator. We now
 // surface the count alongside the rated buckets. It is intentionally NOT
 // fed into severity.ShouldFail (see severity.Counts doc).
+//
+// Codex R6 fix (Finding 2): "no findings" is determined from the sum of
+// per-bucket counts rather than the server-supplied `total`. Earlier code
+// short-circuited on `total == 0` (with kev/unknown defensively added),
+// which mis-rendered "なし ✅" any time the server populated per-severity
+// buckets but left `total` at zero (partial / streamed responses, or an
+// older API build that doesn't compute total client-side). Trusting the
+// sum we compute locally also matches the semantics of the buckets we
+// actually display below.
 func formatScanVulnSummary(result *api.UploadResult, summary *api.VulnerabilitySummary) string {
-	c, h, m, l, u, kev, total := 0, 0, 0, 0, 0, 0, 0
+	c, h, m, l, u, kev := 0, 0, 0, 0, 0, 0
 	if summary != nil {
-		c, h, m, l, u, kev, total = summary.Critical, summary.High, summary.Medium, summary.Low, summary.Unknown, summary.KEV, summary.Total
+		c, h, m, l, u, kev = summary.Critical, summary.High, summary.Medium, summary.Low, summary.Unknown, summary.KEV
 	} else if result != nil {
 		// UploadResult has no Unknown field today; leave u=0 in the fallback.
-		c, h, m, l, kev, total = result.Critical, result.High, result.Medium, result.Low, result.KEVCount, result.VulnerabilityCount
+		c, h, m, l, kev = result.Critical, result.High, result.Medium, result.Low, result.KEVCount
 	}
 
-	if total == 0 && kev == 0 && u == 0 {
+	// Compute total from the buckets we render rather than trusting the
+	// server's `total` field. KEV is orthogonal to CVSS severity (a KEV
+	// CVE is also counted in its critical/high/etc. bucket) so it is
+	// included additively here only as a defensive guard against servers
+	// that emit KEV without any CVSS bucket populated.
+	if c+h+m+l+u+kev == 0 {
 		return "なし ✅"
 	}
 
