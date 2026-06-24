@@ -8,7 +8,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
-	"github.com/youichi-uda/sbomhub-cli/internal/config"
 	"github.com/youichi-uda/sbomhub-cli/internal/scanner"
 )
 
@@ -76,22 +75,20 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	fmt.Printf("📋 コンポーネント数: %d\n", componentCount)
 	fmt.Println()
 
-	// 設定の読み込み
-	configDir := filepath.Join(os.Getenv("HOME"), ".sbomhub")
-	if os.Getenv("USERPROFILE") != "" {
-		configDir = filepath.Join(os.Getenv("USERPROFILE"), ".sbomhub")
-	}
-
-	cfg, err := config.Load(configDir)
+	// 設定の解決: config file → env → CLI flag の precedence で merge する
+	// (Codex R9 fix)。 R2-2e で scan に導入した resolveCredentials を check
+	// にも適用、 SBOMHUB_API_URL / SBOMHUB_API_KEY と --api-url / --api-key
+	// が config file 不在でも一貫して効くようにする。 self-host 用途で
+	// `SBOMHUB_API_URL=http://localhost:8080 sbomhub check .` が動く前提。
+	cfg, err := resolveCredentials(getConfigDir())
 	if err != nil {
-		return fmt.Errorf("設定の読み込みに失敗しました。'sbomhub login' を実行してください: %w", err)
-	}
-
-	if apiKey != "" {
-		cfg.APIKey = apiKey
+		return fmt.Errorf("設定の読み込みに失敗しました: %w", err)
 	}
 	if cfg.APIKey == "" {
-		return fmt.Errorf("API Keyが設定されていません")
+		return fmt.Errorf("API Keyが設定されていません。 'sbomhub login' で対話設定するか、 --api-key フラグ・ 環境変数 SBOMHUB_API_KEY を指定してください")
+	}
+	if cfg.APIURL == "" {
+		return fmt.Errorf("API URLが設定されていません。 'sbomhub login' で設定するか、 --api-url フラグ・ 環境変数 SBOMHUB_API_URL を指定してください")
 	}
 
 	// API クライアントの作成

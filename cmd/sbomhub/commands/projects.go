@@ -2,13 +2,10 @@ package commands
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
-	"github.com/youichi-uda/sbomhub-cli/internal/config"
 )
 
 var (
@@ -55,22 +52,29 @@ func init() {
 	projectsCreateCmd.Flags().StringVarP(&projectDescription, "description", "d", "", "プロジェクトの説明")
 }
 
+// loadConfigAndClient resolves credentials with the documented precedence
+// (CLI flag > env var > config file > default) and returns an api.Client.
+//
+// Codex R9 fix: previously this used config.Load + a manual --api-key
+// override, which silently ignored SBOMHUB_API_URL and the --api-url flag.
+// That broke self-host flows like
+//
+//	SBOMHUB_API_URL=http://localhost:8080 SBOMHUB_API_KEY=sbh_xxx \
+//	    sbomhub projects list
+//
+// where the CLI would still talk to https://api.sbomhub.app. Routing
+// through resolveCredentials (introduced in R2-2e for scan) gives every
+// API-backed command the same precedence semantics.
 func loadConfigAndClient() (*api.Client, error) {
-	configDir := filepath.Join(os.Getenv("HOME"), ".sbomhub")
-	if os.Getenv("USERPROFILE") != "" {
-		configDir = filepath.Join(os.Getenv("USERPROFILE"), ".sbomhub")
-	}
-
-	cfg, err := config.Load(configDir)
+	cfg, err := resolveCredentials(getConfigDir())
 	if err != nil {
 		return nil, fmt.Errorf("設定の読み込みに失敗しました: %w", err)
 	}
-
-	if apiKey != "" {
-		cfg.APIKey = apiKey
-	}
 	if cfg.APIKey == "" {
-		return nil, fmt.Errorf("API Keyが設定されていません。'sbomhub login' でログインしてください")
+		return nil, fmt.Errorf("API Keyが設定されていません。 'sbomhub login' で対話設定するか、 --api-key フラグ・ 環境変数 SBOMHUB_API_KEY を指定してください")
+	}
+	if cfg.APIURL == "" {
+		return nil, fmt.Errorf("API URLが設定されていません。 'sbomhub login' で設定するか、 --api-url フラグ・ 環境変数 SBOMHUB_API_URL を指定してください")
 	}
 
 	return api.NewClient(cfg.APIURL, cfg.APIKey), nil
