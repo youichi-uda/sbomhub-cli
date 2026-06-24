@@ -295,10 +295,29 @@ func runTriageLoop(ctx context.Context, client *api.Client, opts triageOpts) err
 			CVEID:           v.CVEID,
 		})
 
+		// AI-disabled now arrives as a 2xx response with AIDisabled=true
+		// and the server-persisted under_investigation draft (M1 Codex
+		// review #F4). The legacy 503 path is retained as a fallback for
+		// older servers that have not yet shipped the fix.
+		if err == nil && runResp != nil && runResp.AIDisabled {
+			if !aiDisabledNotified {
+				fmt.Fprintln(opts.stderr, aiDisabledHintJa)
+				aiDisabledNotified = true
+			}
+			n := len(runResp.Drafts)
+			if n == 0 && runResp.Draft != nil {
+				n = 1
+			}
+			fmt.Fprintf(opts.stdout, "  → under_investigation (AI disabled; server persisted %d draft(s))\n", n)
+			underInvestigation += n
+			continue
+		}
+
 		var apiErr *api.TriageError
 		if errors.As(err, &apiErr) && apiErr.IsAIDisabled() {
-			// BYOK fallback path. Print the hint once (don't spam),
-			// but record EVERY vuln as under_investigation.
+			// Legacy 503 path — kept for backward compat against servers
+			// that have not yet shipped the F4 fix. New servers return
+			// 2xx + AIDisabled=true instead and never hit this branch.
 			if !aiDisabledNotified {
 				fmt.Fprintln(opts.stderr, aiDisabledHintJa)
 				if apiErr.Reason != "" {
@@ -306,11 +325,6 @@ func runTriageLoop(ctx context.Context, client *api.Client, opts triageOpts) err
 				}
 				aiDisabledNotified = true
 			}
-			// Without a draft we cannot PUT /decision (the endpoint
-			// keys on draft_id which we never received). Surface the
-			// "noted as under_investigation locally" line so the
-			// operator knows the vuln was processed even though no
-			// draft row was persisted.
 			fmt.Fprintln(opts.stdout, "  → under_investigation (AI disabled — no draft persisted)")
 			underInvestigation++
 			continue

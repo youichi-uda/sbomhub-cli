@@ -259,10 +259,81 @@ func TestTriageLoop_HappyPath(t *testing.T) {
 	}
 }
 
-// TestTriageLoop_AIDisabledFallback verifies the BYOK-not-configured
-// path: server returns 503 from llm.DisabledError, CLI prints the
+// TestTriageLoop_AIDisabledServerPersisted verifies the M1 Codex review
+// #F4 path: server returns 2xx with AIDisabled=true and a persisted
+// under_investigation draft. CLI prints the hint once, counts the
+// drafts in the under_investigation summary, never opens a stdin
+// prompt (the operator has nothing to decide on an AI-skipped draft),
+// and exits 0.
+func TestTriageLoop_AIDisabledServerPersisted(t *testing.T) {
+	tf := newTriageFakeServer(t, threeVulns())
+	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {
+		draftID := fakeDraftID(call)
+		return http.StatusCreated, map[string]interface{}{
+			"draft": map[string]interface{}{
+				"id":               draftID,
+				"project_id":       "00000000-0000-0000-0000-000000000aaa",
+				"component_id":     "00000000-0000-0000-0000-0000000000bb",
+				"vulnerability_id": fakeVulnID(call),
+				"cve_id":           fakeCVE(call),
+				"state":            "under_investigation",
+				"provider":         "disabled",
+				"decision":         "pending",
+			},
+			"drafts": []interface{}{map[string]interface{}{
+				"id":    draftID,
+				"state": "under_investigation",
+			}},
+			"clamped":     false,
+			"threshold":   0.7,
+			"ai_disabled": true,
+		}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+
+	// stdin must NOT be consulted — the AI-disabled path skips the
+	// per-vuln prompt because there is no AI verdict to decide on.
+	stdin := strings.NewReader("a\na\na\n")
+	var stdout, stderr bytes.Buffer
+	err := runTriageLoop(context.Background(), client, triageOpts{
+		projectID:           "00000000-0000-0000-0000-000000000aaa",
+		ecosystem:           "go",
+		nonInteractive:      false,
+		confidenceThreshold: 0.7,
+		path:                ".",
+		stdin:               stdin,
+		stdout:              &stdout,
+		stderr:              &stderr,
+		editor:              nil,
+	})
+	if err != nil {
+		t.Fatalf("runTriageLoop returned %v; want nil", err)
+	}
+	if got := atomic.LoadInt32(&tf.triageRunHits); got != 3 {
+		t.Errorf("triageRunHits = %d, want 3", got)
+	}
+	// No /decision PUT — the server already persisted the draft, the
+	// CLI is just rendering and counting.
+	if got := atomic.LoadInt32(&tf.decisionHits); got != 0 {
+		t.Errorf("decisionHits = %d, want 0 (server persisted draft + audit)", got)
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "APIキー未設定") {
+		t.Errorf("stderr missing AI-disabled hint: %q", errOut)
+	}
+	if c := strings.Count(errOut, "APIキー未設定"); c != 1 {
+		t.Errorf("AI-disabled hint printed %d times, want 1", c)
+	}
+	if !strings.Contains(stdout.String(), "AI disabled; server persisted") {
+		t.Errorf("stdout missing server-persisted draft line: %s", stdout.String())
+	}
+}
+
+// TestTriageLoop_AIDisabledFallback verifies the LEGACY BYOK-not-configured
+// path: an older server returns 503 from llm.DisabledError. CLI prints the
 // hint once on stderr, marks every vuln as under_investigation, exits
-// cleanly (return nil).
+// cleanly (return nil). The new server returns 2xx + AIDisabled=true and
+// is covered by TestTriageLoop_AIDisabledServerPersisted above.
 func TestTriageLoop_AIDisabledFallback(t *testing.T) {
 	tf := newTriageFakeServer(t, threeVulns())
 	tf.runTriageResp = func(call int, body []byte) (int, interface{}) {

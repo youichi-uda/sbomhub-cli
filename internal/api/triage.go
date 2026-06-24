@@ -38,13 +38,17 @@ import (
 // TriageRunRequest is the body of POST /api/v1/projects/:id/triage/run.
 //
 // `VulnerabilityID` is required by the server (parsed via uuid.Parse);
-// `CVEID` is also required; `ComponentID` is optional. Sending an empty
-// ComponentID is fine — the server resolves a component_id from the
-// vulnerability_id when omitted (see handler.RunTriage).
+// `CVEID` is also required. `ComponentID` is deprecated as a CLI wire
+// field — the server resolves component_id(s) from
+// (tenant, project, vulnerability_id) and fans out one draft per
+// affected component (M1 Codex review #F3). Callers that have a pinned
+// component_id may still supply it; the server uses that one component
+// without fanning out.
 type TriageRunRequest struct {
 	VulnerabilityID string `json:"vulnerability_id"`
 	CVEID           string `json:"cve_id"`
-	ComponentID     string `json:"component_id,omitempty"`
+	// Deprecated: server resolves component_id from vulnerability_id.
+	ComponentID string `json:"component_id,omitempty"`
 }
 
 // TriageEvidence mirrors triage.EvidencePointer in the API.
@@ -115,12 +119,24 @@ type VEXDraft struct {
 // `under_investigation` because confidence fell below the threshold —
 // that flag is the trigger for the CLI's auto-`under_investigation`
 // path in `--non-interactive`.
+//
+// Drafts is populated when the server fanned out across multiple
+// components affected by the same vulnerability (M1 Codex review #F3);
+// Draft mirrors Drafts[0] for backward compatibility.
+//
+// AIDisabled is true when the server skipped the LLM call because no
+// BYOK provider is configured. The server still persists
+// under_investigation drafts + audit rows; the CLI uses this flag to
+// surface the "APIキー未設定" hint without inventing a counter-only
+// fallback (M1 Codex review #F4).
 type TriageRunResult struct {
-	Draft     *VEXDraft       `json:"draft"`
-	LLMCallID string          `json:"llm_call_id"`
-	Parsed    *ParsedDecision `json:"parsed_decision"`
-	Clamped   bool            `json:"clamped"`
-	Threshold float64         `json:"threshold"`
+	Draft      *VEXDraft       `json:"draft"`
+	Drafts     []*VEXDraft     `json:"drafts,omitempty"`
+	LLMCallID  string          `json:"llm_call_id,omitempty"`
+	Parsed     *ParsedDecision `json:"parsed_decision,omitempty"`
+	Clamped    bool            `json:"clamped"`
+	Threshold  float64         `json:"threshold"`
+	AIDisabled bool            `json:"ai_disabled,omitempty"`
 }
 
 // vexDraftListResponse mirrors handler.vexDraftListResponse.
