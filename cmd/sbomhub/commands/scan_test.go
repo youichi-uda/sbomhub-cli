@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -735,6 +737,170 @@ func TestWaitForScanCompletion_PermanentAPIErrorFastFails(t *testing.T) {
 				t.Errorf("waitForScanCompletion took %s for a permanent 4xx; expected fast-fail under 1s (Codex R7 regression — permanent error being treated as transient)", elapsed)
 			}
 		})
+	}
+}
+
+// TestWaitForScanCompletion_RateLimit429RetriesThenCompletes verifies
+// the Codex R13 P2 fix: a 429 (Too Many Requests) from the polling
+// endpoint must be treated as a transient retry — NOT folded into the
+// permanent-4xx fast-fail path introduced by R7. The motivating bug:
+// upstream gateways or API-side rate limiters routinely return 429 when
+// CI runners burst the polling loop, and the next poll succeeds. Before
+// this fix the loop returned apiErrMsg on the first 429, runScan mapped
+// that to exit-3, and the CI failed even though the scan itself was
+// fine.
+//
+// Acceptance criteria:
+//   - the server returns 429 twice with Retry-After: 0 so the test
+//     stays fast, then a normal "completed" response.
+//   - waitForScanCompletion does NOT set apiErrMsg or timedOut on this
+//     path; it returns a populated summary like the happy path.
+//   - the server received >= 3 hits (the loop kept retrying through
+//     both 429s rather than fast-failing on the first one).
+func TestWaitForScanCompletion_RateLimit429RetriesThenCompletes(t *testing.T) {
+	const projectID = "77777777-7777-7777-7777-777777777777"
+	const sbomID = "88888888-8888-8888-8888-888888888888"
+
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		if n <= 2 {
+			// Retry-After: 0 keeps the test fast; the real behaviour
+			// (honour-and-sleep) is exercised by
+			// TestWaitForScanCompletion_RateLimitRetryAfterHonored.
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+			return
+		}
+		resp := api.ScanStatusResponse{
+			Status:    "completed",
+			SbomID:    sbomID,
+			ProjectID: projectID,
+			Vulnerabilities: api.VulnerabilitySummary{
+				Critical: 1, High: 0, Medium: 0, Low: 0, Total: 1,
+			},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := api.NewClient(server.URL, "test-key")
+
+	scanWaitTimeout = 5 * time.Second
+	scanPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		scanWaitTimeout = 5 * time.Minute
+		scanPollInterval = 5 * time.Second
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+	defer cancel()
+	summary, timedOut, failedMsg, apiErrMsg, _ := waitForScanCompletion(ctx, client, projectID, sbomID)
+
+	if timedOut {
+		t.Errorf("429 must not be reported as timeout; loop should retry through it (Codex R13 P2 regression)")
+	}
+	if failedMsg != "" {
+		t.Errorf("failedMsg = %q on 429-then-complete path, want empty", failedMsg)
+	}
+	if apiErrMsg != "" {
+		t.Errorf("apiErrMsg = %q on 429-then-complete path, want empty (429 must NOT trigger fast-fail — Codex R13 P2)", apiErrMsg)
+	}
+	if summary == nil {
+		t.Fatal("summary is nil; expected the completion snapshot")
+	}
+	if summary.Critical != 1 || summary.Total != 1 {
+		t.Errorf("summary = %+v, want critical=1 total=1", *summary)
+	}
+	if got := atomic.LoadInt32(&hits); got < 3 {
+		t.Errorf("server hit %d times; want >= 3 (loop must retry past 2x 429 before reaching the completion response)", got)
+	}
+}
+
+// TestWaitForScanCompletion_RateLimitRetryAfterHonored verifies that a
+// Retry-After header longer than --poll-interval bumps the sleep for that
+// iteration. We can't directly observe the sleep, but we can observe the
+// inter-request gap by timestamping server hits and asserting the gap
+// between the 429 and the subsequent poll meets the Retry-After hint
+// (modulo a small slack for scheduling jitter).
+//
+// This pins down the documented behaviour: the loop never polls faster
+// than the server asked it to, so honouring Retry-After actually prevents
+// re-triggering the rate limit.
+func TestWaitForScanCompletion_RateLimitRetryAfterHonored(t *testing.T) {
+	const projectID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	const sbomID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+	const retryAfterSecs = 1 // small for test speed, still > poll interval
+
+	var (
+		hits     int32
+		hitTimes []time.Time
+		mu       sync.Mutex
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		hitTimes = append(hitTimes, time.Now())
+		mu.Unlock()
+		n := atomic.AddInt32(&hits, 1)
+		if n == 1 {
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSecs))
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(api.ScanStatusResponse{
+			Status:    "completed",
+			SbomID:    sbomID,
+			ProjectID: projectID,
+			Vulnerabilities: api.VulnerabilitySummary{
+				Critical: 0, Total: 0,
+			},
+		})
+	}))
+	defer server.Close()
+
+	client := api.NewClient(server.URL, "test-key")
+
+	// Poll interval intentionally much smaller than Retry-After so that
+	// without the R13 fix (Retry-After ignored) the gap would be ~10ms
+	// rather than ~retryAfterSecs.
+	scanWaitTimeout = 10 * time.Second
+	scanPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		scanWaitTimeout = 5 * time.Minute
+		scanPollInterval = 5 * time.Second
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
+	defer cancel()
+	_, timedOut, _, apiErrMsg, _ := waitForScanCompletion(ctx, client, projectID, sbomID)
+
+	if timedOut {
+		t.Fatal("unexpected timeout")
+	}
+	if apiErrMsg != "" {
+		t.Fatalf("unexpected apiErrMsg=%q", apiErrMsg)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hitTimes) < 2 {
+		t.Fatalf("got %d hit timestamps; want >= 2", len(hitTimes))
+	}
+	gap := hitTimes[1].Sub(hitTimes[0])
+	want := time.Duration(retryAfterSecs) * time.Second
+	// Allow generous slack on the upper side (timer fires no earlier
+	// than Retry-After but may be slightly late under load) and a
+	// strict lower bound so a regression that ignores Retry-After
+	// trips clearly. Subtract 100ms from the lower bound to absorb
+	// timer-resolution noise.
+	if gap < want-100*time.Millisecond {
+		t.Errorf("gap between 429 and retry = %s, want >= %s (Retry-After ignored — R13 P2 regression)", gap, want)
+	}
+	if gap > want+2*time.Second {
+		t.Errorf("gap between 429 and retry = %s, much larger than Retry-After (%s)", gap, want)
 	}
 }
 

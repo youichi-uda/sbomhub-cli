@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -33,6 +35,19 @@ type Client struct {
 // the operator into thinking the scan was slow when the real failure
 // mode was a misconfigured API key.
 //
+// Codex R13 fix (P2): the R7-7c classification split treated EVERY 4xx
+// (including 429 Too Many Requests) as permanent, so an upstream gateway
+// or API rate limiter throttling the polling loop would fast-fail the CI
+// run with exit-3 even though the next poll would have succeeded. The
+// IsRetryable method now isolates the truly-permanent client errors
+// (auth failure, missing endpoint, malformed path) from the transient
+// throttling case. When the server emits Retry-After (RFC 7231 §7.1.3),
+// RetryAfter carries the parsed wait hint so the polling loop can honour
+// the server's back-off instruction instead of hammering at the default
+// --poll-interval. We accept both delta-seconds and HTTP-date forms; an
+// unparseable header leaves RetryAfter at zero and the caller falls back
+// to its normal cadence.
+//
 // Currently only emitted by GetScanStatus; other client methods still
 // return wrapped sentinel errors. They can adopt APIError incrementally
 // as their callers gain a need to classify failures.
@@ -40,10 +55,51 @@ type APIError struct {
 	StatusCode int
 	Message    string
 	URL        string
+	// RetryAfter is the duration parsed from the Retry-After response
+	// header on retryable responses (429 / 5xx). Zero when the header was
+	// absent or unparseable; callers should fall back to their own polling
+	// cadence in that case.
+	RetryAfter time.Duration
 }
 
 func (e *APIError) Error() string {
 	return fmt.Sprintf("APIエラー (%d) %s: %s", e.StatusCode, e.URL, e.Message)
+}
+
+// IsRetryable reports whether the status code represents a transient
+// failure that the caller may safely retry. 429 (rate limit) and 5xx
+// (server error / upstream blip) are retryable; all other 4xx are
+// permanent (the operator must fix config / upgrade the server before
+// any number of retries can succeed). Codex R13 fix (P2).
+func (e *APIError) IsRetryable() bool {
+	if e == nil {
+		return false
+	}
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
+// parseRetryAfter decodes the Retry-After header (RFC 7231 §7.1.3),
+// which may be either delta-seconds (e.g. "120") or an HTTP-date
+// (e.g. "Wed, 21 Oct 2026 07:28:00 GMT"). Returns 0 for any
+// unparseable / past-dated / non-positive value — the caller should
+// treat zero as "no server-supplied hint, use normal cadence".
+func parseRetryAfter(header string) time.Duration {
+	s := strings.TrimSpace(header)
+	if s == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(s); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(s); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // NewClient creates a new API client
@@ -484,6 +540,11 @@ type ScanStatusResponse struct {
 // of a stringly-wrapped fmt.Errorf) so the polling loop can classify
 // 4xx as permanent (fast-fail with exit 3) vs 5xx / network as transient
 // (retry within --wait-timeout). See APIError doc for the full rationale.
+//
+// Codex R13 fix (P2): APIError carries IsRetryable() and a parsed
+// Retry-After value so the polling loop can treat 429 (Too Many Requests)
+// as transient — previously folded under "all 4xx are permanent" which
+// caused upstream-throttled CIs to fast-fail incorrectly.
 func (c *Client) GetScanStatus(ctx context.Context, projectID, sbomID string) (*ScanStatusResponse, error) {
 	url := fmt.Sprintf("%s/api/v1/projects/%s/sboms/%s/scan-status", c.baseURL, projectID, sbomID)
 
@@ -505,6 +566,7 @@ func (c *Client) GetScanStatus(ctx context.Context, projectID, sbomID string) (*
 			StatusCode: resp.StatusCode,
 			Message:    string(body),
 			URL:        url,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
 	}
 

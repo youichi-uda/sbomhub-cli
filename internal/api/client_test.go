@@ -574,6 +574,165 @@ func TestGetScanStatusError(t *testing.T) {
 	if apiErr.StatusCode != http.StatusInternalServerError {
 		t.Errorf("APIError.StatusCode = %d, want %d", apiErr.StatusCode, http.StatusInternalServerError)
 	}
+	// Codex R13 P2 regression guard: 5xx must remain in the retryable
+	// bucket so the polling loop keeps riding out brief upstream blips
+	// within the --wait-timeout budget.
+	if !apiErr.IsRetryable() {
+		t.Error("APIError{500}.IsRetryable() = false; want true (5xx must remain retryable per R13 classification)")
+	}
+}
+
+// TestAPIError_IsRetryable verifies the Codex R13 P2 classification:
+// 429 (rate limit) and 5xx must be marked retryable; all other 4xx are
+// permanent. A regression here is exactly the original bug — 429 being
+// folded into the permanent-4xx bucket and failing CI on transient
+// throttling.
+func TestAPIError_IsRetryable(t *testing.T) {
+	cases := []struct {
+		name string
+		code int
+		want bool
+	}{
+		// retryable
+		{"429 too many requests", http.StatusTooManyRequests, true},
+		{"500 internal server error", http.StatusInternalServerError, true},
+		{"502 bad gateway", http.StatusBadGateway, true},
+		{"503 service unavailable", http.StatusServiceUnavailable, true},
+		{"504 gateway timeout", http.StatusGatewayTimeout, true},
+		// permanent
+		{"400 bad request", http.StatusBadRequest, false},
+		{"401 unauthorized", http.StatusUnauthorized, false},
+		{"403 forbidden", http.StatusForbidden, false},
+		{"404 not found", http.StatusNotFound, false},
+		{"409 conflict", http.StatusConflict, false},
+		{"410 gone", http.StatusGone, false},
+		{"422 unprocessable", http.StatusUnprocessableEntity, false},
+		// nil receiver — defensive guard against errors.As-style use
+		// patterns where a typed nil might slip in.
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &APIError{StatusCode: tc.code}
+			if got := e.IsRetryable(); got != tc.want {
+				t.Errorf("APIError{%d}.IsRetryable() = %v, want %v", tc.code, got, tc.want)
+			}
+		})
+	}
+	t.Run("nil receiver", func(t *testing.T) {
+		var e *APIError
+		if e.IsRetryable() {
+			t.Error("nil *APIError.IsRetryable() = true, want false")
+		}
+	})
+}
+
+// TestParseRetryAfter exercises both forms of RFC 7231 §7.1.3 (Retry-After):
+// integer delta-seconds and HTTP-date. Past-dated / unparseable values
+// must return 0 so callers fall back to their own polling cadence
+// instead of blocking on garbage.
+func TestParseRetryAfter(t *testing.T) {
+	cases := []struct {
+		name    string
+		header  string
+		wantMin time.Duration // inclusive lower bound (allows HTTP-date drift)
+		wantMax time.Duration // inclusive upper bound
+	}{
+		{"empty", "", 0, 0},
+		{"whitespace only", "   ", 0, 0},
+		{"zero seconds", "0", 0, 0},
+		{"negative seconds", "-5", 0, 0},
+		{"30 seconds", "30", 30 * time.Second, 30 * time.Second},
+		{"120 seconds with whitespace", "  120  ", 120 * time.Second, 120 * time.Second},
+		{"garbage", "soon-ish", 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseRetryAfter(tc.header)
+			if got < tc.wantMin || got > tc.wantMax {
+				t.Errorf("parseRetryAfter(%q) = %s, want in [%s, %s]", tc.header, got, tc.wantMin, tc.wantMax)
+			}
+		})
+	}
+
+	t.Run("http-date future", func(t *testing.T) {
+		// 60s in the future, formatted as an HTTP date. parseRetryAfter
+		// returns time.Until(that), so the test allows generous slack
+		// for the time spent between formatting and parsing.
+		future := time.Now().Add(60 * time.Second).UTC().Format(http.TimeFormat)
+		got := parseRetryAfter(future)
+		if got < 30*time.Second || got > 70*time.Second {
+			t.Errorf("parseRetryAfter(http-date +60s) = %s, want ~60s", got)
+		}
+	})
+
+	t.Run("http-date past returns zero", func(t *testing.T) {
+		past := time.Now().Add(-60 * time.Second).UTC().Format(http.TimeFormat)
+		if got := parseRetryAfter(past); got != 0 {
+			t.Errorf("parseRetryAfter(past http-date) = %s, want 0", got)
+		}
+	})
+}
+
+// TestGetScanStatus_RateLimitedRetryAfter verifies the Codex R13 P2 fix
+// end-to-end at the client layer: a 429 response with a Retry-After header
+// must surface as a typed *APIError where IsRetryable() == true AND the
+// header is parsed into RetryAfter. Both fields are load-bearing for the
+// polling loop in scan.go — IsRetryable gates the transient retry path,
+// and RetryAfter lets the loop honour the server's back-off hint instead
+// of hammering at --poll-interval.
+func TestGetScanStatus_RateLimitedRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "45")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	_, err := client.GetScanStatus(context.Background(), "p", "s")
+	if err == nil {
+		t.Fatal("GetScanStatus() expected error for 429 response")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error is not *APIError: %T %v", err, err)
+	}
+	if apiErr.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("StatusCode = %d, want %d", apiErr.StatusCode, http.StatusTooManyRequests)
+	}
+	if !apiErr.IsRetryable() {
+		t.Error("APIError.IsRetryable() = false for 429; want true (Codex R13 P2: 429 must be retryable, not folded into permanent-4xx)")
+	}
+	if apiErr.RetryAfter != 45*time.Second {
+		t.Errorf("APIError.RetryAfter = %s, want 45s (parsed from Retry-After header)", apiErr.RetryAfter)
+	}
+}
+
+// TestGetScanStatus_RateLimitedNoRetryAfter verifies that a 429 without a
+// Retry-After header still classifies as retryable; RetryAfter is just
+// zero so the caller falls back to its own cadence.
+func TestGetScanStatus_RateLimitedNoRetryAfter(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":"rate limited"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	_, err := client.GetScanStatus(context.Background(), "p", "s")
+	if err == nil {
+		t.Fatal("GetScanStatus() expected error for 429 response")
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("error is not *APIError: %T %v", err, err)
+	}
+	if !apiErr.IsRetryable() {
+		t.Error("APIError.IsRetryable() = false for 429; want true even without Retry-After")
+	}
+	if apiErr.RetryAfter != 0 {
+		t.Errorf("APIError.RetryAfter = %s, want 0 (no Retry-After header sent)", apiErr.RetryAfter)
+	}
 }
 
 // TestGetScanStatus_PermanentClientError verifies the Codex R7 fix:
@@ -628,6 +787,14 @@ func TestGetScanStatus_PermanentClientError(t *testing.T) {
 			// message (e.g. "invalid api key") is preserved end-to-end.
 			if !strings.Contains(apiErr.Message, "permanent") {
 				t.Errorf("APIError.Message = %q, want substring %q (server body lost)", apiErr.Message, "permanent")
+			}
+			// Codex R13 P2 regression guard: these codes must remain
+			// classified as permanent. A regression where 401/403/404
+			// flips to retryable would silently retry bad-auth /
+			// missing-endpoint for the full --wait-timeout — the exact
+			// failure mode R7 was introduced to fix.
+			if apiErr.IsRetryable() {
+				t.Errorf("APIError{%d}.IsRetryable() = true; want false (R13: only 429+5xx are retryable, all other 4xx remain permanent)", tc.code)
 			}
 		})
 	}

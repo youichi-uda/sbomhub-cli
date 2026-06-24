@@ -429,6 +429,15 @@ func runScan(cmd *cobra.Command, args []string) error {
 // Unknown error types (e.g. JSON parse failures) are also kept on the
 // transient path because they may signal a temporary upstream glitch
 // rather than a permanent contract mismatch.
+//
+// Codex R13 fix (P2): the R7 split treated EVERY 4xx as permanent,
+// including 429 Too Many Requests. An upstream gateway or API rate
+// limiter throttling the polling loop therefore fast-failed CIs that
+// would have succeeded on the next poll. We now delegate the
+// transient/permanent classification to APIError.IsRetryable (429 +
+// 5xx → retryable, other 4xx → permanent) and honour the server's
+// Retry-After hint when present (capped only by ctx deadline, so a
+// rogue large Retry-After never outlives --wait-timeout).
 func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, sbomID string) (summary *api.VulnerabilitySummary, timedOut bool, failedErrorMsg, apiErrMsg string, lastFetchedAt time.Time) {
 	tick := scanPollInterval
 	if tick <= 0 {
@@ -445,6 +454,13 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 			return latest, true, "", "", latestAt
 		}
 
+		// nextSleep defaults to the configured poll cadence. A retryable
+		// APIError carrying a Retry-After hint may bump it up for this
+		// iteration only (so a one-off 429 with "Retry-After: 30" doesn't
+		// permanently slow the loop down). ctx-bound select below caps
+		// any inflated sleep at the remaining --wait-timeout budget.
+		nextSleep := tick
+
 		status, err := client.GetScanStatus(ctx, projectID, sbomID)
 		if err != nil {
 			// If the error is because ctx was cancelled (deadline hit
@@ -454,19 +470,35 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 				return latest, true, "", "", latestAt
 			}
 
-			// Permanent client-side error (4xx): fast-fail. Retrying a
-			// 401/403/404 for the full --wait-timeout would hide the real
-			// failure mode (bad auth, missing endpoint) behind a misleading
-			// "scan timed out" exit. The caller maps apiErrMsg to exit-3.
+			// Classify the API error. 429 / 5xx are retryable transient
+			// failures; other 4xx are permanent (bad auth, missing
+			// endpoint, malformed path) and fast-fail to exit-3 so the
+			// operator sees the real failure mode rather than a misleading
+			// "scan timed out".
 			var apiErr *api.APIError
-			if errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
-				fmt.Printf("   ✗ scan-status 取得エラー (HTTP %d): 永続的なエラーのため即座に中断します\n", apiErr.StatusCode)
-				return latest, false, "", fmt.Sprintf("HTTP %d %s: %s", apiErr.StatusCode, apiErr.URL, strings.TrimSpace(apiErr.Message)), latestAt
+			if errors.As(err, &apiErr) {
+				if !apiErr.IsRetryable() {
+					fmt.Printf("   ✗ scan-status 取得エラー (HTTP %d): 永続的なエラーのため即座に中断します\n", apiErr.StatusCode)
+					return latest, false, "", fmt.Sprintf("HTTP %d %s: %s", apiErr.StatusCode, apiErr.URL, strings.TrimSpace(apiErr.Message)), latestAt
+				}
+				// Retryable (429 / 5xx). Honour Retry-After when the
+				// server supplied it AND it is longer than our default
+				// cadence; we never go faster than the operator asked
+				// (would defeat the rate-limit hint) but we still let
+				// ctx cancellation wake the sleep below.
+				if apiErr.RetryAfter > nextSleep {
+					nextSleep = apiErr.RetryAfter
+				}
+				if apiErr.StatusCode == 429 {
+					fmt.Printf("   ⚠️  scan-status rate limited (HTTP 429), retrying after %s...\n", nextSleep.Round(time.Second))
+				} else {
+					fmt.Printf("   ⚠️  scan-status server error (HTTP %d), retrying after %s...\n", apiErr.StatusCode, nextSleep.Round(time.Second))
+				}
+			} else {
+				// Non-APIError transient (network flap, JSON parse
+				// glitch, …): log and keep polling within ctx budget.
+				fmt.Printf("   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
 			}
-
-			// Transient (5xx, network flap, JSON parse glitch, …): log
-			// and keep polling within the ctx budget.
-			fmt.Printf("   ⚠️  scan-status 取得エラー (継続して再試行): %v\n", err)
 		} else {
 			elapsed := time.Since(startTime)
 			fmt.Printf("   状態: %-9s 経過: %4s / %s  (critical=%d high=%d medium=%d low=%d unknown=%d kev=%d total=%d)\n",
@@ -493,8 +525,10 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 
 		// Sleep until next poll tick or ctx cancellation, whichever
 		// comes first. select prevents a fixed-tick Sleep from outliving
-		// the timeout.
-		timer := time.NewTimer(tick)
+		// the timeout. nextSleep equals `tick` on the happy path; a
+		// retryable APIError carrying Retry-After may have bumped it up
+		// for this single iteration (Codex R13 P2).
+		timer := time.NewTimer(nextSleep)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
