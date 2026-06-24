@@ -17,7 +17,8 @@ SBOMHub CLI: SBOM 生成からアップロード、 将来は CRA 提出向け V
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew install sbomhub/tap/sbomhub
+brew tap youichi-uda/sbomhub https://github.com/youichi-uda/homebrew-sbomhub
+brew install sbomhub
 ```
 
 ### Shell script
@@ -35,7 +36,7 @@ go install github.com/youichi-uda/sbomhub-cli/cmd/sbomhub@latest
 ### Windows (Scoop)
 
 ```bash
-scoop bucket add sbomhub https://github.com/sbomhub/scoop-bucket
+scoop bucket add sbomhub https://github.com/youichi-uda/scoop-sbomhub
 scoop install sbomhub
 ```
 
