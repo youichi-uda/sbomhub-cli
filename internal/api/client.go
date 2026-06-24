@@ -96,6 +96,15 @@ type sbomUploadResponse struct {
 // is treated as a project NAME by UploadSBOM, preserving the get-or-create
 // semantics for the legacy `--project my-app` form.
 //
+// Codex R12 fix (P2): looksLikeUUID is only consulted when the caller
+// passes allowAsID=true to UploadSBOM. That gate exists because the CLI's
+// scan command falls back to the working-directory basename when --project
+// is not explicitly given, and a checkout path like /tmp/<uuid>/ would
+// otherwise be silently routed to a random project ID — UploadSBOM cannot
+// distinguish "user gave me this UUID on purpose" from "I synthesized this
+// from a directory name" without the explicit bit. Keeping looksLikeUUID
+// unexported keeps that gate co-located with the only legitimate use.
+//
 // We do strict format matching rather than pulling in github.com/google/uuid
 // to keep the CLI's dependency surface minimal (the project's go.mod has
 // cobra + yaml only).
@@ -123,44 +132,59 @@ func looksLikeUUID(s string) bool {
 // Wire contract (Trust Rescue 9.3.1 / #9, BREAKING):
 //   - Step 1: resolve `projectRef` to a tenant-scoped project ID. The flag
 //     `sbomhub scan --project` accepts EITHER a project name OR a project
-//     UUID per its help text. If `projectRef` parses as a canonical UUID
-//     (8-4-4-4-12 hex per RFC 4122) we treat it as the project ID directly
-//     and skip the get-or-create call. Otherwise we POST to
-//     /api/v1/cli/projects, which has get-or-create semantics on the
-//     server side (CLIService.GetOrCreateProject).
+//     UUID per its help text. If the caller passes `allowAsID=true` AND
+//     `projectRef` parses as a canonical UUID (8-4-4-4-12 hex per RFC 4122)
+//     we treat it as the project ID directly and skip the get-or-create
+//     call. Otherwise we POST to /api/v1/cli/projects, which has
+//     get-or-create semantics on the server side
+//     (CLIService.GetOrCreateProject).
 //   - Step 2: POST the raw SBOM bytes to /api/v1/projects/{id}/sbom — the
 //     canonical endpoint protected by MultiAuth that the web UI also uses.
 //     Content-Type is `application/json` because both CycloneDX-JSON and
 //     SPDX-JSON parse as JSON and the server auto-detects which by the
 //     body's `bomFormat` / `spdxVersion` field.
 //
-// Codex R6 fix (Finding 1): before this change, passing a UUID via
+// Codex R6 fix (Finding 1): before that change, passing a UUID via
 // `--project <uuid>` was silently routed through CreateProject, which would
 // create a new project whose NAME was the literal UUID string (because no
 // existing project had that name). SBOMs then attached to the wrong (newly
-// created) project. With the UUID short-circuit the operator gets the
+// created) project. The UUID short-circuit gives the operator the
 // behaviour the help text already promised.
+//
+// Codex R12 fix (P2): R6 keyed the short-circuit purely on UUID format,
+// which made it fire even when the CLI had synthesized projectRef from the
+// working-directory basename (the no-flag fallback in cmd/sbomhub/commands/
+// scan.go). A checkout under /tmp/<uuid>/ would then attach to whatever
+// random project happened to share that ID — silently rebinding the SBOM
+// to an unrelated tenant resource. The `allowAsID` parameter scopes the
+// ID short-circuit to the case where the caller can vouch that projectRef
+// came from an explicit user-supplied value (i.e. the `--project` flag
+// was changed on the command line). When `allowAsID=false` we ALWAYS go
+// through CreateProject get-or-create, so a UUID-shaped directory name
+// becomes a benignly-named project rather than a misattribution incident.
 //
 // The legacy multipart POST /api/v1/cli/upload still exists with a Sunset of
 // 2026-09-24, but new requests MUST go through the canonical endpoint so the
 // product has one source of truth on auth + tenant scoping.
-func (c *Client) UploadSBOM(projectRef string, sbomData []byte, format string) (*UploadResult, error) {
+func (c *Client) UploadSBOM(projectRef string, allowAsID bool, sbomData []byte, format string) (*UploadResult, error) {
 	// Step 1: resolve projectRef to a project ID.
 	//
-	// If projectRef is a canonical UUID, treat it as the ID directly — no
-	// CreateProject round-trip, and crucially no risk of accidentally
-	// creating a new project whose NAME is the UUID string. If the UUID is
-	// invalid (no such project in this tenant) the canonical upload
+	// If projectRef is an explicitly-supplied canonical UUID
+	// (allowAsID=true AND format matches), treat it as the ID directly —
+	// no CreateProject round-trip, and crucially no risk of accidentally
+	// creating a new project whose NAME is the UUID string. If the UUID
+	// is invalid (no such project in this tenant) the canonical upload
 	// endpoint will return 4xx and surface that to the operator.
 	//
-	// If projectRef is a name, fall through to the get-or-create call as
-	// before.
+	// Otherwise — including the case of a UUID-shaped value that came
+	// from the CLI's implicit dir-basename fallback (allowAsID=false) —
+	// fall through to the get-or-create call as before.
 	var (
 		projectID      string
 		projectName    string
 		projectCreated bool
 	)
-	if looksLikeUUID(projectRef) {
+	if allowAsID && looksLikeUUID(projectRef) {
 		projectID = projectRef
 		// We don't have the project's display name without an extra
 		// GET; leave it empty — UploadResult.ProjectName is only used

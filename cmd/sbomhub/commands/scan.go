@@ -83,7 +83,7 @@ Exit codes:
 func init() {
 	rootCmd.AddCommand(scanCmd)
 
-	scanCmd.Flags().StringVarP(&scanProject, "project", "p", "", "プロジェクト名 または UUID (UUID 形式なら既存プロジェクトの ID として扱い、 名前形式なら get-or-create)")
+	scanCmd.Flags().StringVarP(&scanProject, "project", "p", "", "プロジェクト名 または UUID (このフラグを明示指定したときのみ UUID 形式値を既存プロジェクトの ID として扱う。 未指定時はディレクトリ名を name として get-or-create)")
 	scanCmd.Flags().StringVarP(&scanTool, "tool", "t", "", "使用するツール (syft/trivy/cdxgen, デフォルト: 自動検出)")
 	scanCmd.Flags().StringVarP(&scanFormat, "format", "f", "cyclonedx", "出力フォーマット (cyclonedx/spdx)")
 	scanCmd.Flags().StringVarP(&scanOutput, "output", "o", "", "ローカルにも保存するファイルパス")
@@ -204,7 +204,22 @@ func runScan(cmd *cobra.Command, args []string) error {
 	// API クライアントの作成
 	client := api.NewClient(cfg.APIURL, cfg.APIKey)
 
-	// プロジェクト名の決定
+	// プロジェクト名の決定。
+	//
+	// Codex R12 fix (P2): we track whether --project was *explicitly*
+	// supplied so UploadSBOM can decide if a UUID-shaped value should be
+	// treated as a project ID. Without this distinction a directory like
+	// /tmp/01234567-0123-0123-0123-0123456789ab (e.g. an ephemeral CI
+	// checkout) would have its basename routed through the R6 UUID
+	// short-circuit and silently attach the SBOM to whatever random
+	// project happened to share that ID. We define "explicit" as a
+	// non-empty --project flag value: that's exactly the branch where
+	// the caller demonstrably chose the value, and matches the existing
+	// `scanProject == ""` fallback condition below. (Using
+	// cmd.Flags().Changed would be equivalent here, but keeping the
+	// check inline avoids reaching into cobra plumbing from the test
+	// surface.)
+	projectExplicit := scanProject != ""
 	projectName := scanProject
 	if projectName == "" {
 		// ディレクトリ名をプロジェクト名として使用
@@ -217,8 +232,10 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("📤 アップロード中: プロジェクト '%s'\n", projectName)
 
-	// アップロード
-	result, err := client.UploadSBOM(projectName, sbomData, scanFormat)
+	// アップロード。 projectExplicit=false (= dir-basename fallback) のときは
+	// UploadSBOM は projectName が UUID 形式であっても ID として扱わず、
+	// CreateProject(get-or-create) 経由で安全に name として登録する。
+	result, err := client.UploadSBOM(projectName, projectExplicit, sbomData, scanFormat)
 	if err != nil {
 		return &scanExitError{code: exitAPIError, msg: fmt.Sprintf("アップロードに失敗しました: %v", err)}
 	}

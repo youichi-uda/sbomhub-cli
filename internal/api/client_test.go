@@ -100,7 +100,11 @@ func TestUploadSBOM(t *testing.T) {
 
 	client := NewClient(server.URL, "test-key")
 	sbomData := []byte(`{"bomFormat": "CycloneDX", "specVersion": "1.4"}`)
-	result, err := client.UploadSBOM("my-project", sbomData, "cyclonedx")
+	// allowAsID=true here because the test simulates an explicit --project
+	// supply; the value is a name, so the UUID short-circuit does not
+	// fire and we still take the get-or-create path. allowAsID toggles
+	// "may treat as ID if it happens to be a UUID", not "is an ID".
+	result, err := client.UploadSBOM("my-project", true, sbomData, "cyclonedx")
 
 	if err != nil {
 		t.Fatalf("UploadSBOM() error = %v", err)
@@ -127,11 +131,18 @@ func TestUploadSBOM(t *testing.T) {
 }
 
 // TestUploadSBOM_ProjectRefIsUUID verifies the Codex R6 finding 1 fix:
-// when `--project` is given a canonical UUID, UploadSBOM must treat it as
-// the existing project's ID and skip CreateProject entirely. Before the
-// fix the UUID was passed to CreateProject as a NAME, which then created
-// a brand-new project whose name happened to be the UUID string —
-// attaching the SBOM to the wrong project.
+// when `--project` is EXPLICITLY given a canonical UUID (allowAsID=true),
+// UploadSBOM must treat it as the existing project's ID and skip
+// CreateProject entirely. Before the fix the UUID was passed to
+// CreateProject as a NAME, which then created a brand-new project whose
+// name happened to be the UUID string — attaching the SBOM to the wrong
+// project.
+//
+// Codex R12 fix (P2) layered on top: the short-circuit is now ALSO gated
+// on allowAsID=true. See TestUploadSBOM_UUIDImplicitTreatedAsName for the
+// inverse — UUID-shaped but implicit-from-dir-basename must NOT trip the
+// short-circuit, or a /tmp/<uuid>/ checkout silently attaches to a random
+// project.
 func TestUploadSBOM_ProjectRefIsUUID(t *testing.T) {
 	const projectID = "12345678-1234-1234-1234-1234567890ab"
 	const sbomID = "00000000-0000-0000-0000-000000000def"
@@ -146,8 +157,8 @@ func TestUploadSBOM_ProjectRefIsUUID(t *testing.T) {
 		case r.Method == "POST" && r.URL.Path == "/api/v1/cli/projects":
 			createProjectHits++
 			// We do NOT expect this branch to be reached when the
-			// caller passes a UUID. Still respond so a regression
-			// produces a useful diff rather than a hang.
+			// caller passes a UUID with allowAsID=true. Still respond
+			// so a regression produces a useful diff rather than a hang.
 			w.WriteHeader(http.StatusCreated)
 			_ = json.NewEncoder(w).Encode(CreateProjectResponse{
 				Project: &Project{ID: "wrong-id", Name: projectID},
@@ -174,7 +185,9 @@ func TestUploadSBOM_ProjectRefIsUUID(t *testing.T) {
 
 	client := NewClient(server.URL, "test-key")
 	sbomData := []byte(`{"bomFormat": "CycloneDX", "specVersion": "1.4"}`)
-	result, err := client.UploadSBOM(projectID, sbomData, "cyclonedx")
+	// allowAsID=true → the caller (scan.go) saw an explicit --project
+	// flag, so a UUID-format value is honored as a project ID.
+	result, err := client.UploadSBOM(projectID, true, sbomData, "cyclonedx")
 	if err != nil {
 		t.Fatalf("UploadSBOM() error = %v", err)
 	}
@@ -190,6 +203,122 @@ func TestUploadSBOM_ProjectRefIsUUID(t *testing.T) {
 	}
 	if result.ProjectCreated {
 		t.Error("ProjectCreated should be false when --project was an existing UUID (no create happened)")
+	}
+}
+
+// TestUploadSBOM_UUIDImplicitTreatedAsName verifies the Codex R12 P2 fix:
+// when allowAsID=false the UUID short-circuit must NOT fire even for a
+// projectRef that matches the canonical UUID format. The motivating bug
+// is that scan.go falls back to the working-directory basename when
+// --project is not supplied, and a CI checkout under /tmp/<uuid>/ would
+// otherwise have its basename misread as "user gave me this project ID
+// on purpose" — silently attaching the SBOM to whichever random project
+// happened to share that ID in the tenant.
+//
+// The contract this test pins down:
+//   - CreateProject IS called with the UUID-shaped string as the NAME
+//     (server-side get-or-create then mints a fresh project, or returns
+//     the one already named that way).
+//   - The SBOM uploads to whatever project ID CreateProject returned,
+//     NOT to the literal UUID value the caller passed in.
+//
+// A regression where allowAsID=false reverts to UUID-format-driven
+// short-circuit reopens the P2 misattribution incident.
+func TestUploadSBOM_UUIDImplicitTreatedAsName(t *testing.T) {
+	// projectRef is UUID-shaped (would have tripped pre-R12 short-circuit)
+	// but we hand it in with allowAsID=false, mimicking the dir-basename
+	// fallback in scan.go.
+	const dirBasenameUUID = "01234567-0123-0123-0123-0123456789ab"
+	// The server resolves the name to an entirely different project ID,
+	// so a regression that still treats the input as an ID would POST
+	// the SBOM to /projects/<dirBasenameUUID>/sbom and the test would
+	// see uploadToCreatedID == 0 + uploadToInputUUID == 1.
+	const createdProjectID = "99999999-9999-9999-9999-999999999999"
+	const sbomID = "00000000-0000-0000-0000-000000000def"
+
+	var (
+		createProjectHits int
+		uploadToCreatedID int
+		uploadToInputUUID int
+		seenCreateName    string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == "POST" && r.URL.Path == "/api/v1/cli/projects":
+			createProjectHits++
+			// Capture the NAME the client sent so the test can assert
+			// the dir-basename UUID was passed verbatim (not parsed as
+			// an ID and stripped).
+			body, _ := io.ReadAll(r.Body)
+			var req CreateProjectRequest
+			_ = json.Unmarshal(body, &req)
+			seenCreateName = req.Name
+
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(CreateProjectResponse{
+				Project: &Project{ID: createdProjectID, Name: dirBasenameUUID},
+				Created: true,
+			})
+
+		case r.Method == "POST" && r.URL.Path == "/api/v1/projects/"+createdProjectID+"/sbom":
+			uploadToCreatedID++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":         sbomID,
+				"project_id": createdProjectID,
+				"format":     "cyclonedx",
+				"version":    "1.4",
+				"created_at": "2026-06-24T00:00:00Z",
+			})
+
+		case r.Method == "POST" && r.URL.Path == "/api/v1/projects/"+dirBasenameUUID+"/sbom":
+			// Regression path: the client treated the input UUID as an
+			// ID directly. Count + respond so the test produces a clear
+			// diff rather than a network error.
+			uploadToInputUUID++
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"id":         sbomID,
+				"project_id": dirBasenameUUID,
+				"format":     "cyclonedx",
+				"version":    "1.4",
+				"created_at": "2026-06-24T00:00:00Z",
+			})
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	sbomData := []byte(`{"bomFormat": "CycloneDX", "specVersion": "1.4"}`)
+	// allowAsID=false: caller is the dir-basename fallback path in
+	// scan.go and has NOT been told to treat this value as a UUID.
+	result, err := client.UploadSBOM(dirBasenameUUID, false, sbomData, "cyclonedx")
+	if err != nil {
+		t.Fatalf("UploadSBOM() error = %v", err)
+	}
+
+	if createProjectHits != 1 {
+		t.Errorf("CreateProject called %d times for implicit UUID-shaped name; want 1 (Codex R12 P2 regression — UUID short-circuit firing without explicit --project)", createProjectHits)
+	}
+	if seenCreateName != dirBasenameUUID {
+		t.Errorf("CreateProject received name %q, want %q (the dir-basename UUID must be passed verbatim as a name)", seenCreateName, dirBasenameUUID)
+	}
+	if uploadToInputUUID != 0 {
+		t.Errorf("upload hit /projects/%s/sbom %d times (R12 P2 regression: implicit UUID was treated as an ID and the SBOM would have attached to a stranger's project)", dirBasenameUUID, uploadToInputUUID)
+	}
+	if uploadToCreatedID != 1 {
+		t.Errorf("upload hit /projects/%s/sbom %d times, want 1 (SBOM must attach to the project the server actually created/found)", createdProjectID, uploadToCreatedID)
+	}
+	if result.ProjectID != createdProjectID {
+		t.Errorf("ProjectID = %q, want %q (must be the server-issued ID, not the dir-basename UUID)", result.ProjectID, createdProjectID)
+	}
+	if !result.ProjectCreated {
+		t.Error("ProjectCreated should be true (CreateProject returned Created: true)")
 	}
 }
 
@@ -250,7 +379,9 @@ func TestUploadSBOMError(t *testing.T) {
 
 	client := NewClient(server.URL, "bad-key")
 
-	_, err := client.UploadSBOM("my-project", []byte(`{}`), "cyclonedx")
+	// allowAsID=true is irrelevant here ("my-project" is not a UUID), but
+	// match the realistic explicit-flag case.
+	_, err := client.UploadSBOM("my-project", true, []byte(`{}`), "cyclonedx")
 
 	if err == nil {
 		t.Error("UploadSBOM() expected error for 401 response from canonical endpoint")
