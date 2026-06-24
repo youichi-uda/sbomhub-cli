@@ -304,6 +304,72 @@ func getString(m map[string]interface{}, key string) string {
 	return ""
 }
 
+// VulnerabilitySummary aggregates vulnerability counts by severity for a
+// single SBOM. It mirrors the API-side `VulnerabilitySummaryCount` type
+// in apps/api/internal/handler/sbom.go — keep them in sync.
+type VulnerabilitySummary struct {
+	Critical int `json:"critical"`
+	High     int `json:"high"`
+	Medium   int `json:"medium"`
+	Low      int `json:"low"`
+	Unknown  int `json:"unknown"`
+	Total    int `json:"total"`
+}
+
+// ScanStatusResponse is the body of
+// GET /api/v1/projects/{project_id}/sboms/{sbom_id}/scan-status.
+//
+// Status values:
+//
+//   - "running":   background NVD/JVN scan in progress; counts are partial
+//   - "completed": scan finished without errors; counts are authoritative
+//   - "failed":    scan errored; Error has details; counts may be partial
+//   - "unknown":   no tracker entry (server restart, very old sbom, …);
+//                  callers should keep polling until --wait-timeout
+//
+// `sbomhub scan --fail-on <severity>` only enforces thresholds once
+// Status == "completed".
+type ScanStatusResponse struct {
+	Status          string               `json:"status"`
+	SbomID          string               `json:"sbom_id"`
+	ProjectID       string               `json:"project_id"`
+	Error           string               `json:"error,omitempty"`
+	Vulnerabilities VulnerabilitySummary `json:"vulnerabilities"`
+}
+
+// GetScanStatus polls the per-SBOM scan-status endpoint. Returns the
+// current state of the asynchronous NVD/JVN scan kicked off by
+// POST /api/v1/projects/:id/sbom plus the current per-severity counts.
+//
+// Trust Rescue P1 #12: this is the contract that lets the CLI block a CI
+// job on --fail-on <severity>.
+func (c *Client) GetScanStatus(projectID, sbomID string) (*ScanStatusResponse, error) {
+	url := fmt.Sprintf("%s/api/v1/projects/%s/sboms/%s/scan-status", c.baseURL, projectID, sbomID)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("リクエスト送信エラー: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("APIエラー (%d): %s", resp.StatusCode, string(body))
+	}
+
+	var out ScanStatusResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, fmt.Errorf("レスポンス解析エラー: %w", err)
+	}
+	return &out, nil
+}
+
 // Project represents a project
 type Project struct {
 	ID          string `json:"id"`

@@ -245,6 +245,71 @@ func TestListProjectsError(t *testing.T) {
 	}
 }
 
+// TestGetScanStatus exercises the polling contract used by
+// `sbomhub scan --fail-on` (Trust Rescue P1 #12). The CLI calls
+// GET /api/v1/projects/{project_id}/sboms/{sbom_id}/scan-status with the
+// Bearer API key and decodes the status + per-severity counts.
+func TestGetScanStatus(t *testing.T) {
+	const projectID = "00000000-0000-0000-0000-000000000abc"
+	const sbomID = "00000000-0000-0000-0000-000000000def"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			t.Errorf("Method = %q, want GET", r.Method)
+		}
+		wantPath := "/api/v1/projects/" + projectID + "/sboms/" + sbomID + "/scan-status"
+		if r.URL.Path != wantPath {
+			t.Errorf("Path = %q, want %q", r.URL.Path, wantPath)
+		}
+		if auth := r.Header.Get("Authorization"); auth != "Bearer test-key" {
+			t.Errorf("Authorization = %q, want Bearer test-key", auth)
+		}
+
+		resp := ScanStatusResponse{
+			Status:    "completed",
+			SbomID:    sbomID,
+			ProjectID: projectID,
+			Vulnerabilities: VulnerabilitySummary{
+				Critical: 2, High: 3, Medium: 5, Low: 7, Unknown: 1, Total: 18,
+			},
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	got, err := client.GetScanStatus(projectID, sbomID)
+	if err != nil {
+		t.Fatalf("GetScanStatus() error = %v", err)
+	}
+	if got.Status != "completed" {
+		t.Errorf("Status = %q, want completed", got.Status)
+	}
+	if got.Vulnerabilities.Critical != 2 || got.Vulnerabilities.High != 3 {
+		t.Errorf("Vulnerabilities = %+v, want critical=2 high=3", got.Vulnerabilities)
+	}
+	if got.Vulnerabilities.Total != 18 {
+		t.Errorf("Total = %d, want 18", got.Vulnerabilities.Total)
+	}
+}
+
+// TestGetScanStatusError exercises the transient-error path. The CLI
+// poll loop logs and retries on errors here, so the only contract we
+// need from the client is "return a non-nil error".
+func TestGetScanStatusError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error": "boom"}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	if _, err := client.GetScanStatus("p", "s"); err == nil {
+		t.Error("GetScanStatus() expected error for 500 response")
+	}
+}
+
 func TestUploadResultJSON(t *testing.T) {
 	jsonData := `{
 		"project_id": "abc",
