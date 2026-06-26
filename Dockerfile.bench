@@ -39,12 +39,34 @@ WORKDIR /app
 RUN apk add --no-cache git ca-certificates
 
 # Build the CLI from source.
+#
+# M5-4 cache strategy (sbomhub-cli #6): BuildKit `--mount=type=cache`
+# is wired on both the module-download and the `go build` steps so a
+# warm CI cache (GHA `type=gha,mode=max` backend — see
+# `.github/workflows/ci.yml` docker-smoke job) reuses the previously
+# downloaded module set + the build artefact cache instead of pulling
+# every transitive dep + recompiling the standard library on every
+# push. The mount targets match `golang:1.25-alpine`'s defaults:
+#
+#   GOMODCACHE = /go/pkg/mod
+#   GOCACHE    = /root/.cache/go-build
+#
+# Confirmed via `docker run --rm golang:1.25-alpine go env`. These
+# are layer-private cache volumes (BuildKit `RUN --mount=type=cache`),
+# NOT image layers — so the resulting `sbomhub-cli:ci-bench` /
+# `:bench` image stays the same size as before, only build time
+# changes. ※要確認: when the base image is bumped (1.26+, see the
+# F56 note above) re-verify these paths with `go env`.
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/sbomhub ./cmd/sbomhub
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/sbomhub ./cmd/sbomhub
 
 # Config directory matches the default image.
 RUN mkdir -p /root/.sbomhub

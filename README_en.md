@@ -243,6 +243,70 @@ docker run --rm \
 Every other subcommand — including `sbomhub llm test` — talks HTTP
 only and works on the default slim image.
 
+#### Docker image build times (M5-4 sbomhub-cli #6)
+
+`Dockerfile.bench` carries BuildKit cache mounts
+(`RUN --mount=type=cache,target=/go/pkg/mod` and
+`target=/root/.cache/go-build`); CI's `docker-smoke` job builds with
+`docker buildx build --cache-from=type=gha --cache-to=type=gha,mode=max`
+so the GitHub Actions cache backend persists `$GOMODCACHE` +
+`$GOCACHE` across runs. The smoke job uses a SEPARATE cache scope
+(`sbomhub-cli-smoke-bench`) from the release `docker-publish` job
+(`sbomhub-cli-bench`) so a smoke-run cache eviction cannot
+contaminate the release pipeline's cache.
+
+| build | cold (estimate) | warm (estimate) | measured at |
+|-------|------------------|------------------|-------------|
+| `Dockerfile` (default, alpine slim) | ~30 s | ~10 s | CI `$GITHUB_STEP_SUMMARY` |
+| `Dockerfile.bench` (`golang:1.25-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
+
+Actual numbers are emitted into `Actions → CI → docker-smoke (Linux)
+→ Summary` in seconds. The build flips from cold to warm once the
+GHA cache is primed (first push after a cache eviction). ※要確認:
+GHA cache backend has a 10 GB repo-wide LRU cap and the smoke +
+publish jobs both live in it — keeping the scopes separate is what
+prevents the steady-state cache eviction from pushing the release
+publish job back to a cold build.
+
+#### Cross-OS docker-smoke coverage (M5-4 sbomhub-cli #6)
+
+| OS | runner | docker-smoke equivalent | release gate | notes |
+|----|--------|-------------------------|--------------|-------|
+| Linux | `ubuntu-latest` | yes (`docker-smoke`) | yes (`needs:`) | GHCR publish hits this surface |
+| macOS | `macos-15-intel` | yes (`docker-smoke-macos`, informational) | no | Colima + sidecar mock, see below |
+| Windows | `windows-latest` | no (skipped) | no | WSL2 cold start is 15-30 min |
+
+**macOS caveats**:
+- Apple Silicon `macos-26` / `macos-latest` runners do not support
+  the nested virtualisation Colima / Lima rely on (Colima upstream
+  issues #277 / #902 / #1427), so the job pins to `macos-15-intel`
+  for now. Switch to `macos-latest` once GitHub enables ARM nested
+  virt.
+- Under Colima, neither `--network=host` nor
+  `--add-host=host.docker.internal:host-gateway` reaches the macOS
+  runner host (both resolve inside the Lima VM). The macOS smoke job
+  therefore runs the mock `/api/v1/health` python http.server as a
+  sidecar container on a user-defined bridge network and lets the
+  CLI container reach it via container-DNS hostname (`mock-health`).
+- Marked `continue-on-error: true` and intentionally NOT a release
+  gate: the GHCR images we publish are Linux-only, and macOS runner
+  variance is 3-4x Linux, so blocking tag releases on macOS flake
+  would hurt recoverability more than it helps.
+
+**Windows skip rationale**:
+Running Linux containers on a GitHub Actions Windows runner requires
+Docker Desktop + WSL2 cold start, which empirically takes 15-30 min
+for the same docker-smoke contract — an order of magnitude worse
+than `ubuntu-latest`'s 5-8 min. The GHCR-published images are
+Linux-only (alpine base); Windows operators following the README
+`docker run ghcr.io/...:bench` instructions run them via Docker
+Desktop's WSL2 backend on their workstation, so the surface the
+Linux smoke job validates IS the surface they execute. Native
+Windows binary builds are covered by the `build` job
+(`go build` on `windows-latest`) and the goreleaser release path.
+Revisit only when a Windows-Docker-specific regression is suspected
+(entrypoint CRLF / NTFS exec-bit handling, etc.).
+
 ## Roadmap (M1 and beyond)
 
 The following commands are planned for M1–M2 to round out CRA 2026-09 readiness. Every one of them is built on an AI-drafts-with-human-approval model (no auto-approval).

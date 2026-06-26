@@ -93,27 +93,76 @@ jobs:
   # Network: the smoke step uses `--network=host` so the in-container CLI
   # can hit the host-side mock health server. ubuntu-latest exposes the
   # host network namespace to docker; on macOS/Windows runners this would
-  # need `--add-host=host.docker.internal:host-gateway` instead, but the
-  # job is pinned to ubuntu-latest because we only need to validate the
-  # Linux image surface published to GHCR.
+  # need a different mock-host topology (see `docker-smoke-macos` job
+  # below — `--add-host=host.docker.internal:host-gateway` does NOT work
+  # under Colima because it resolves to the Lima VM rather than the
+  # runner host; the macOS job runs the mock as a sidecar container on
+  # a user-defined bridge network instead). This Linux job stays the
+  # release gate because the GHCR images we ship are Linux-only.
   #
-  # Runtime: ~5-8 minutes per push (default build ~30s, bench build with
-  # Go toolchain ~3-5min, smoke ~1-2min). Acceptable for a release-gate
-  # job that only fires on push to main / tags / PRs.
+  # M5-4 sbomhub-cli #6: BuildKit GHA cache backend wired
+  # (`type=gha,mode=max`) + per-image cache scope so cold-vs-warm build
+  # times are observable. The Dockerfile.bench `RUN --mount=type=cache,
+  # target=/go/pkg/mod / /root/.cache/go-build` mounts (added in the
+  # same patch) are layer-private cache volumes whose contents BuildKit
+  # exports into the GHA cache when `mode=max` is set. Combined effect:
+  # the bench image's `golang:1.25-alpine` second-stage build drops
+  # from ~3-5min cold to ~30-60s warm in steady state. Build times are
+  # printed into `$GITHUB_STEP_SUMMARY` so the gain is visible without
+  # log-diving. ※要確認: GHA cache scope name collides with the
+  # `docker-publish` job's `sbomhub-cli-default` / `sbomhub-cli-bench`
+  # scopes — kept SEPARATE here (`...-smoke-...`) so a smoke-run cache
+  # eviction can't corrupt the release-pipeline cache.
+  #
+  # Runtime (with M5-4 cache):
+  #   - cold: ~5-8 min (initial cache prime — same as pre-M5-4)
+  #   - warm: ~2-3 min (cache hit on Go module + build cache)
   docker-smoke:
-    name: Docker production smoke
+    name: Docker production smoke (Linux)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build default Dockerfile (sbomhub-cli:ci-test)
-        run: docker build -t sbomhub-cli:ci-test -f Dockerfile .
+      - name: Build default Dockerfile (sbomhub-cli:ci-test) with GHA cache
+        run: |
+          set -euo pipefail
+          START=$(date +%s)
+          # `--load` makes the resulting image available to the local
+          # docker daemon for subsequent `docker run` steps (default
+          # buildx output is a build-only OCI layout, not loaded).
+          docker buildx build \
+            --tag sbomhub-cli:ci-test \
+            --file Dockerfile \
+            --cache-from=type=gha,scope=sbomhub-cli-smoke-default \
+            --cache-to=type=gha,scope=sbomhub-cli-smoke-default,mode=max \
+            --load \
+            .
+          ELAPSED=$(( $(date +%s) - START ))
+          {
+            echo "## docker-smoke (Linux) build times"
+            echo ""
+            echo "| image | seconds |"
+            echo "|-------|---------|"
+            echo "| default (alpine slim) | ${ELAPSED} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build bench Dockerfile (sbomhub-cli:ci-bench)
-        run: docker build -t sbomhub-cli:ci-bench -f Dockerfile.bench .
+      - name: Build bench Dockerfile (sbomhub-cli:ci-bench) with GHA cache
+        run: |
+          set -euo pipefail
+          START=$(date +%s)
+          docker buildx build \
+            --tag sbomhub-cli:ci-bench \
+            --file Dockerfile.bench \
+            --cache-from=type=gha,scope=sbomhub-cli-smoke-bench \
+            --cache-to=type=gha,scope=sbomhub-cli-smoke-bench,mode=max \
+            --load \
+            .
+          ELAPSED=$(( $(date +%s) - START ))
+          echo "| bench (golang:1.25-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start mock /api/v1/health server (port 18080)
         run: |
@@ -254,6 +303,263 @@ jobs:
           if [ -f "$RUNNER_TEMP/mock_health.pid" ]; then
             kill "$(cat "$RUNNER_TEMP/mock_health.pid")" 2>/dev/null || true
           fi
+
+  # M5-4 sbomhub-cli #6: cross-OS coverage for the M4 #F66 docker-smoke
+  # gate. Same shape as `docker-smoke` (Dockerfile + Dockerfile.bench
+  # build, default-image `llm test` smoke, bench-image inner exit-code
+  # pass-through smoke) but on macOS so a Dockerfile regression that
+  # only surfaces under Colima (alpine apk wheel arch, /go cache-mount
+  # POSIX semantics, etc.) is caught before a tag.
+  #
+  # macOS runner constraints (M5-4 web research, 2026-06):
+  #   - Apple Silicon (`macos-26` / `macos-latest`) does NOT support
+  #     the nested virtualisation Colima/Lima need; both upstreams
+  #     refuse to start. → pin to `macos-15-intel` for now.
+  #   - Docker Desktop has no CI-friendly headless installer.
+  #     `douglascamata/setup-docker-macos-action@v1.1.0` (Dec 2025)
+  #     wraps Homebrew + Colima and is the de-facto choice cited by
+  #     most macOS-on-GHA Docker recipes in 2026.
+  #   - `--network=host` does NOT work on Colima (it joins the Lima
+  #     VM's network namespace, not the macOS host's). The
+  #     `--add-host=host.docker.internal:host-gateway` workaround
+  #     suggested in some docs ALSO fails on Colima — it resolves to
+  #     the Lima VM, not the runner host (Colima upstream #277/#902).
+  #     Working substitute: run the mock /api/v1/health server as a
+  #     sidecar container on a user-defined bridge network and have
+  #     the CLI container reach it via container-DNS hostname.
+  #   - Cold start (Homebrew + Colima VM + image pull) is 3-7 min,
+  #     small-image build 2-4 min, smoke 1-2 min. timeout-minutes 30
+  #     leaves headroom for runner variance.
+  #
+  # Release gate scope: this job runs on every push/PR for cross-OS
+  # signal but is intentionally NOT in `needs:` for `release` /
+  # `docker-publish`. Rationale: the GHCR images we ship are
+  # Linux-only (`linux/amd64,linux/arm64`), macOS runner variance is
+  # ~3-4x Linux, and Intel `macos-15` will eventually be retired —
+  # gating a release on a macOS-only flake would block recovery on
+  # transient runner issues. The Linux `docker-smoke` job stays the
+  # binding release gate.
+  #
+  # ※要確認:
+  #   - GitHub may enable nested-virt on `macos-*` ARM runners later;
+  #     when that lands, switch `runs-on` to `macos-latest` and drop
+  #     the `macos-15-intel` pin (track Colima #1427).
+  #   - `macos-15-intel` itself is on a deprecation path; reassess
+  #     this job when Intel runners are retired (likely 2026 H2 or
+  #     later per actions/runner-images announcements).
+  docker-smoke-macos:
+    name: Docker production smoke (macOS, informational)
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    # Informational only — see release-gate rationale in the leading
+    # comment block. Failures show up as a red job on PRs / pushes but
+    # do not block tag-driven releases.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker (Colima) on macOS
+        # v1.1.0 is the latest tag as of 2026-06.
+        uses: douglascamata/setup-docker-macos-action@v1.1.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build default Dockerfile (sbomhub-cli:ci-test) with GHA cache
+        run: |
+          set -euo pipefail
+          START=$(date +%s)
+          # Separate cache scope from the Linux smoke job so a macOS
+          # build (different host platform headers under Colima) cannot
+          # corrupt Linux cache reuse and vice versa.
+          docker buildx build \
+            --tag sbomhub-cli:ci-test \
+            --file Dockerfile \
+            --cache-from=type=gha,scope=sbomhub-cli-smoke-macos-default \
+            --cache-to=type=gha,scope=sbomhub-cli-smoke-macos-default,mode=max \
+            --load \
+            .
+          ELAPSED=$(( $(date +%s) - START ))
+          {
+            echo "## docker-smoke (macOS) build times"
+            echo ""
+            echo "| image | seconds |"
+            echo "|-------|---------|"
+            echo "| default (alpine slim) | ${ELAPSED} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build bench Dockerfile (sbomhub-cli:ci-bench) with GHA cache
+        run: |
+          set -euo pipefail
+          START=$(date +%s)
+          docker buildx build \
+            --tag sbomhub-cli:ci-bench \
+            --file Dockerfile.bench \
+            --cache-from=type=gha,scope=sbomhub-cli-smoke-macos-bench \
+            --cache-to=type=gha,scope=sbomhub-cli-smoke-macos-bench,mode=max \
+            --load \
+            .
+          ELAPSED=$(( $(date +%s) - START ))
+          echo "| bench (golang:1.25-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create user-defined bridge network for mock + CLI
+        # See leading comment block: Colima makes `--network=host`
+        # and `--add-host=host.docker.internal:host-gateway` both
+        # useless for reaching a macOS-host-side service. A
+        # user-defined bridge network gives mock + CLI a shared
+        # container-DNS resolution path that works identically on
+        # Linux and macOS Docker engines.
+        run: docker network create sbomhub-smoke-net
+
+      - name: Start mock /api/v1/health server (sidecar container)
+        run: |
+          set -euo pipefail
+          # Materialise the same mock_health.py used by the Linux
+          # smoke job into a temp dir, then run it inside a python
+          # container on the shared bridge network so the CLI
+          # container can reach it via the hostname `mock-health`.
+          mkdir -p "$RUNNER_TEMP/mock"
+          cat > "$RUNNER_TEMP/mock/mock_health.py" <<'PY'
+          # Mirror of the Linux docker-smoke job's mock_health.py —
+          # M4 #F66 / M5-4 #6. Kept in-source rather than factored
+          # into a shared file because both job inlines must stay
+          # self-contained (one runs on a runner host, the other in
+          # a container) and the body is short.
+          import http.server, json
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path == '/api/v1/health':
+                      body = json.dumps({'status': 'ok', 'mode': 'self-host'}).encode()
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/json')
+                      self.send_header('Content-Length', str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+              def log_message(self, *a, **kw):
+                  pass
+          http.server.HTTPServer(('0.0.0.0', 18080), H).serve_forever()
+          PY
+          docker run --rm -d \
+            --name mock-health \
+            --network sbomhub-smoke-net \
+            -v "$RUNNER_TEMP/mock:/mock:ro" \
+            python:3.13-alpine \
+            python3 /mock/mock_health.py
+          # Poll until ready (max ~30s — Colima networking can take a
+          # moment to settle the bridge).
+          for _ in $(seq 1 150); do
+            if docker run --rm --network sbomhub-smoke-net curlimages/curl:latest \
+                -fsS --max-time 1 http://mock-health:18080/api/v1/health > /dev/null 2>&1; then
+              echo "Mock health server ready"
+              exit 0
+            fi
+            sleep 0.2
+          done
+          echo "Mock health server failed to start" >&2
+          docker logs mock-health >&2 || true
+          exit 1
+
+      - name: Default image llm test smoke (against sidecar mock)
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --network sbomhub-smoke-net \
+            -e SBOMHUB_API_URL=http://mock-health:18080 \
+            sbomhub-cli:ci-test \
+            llm test --json
+
+      - name: Prepare fake sbomhub source for bench exit-code smoke
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/fake-sbomhub"
+          mkdir -p "$ROOT/apps/api/cmd/llm-bench"
+          mkdir -p "$ROOT/apps/api/test/fixtures/llm-bench"
+          cat > "$ROOT/apps/api/go.mod" <<'EOF'
+          module github.com/sbomhub/sbomhub/apps/api
+
+          go 1.25
+          EOF
+          cat > "$ROOT/apps/api/cmd/llm-bench/main.go" <<'EOF'
+          // Stub bench binary — mirrors the Linux smoke job. See the
+          // `docker-smoke` (Linux) prepare step for full rationale.
+          package main
+
+          import (
+              "os"
+              "strconv"
+          )
+
+          func main() {
+              code, _ := strconv.Atoi(os.Getenv("FAKE_BENCH_EXIT"))
+              os.Exit(code)
+          }
+          EOF
+          echo '[]' > "$ROOT/apps/api/test/fixtures/llm-bench/cve-20-50.json"
+
+      - name: Bench image inner exit code pass-through smoke (N=2/3/4/5)
+        run: |
+          set -uo pipefail
+          ROOT="$RUNNER_TEMP/fake-sbomhub"
+          FAIL=0
+          for N in 2 3 4 5; do
+            set +e
+            # Bench smoke does NOT need network access (the stub
+            # binary just reads $FAKE_BENCH_EXIT and exits), so no
+            # --network flag — works identically on Linux and macOS.
+            docker run --rm \
+              -v "$ROOT:/workspace/sbomhub" \
+              -e FAKE_BENCH_EXIT="$N" \
+              sbomhub-cli:ci-bench \
+              llm bench \
+                --sbomhub-source /workspace/sbomhub \
+                --providers openai \
+                --max-cases 1 \
+                --timeout 5
+            WRAPPER_EXIT=$?
+            set -e
+            if [ "$WRAPPER_EXIT" != "$N" ]; then
+              echo "FAIL: bench inner exit=$N but wrapper exit=$WRAPPER_EXIT" >&2
+              FAIL=1
+            else
+              echo "OK:   bench inner exit=$N → wrapper exit=$WRAPPER_EXIT"
+            fi
+          done
+          if [ "$FAIL" != "0" ]; then
+            echo "M4-3 F42 typed exit code pass-through (#F46/#F61) regressed on macOS" >&2
+            exit 1
+          fi
+
+      - name: Stop mock health server
+        if: always()
+        run: |
+          docker rm -f mock-health 2>/dev/null || true
+          docker network rm sbomhub-smoke-net 2>/dev/null || true
+
+  # M5-4 sbomhub-cli #6: Windows runner docker-smoke INTENTIONALLY OMITTED.
+  #
+  # Rationale:
+  #   - GitHub Actions Windows runners only expose Linux containers via
+  #     a nested Hyper-V Linux VM (or WSL2). Cold-start (Docker Desktop
+  #     install + WSL2 distro provisioning + image build) is empirically
+  #     15-30 min, an order of magnitude worse than ubuntu-latest's
+  #     ~5-8 min for the same docker-smoke contract.
+  #   - The GHCR-published `sbomhub-cli` / `sbomhub-cli:bench` images
+  #     are Linux-only (alpine base). Operators on Windows running the
+  #     `docker run ghcr.io/...:bench` instructions from README do so via
+  #     Docker Desktop's WSL2 backend on their workstation — so the
+  #     surface validated by the Linux smoke job IS the surface they run.
+  #   - The `build` job already covers the native Windows binary build
+  #     (`go build` on `windows-latest`), and goreleaser handles the
+  #     native Windows binary release path (see `.goreleaser.yaml`).
+  #
+  # If a future regression is suspected to be Windows-Docker-specific
+  # (e.g. CRLF in entrypoint scripts, NTFS exec-bit handling), revisit
+  # this decision — but make the operator pain explicit (a 30-min
+  # cold-start job for a Linux-only image surface is hard to justify
+  # as a default release gate).
 
   # M4 Codex review #F71: README documents
   # `ghcr.io/youichi-uda/sbomhub-cli:bench` (and the default image) as

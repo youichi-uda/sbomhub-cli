@@ -235,6 +235,60 @@ docker run --rm \
 `sbomhub llm test` を含む他の subcommand は HTTP API call のみで動作するため
 default slim image でも問題なく動く。
 
+#### Docker image build 時間 (M5-4 sbomhub-cli #6)
+
+`Dockerfile.bench` に BuildKit cache mount
+(`RUN --mount=type=cache,target=/go/pkg/mod` / `target=/root/.cache/go-build`)
+を追加し、 CI (`docker-smoke` job) は `docker buildx build
+--cache-from=type=gha --cache-to=type=gha,mode=max` で GitHub Actions cache
+backend を使う。 cache scope は smoke job と release publish job
+(`docker-publish`) で別々 (`sbomhub-cli-smoke-bench` vs `sbomhub-cli-bench`)
+に分離してあるので、 smoke 側 cache eviction が release 側を汚染しない。
+
+| build | 実測予測 (cold) | 実測予測 (warm) | 計測場所 |
+|-------|-----------------|-----------------|----------|
+| `Dockerfile` (default, alpine slim) | ~30s | ~10s | CI `$GITHUB_STEP_SUMMARY` |
+| `Dockerfile.bench` (`golang:1.25-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
+
+実数は push ごとに `Actions → CI → docker-smoke (Linux) → Summary` に
+seconds 単位で出力される。 初回 push 後に cache が temper されると warm
+build に切り替わる。 ※要確認: GitHub Actions cache backend は repo 全体で
+10 GB 上限の LRU、 release 側 publish と同居しているので scope を切らずに
+混ぜると steady state で取り合いになる。
+
+#### Cross-OS docker-smoke 対応状況 (M5-4 sbomhub-cli #6)
+
+| OS | runner | docker-smoke 同等 | release gate | 備考 |
+|----|--------|-------------------|--------------|------|
+| Linux | `ubuntu-latest` | 対応 (`docker-smoke`) | 対応 (`needs:` 参照) | GHCR publish もこの surface |
+| macOS | `macos-15-intel` | 対応 (`docker-smoke-macos`, informational) | 非対応 | Colima + sidecar mock 経路 ※下記 |
+| Windows | `windows-latest` | 非対応 (skip) | 非対応 | WSL2 cold start 15-30 分が高すぎる |
+
+**macOS 注意点**:
+- Apple Silicon の `macos-26` / `macos-latest` は nested virtualization が
+  使えず Colima / Lima を起動できない (Colima #277/#902/#1427)。 現状
+  `macos-15-intel` (Intel runner) に pin してある。 GitHub が ARM 側で
+  nested virt を有効化したら `macos-latest` に切替予定。
+- Colima では `--network=host` も
+  `--add-host=host.docker.internal:host-gateway` も macOS host を指さない
+  (Lima VM 内で完結する) ため、 mock `/api/v1/health` 用 python http.server
+  を sidecar container として user-defined bridge network 上に立て、 CLI
+  container が container-DNS hostname (`mock-health`) で到達する構造に
+  している。
+- `continue-on-error: true`。 macOS-only flake が tag release を block しない
+  ように release gate からは外している (publish 先 image は Linux-only)。
+
+**Windows skip 理由**:
+GitHub Actions の Windows runner で Linux container を動かすには
+Docker Desktop + WSL2 の cold start が必要で、 同じ `docker-smoke` を回すと
+15-30 分かかる。 publish 先の `sbomhub-cli` / `sbomhub-cli:bench` image は
+Linux-only (alpine ベース) で、 Windows 操作者は Docker Desktop / WSL2 経由で
+そのまま Linux container を引いて使うため、 Linux smoke がカバーする surface
+と同じ。 `build` job が native Windows binary build (`go build` on
+`windows-latest`) を別途持っており、 native 配布は goreleaser
+(`.goreleaser.yaml`) でカバーされている。 Windows-Docker 固有 regression
+(entrypoint CRLF / NTFS exec-bit 等) が将来発覚した時は revisit する。
+
 ## Roadmap (M1 以降)
 
 CRA 2026/9 期限対応に向け、 以下のコマンドを M1〜M2 で順次実装予定。 いずれも AI 下書き + 人間承認モデル (自動承認なし)。
