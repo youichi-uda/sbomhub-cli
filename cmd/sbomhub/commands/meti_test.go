@@ -34,20 +34,23 @@ import (
 // ---------------------------------------------------------------------------
 
 type metiFakeServer struct {
-	t                *testing.T
-	server           *httptest.Server
-	listResp         func(call int, q map[string][]string) (status int, headers map[string]string, payload interface{})
-	refreshResp      func(call int, body []byte) (status int, payload interface{})
-	overrideResp     func(call int, criterion string, body []byte) (status int, payload interface{})
-	improvementsResp func(call int) (status int, headers map[string]string, payload interface{})
+	t                  *testing.T
+	server             *httptest.Server
+	listResp           func(call int, q map[string][]string) (status int, headers map[string]string, payload interface{})
+	refreshResp        func(call int, body []byte) (status int, payload interface{})
+	overrideResp       func(call int, criterion string, body []byte) (status int, payload interface{})
+	clearOverrideResp  func(call int, criterion string, body []byte) (status int, payload interface{})
+	improvementsResp   func(call int) (status int, headers map[string]string, payload interface{})
 
-	listHits         int32
-	refreshHits      int32
-	overrideHits     int32
-	improvementsHits int32
+	listHits          int32
+	refreshHits       int32
+	overrideHits      int32
+	clearOverrideHits int32
+	improvementsHits  int32
 
-	seenOverrides []capturedMetiOverride
-	mu            sync.Mutex
+	seenOverrides      []capturedMetiOverride
+	seenClearOverrides []capturedMetiClearOverride
+	mu                 sync.Mutex
 }
 
 type capturedMetiOverride struct {
@@ -55,6 +58,11 @@ type capturedMetiOverride struct {
 	OverrideStatus    string
 	OverrideNote      string
 	ImprovementAction *string
+}
+
+type capturedMetiClearOverride struct {
+	CriterionID string
+	Note        string
 }
 
 func newMetiFakeServer(t *testing.T) *metiFakeServer {
@@ -144,6 +152,46 @@ func (tf *metiFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(payload)
+
+	case r.Method == http.MethodDelete && strings.HasSuffix(r.URL.Path, "/override"):
+		n := atomic.AddInt32(&tf.clearOverrideHits, 1)
+		body, _ := io.ReadAll(r.Body)
+		// path: /api/v1/projects/<pid>/meti/assessment/<criterion>/override
+		parts := strings.Split(r.URL.Path, "/")
+		criterion := ""
+		for i, p := range parts {
+			if p == "assessment" && i+1 < len(parts) {
+				criterion = parts[i+1]
+				break
+			}
+		}
+		var req api.MetiClearOverrideRequest
+		_ = json.Unmarshal(body, &req)
+		tf.mu.Lock()
+		tf.seenClearOverrides = append(tf.seenClearOverrides, capturedMetiClearOverride{
+			CriterionID: criterion,
+			Note:        req.Note,
+		})
+		tf.mu.Unlock()
+		status := http.StatusOK
+		var payload interface{}
+		if tf.clearOverrideResp != nil {
+			status, payload = tf.clearOverrideResp(int(n), criterion, body)
+		} else {
+			// default success: post-clear row with override_* nulled.
+			payload = api.MetiAssessment{
+				ID:             "rid",
+				ProjectID:      "p",
+				CriterionID:    criterion,
+				CriterionPhase: "env_setup",
+				Status:         "needs_review",
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if payload != nil {
+			_ = json.NewEncoder(w).Encode(payload)
+		}
 
 	case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/meti/improvement-actions"):
 		n := atomic.AddInt32(&tf.improvementsHits, 1)
@@ -814,4 +862,197 @@ func runMetiOverrideAndCapture(t *testing.T, client *api.Client, args metiOverri
 	fmt.Fprintf(out.Writer, "METI criterion %s に上書きを適用しました\n", fresh.CriterionID)
 	fmt.Fprintf(out.Writer, "  Override status: %s\n", fresh.OverrideStatus)
 	return capturedResult{err: nil}, &stdout, &stderr
+}
+
+// ---------------------------------------------------------------------------
+// meti clear-override (M3 Codex review #F36)
+// ---------------------------------------------------------------------------
+
+type metiClearOverrideArgs struct {
+	project   string
+	criterion string
+	note      string
+}
+
+// runMetiClearOverrideAndCapture mirrors runMetiClearOverride step-by-step.
+// Same pattern as runMetiOverrideAndCapture so the test does not have
+// to leak package globals between cases.
+func runMetiClearOverrideAndCapture(t *testing.T, client *api.Client, args metiClearOverrideArgs) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
+	if strings.TrimSpace(args.project) == "" {
+		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout, &stderr
+	}
+	if strings.TrimSpace(args.criterion) == "" {
+		return capturedResult{err: fmt.Errorf("--criterion は必須")}, &stdout, &stderr
+	}
+	cleanedNote := strings.TrimSpace(args.note)
+	if cleanedNote == "" {
+		return capturedResult{err: fmt.Errorf("--note は必須")}, &stdout, &stderr
+	}
+	if len(cleanedNote) > metiClearOverrideNoteMaxLen {
+		return capturedResult{err: fmt.Errorf("--note は %d 文字以内", metiClearOverrideNoteMaxLen)}, &stdout, &stderr
+	}
+	ctx := context.Background()
+	req := api.MetiClearOverrideRequest{Note: cleanedNote}
+	if err := client.ClearOverrideCriterion(ctx, args.project, args.criterion, req); err != nil {
+		return capturedResult{err: metiFailureToExitError("meti clear-override", err)}, &stdout, &stderr
+	}
+	fmt.Fprintf(out.Writer, "METI criterion %s の上書きを取り消しました\n", args.criterion)
+	fmt.Fprintf(out.Writer, "  Cleared note: %s\n", cleanedNote)
+	return capturedResult{err: nil}, &stdout, &stderr
+}
+
+// TestMetiClearOverride_HappyPath_F36 — DELETE body shape + stdout
+// confirmation. Verifies criterion + note round-trip through to the
+// captured request and that the success path returns nil error.
+func TestMetiClearOverride_HappyPath_F36(t *testing.T) {
+	tf := newMetiFakeServer(t)
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, stdout, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+		project:   "p",
+		criterion: "env_setup.policy_documented",
+		note:      "re-evaluated 2026-09-12: original override was a mis-read",
+	})
+	if res.err != nil {
+		t.Fatalf("F36: clear-override err: %v", res.err)
+	}
+	if atomic.LoadInt32(&tf.clearOverrideHits) != 1 {
+		t.Errorf("F36: clearOverrideHits = %d, want 1", tf.clearOverrideHits)
+	}
+	if len(tf.seenClearOverrides) != 1 {
+		t.Fatalf("F36: seenClearOverrides len = %d, want 1", len(tf.seenClearOverrides))
+	}
+	d := tf.seenClearOverrides[0]
+	if d.CriterionID != "env_setup.policy_documented" {
+		t.Errorf("F36: CriterionID = %q", d.CriterionID)
+	}
+	if !strings.Contains(d.Note, "re-evaluated") {
+		t.Errorf("F36: Note = %q (must round-trip operator rationale)", d.Note)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "上書きを取り消しました") {
+		t.Errorf("F36: stdout missing clear-override confirmation: %s", out)
+	}
+}
+
+// TestMetiClearOverride_404Permanent_F36 — server returns 404 when
+// there is no override to clear (or row does not exist). Permanent
+// classification: the operator's correct response is "check state",
+// not "retry blindly".
+func TestMetiClearOverride_404Permanent_F36(t *testing.T) {
+	tf := newMetiFakeServer(t)
+	tf.clearOverrideResp = func(call int, criterion string, body []byte) (int, interface{}) {
+		return http.StatusNotFound, map[string]string{"error": "meti assessment override not found"}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, _, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+		project:   "p",
+		criterion: "c1",
+		note:      "trying to clear something that is not there",
+	})
+	exitErr, ok := res.err.(*metiExitError)
+	if !ok {
+		t.Fatalf("F36: err = %v (%T), want *metiExitError", res.err, res.err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Errorf("F36: ExitCode = %d, want 3 (404 no override = permanent)", exitErr.ExitCode())
+	}
+}
+
+// TestMetiClearOverride_400NoteRejected_F36 — server's
+// validateMetiOverrideNote 400 must exit 3 (input error). The CLI
+// short-circuits empty/over-long notes locally; this test pins the
+// classification for any server-side 400 that slips through.
+func TestMetiClearOverride_400NoteRejected_F36(t *testing.T) {
+	tf := newMetiFakeServer(t)
+	tf.clearOverrideResp = func(call int, criterion string, body []byte) (int, interface{}) {
+		return http.StatusBadRequest, map[string]string{"error": "override_note is required and must be 1-4096 characters"}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, _, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+		project:   "p",
+		criterion: "c1",
+		note:      "non-empty so CLI-side validator lets it through",
+	})
+	exitErr, ok := res.err.(*metiExitError)
+	if !ok {
+		t.Fatalf("F36: err = %v (%T), want *metiExitError", res.err, res.err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Errorf("F36: ExitCode = %d, want 3 (400 note validation = permanent)", exitErr.ExitCode())
+	}
+}
+
+// TestMetiClearOverride_MissingFlags_F36 — flag validation must
+// short-circuit BEFORE the API call. Mirrors the override
+// MissingFlags table-test.
+func TestMetiClearOverride_MissingFlags_F36(t *testing.T) {
+	tf := newMetiFakeServer(t)
+	client := api.NewClient(tf.server.URL, "test-key")
+	cases := []metiClearOverrideArgs{
+		{project: "p"},                                              // no criterion / note
+		{project: "p", criterion: "c1"},                             // no note
+		{project: "p", criterion: "c1", note: ""},                   // empty note
+		{project: "p", criterion: "c1", note: "   "},                // whitespace-only note
+		{project: "p", criterion: "", note: "ok"},                   // empty criterion
+		{project: "", criterion: "c1", note: "ok"},                  // empty project
+		{project: "p", criterion: "c1", note: strings.Repeat("x", metiClearOverrideNoteMaxLen+1)}, // over cap
+	}
+	for i, args := range cases {
+		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
+			res, _, _ := runMetiClearOverrideAndCapture(t, client, args)
+			if res.err == nil {
+				t.Fatalf("F36: expected error for args %+v", args)
+			}
+		})
+	}
+	if atomic.LoadInt32(&tf.clearOverrideHits) != 0 {
+		t.Errorf("F36: validation must short-circuit BEFORE API call, clearOverrideHits = %d", tf.clearOverrideHits)
+	}
+}
+
+// TestMetiClearOverride_ForbiddenPermanent_F36 — 403 RequireWrite
+// (or audit user identity missing) must exit 3.
+func TestMetiClearOverride_ForbiddenPermanent_F36(t *testing.T) {
+	tf := newMetiFakeServer(t)
+	tf.clearOverrideResp = func(call int, criterion string, body []byte) (int, interface{}) {
+		return http.StatusForbidden, map[string]string{"error": "write permission required"}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, _, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+		project:   "p",
+		criterion: "c1",
+		note:      "ok",
+	})
+	exitErr, ok := res.err.(*metiExitError)
+	if !ok {
+		t.Fatalf("F36: err = %v (%T), want *metiExitError", res.err, res.err)
+	}
+	if exitErr.ExitCode() != 3 {
+		t.Errorf("F36: ExitCode = %d, want 3 (403 = permanent)", exitErr.ExitCode())
+	}
+}
+
+// TestMetiClearOverride_TransientExit4_500_F36 — 5xx must classify
+// transient so CI can retry the clear after a server blip.
+func TestMetiClearOverride_TransientExit4_500_F36(t *testing.T) {
+	tf := newMetiFakeServer(t)
+	tf.clearOverrideResp = func(call int, criterion string, body []byte) (int, interface{}) {
+		return http.StatusInternalServerError, map[string]string{"error": "internal"}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, _, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+		project:   "p",
+		criterion: "c1",
+		note:      "ok",
+	})
+	exitErr, ok := res.err.(*metiExitError)
+	if !ok {
+		t.Fatalf("F36: err = %v (%T), want *metiExitError", res.err, res.err)
+	}
+	if exitErr.ExitCode() != 4 {
+		t.Errorf("F36: ExitCode = %d, want 4 (500 = transient)", exitErr.ExitCode())
+	}
 }

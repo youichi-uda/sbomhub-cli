@@ -1,9 +1,10 @@
 package commands
 
 // `sbomhub meti` — METI 手引 ver 2.0 self-assessment listing, refresh,
-// and per-criterion override (M3 Wave M3-7 — sbomhub-cli issue #3).
+// per-criterion override, and override clear (M3 Wave M3-7 +
+// M3 Codex review #F36 — sbomhub-cli issue #3).
 //
-// The M3 MVP exposes three subcommands:
+// The M3 MVP exposes four subcommands:
 //
 //	sbomhub meti list --project <id> \
 //	    [--phase env_setup|sbom_creation|sbom_operation] \
@@ -15,7 +16,10 @@ package commands
 //	sbomhub meti override --project <id> --criterion <criterion_id> \
 //	    --status <status> [--note <text>] [--improvement-action <text>]
 //
-// All three flow through the same M1/M2-aligned regime — credentials
+//	sbomhub meti clear-override --project <id> --criterion <criterion_id> \
+//	    --note <text>
+//
+// All four flow through the same M1/M2-aligned regime — credentials
 // via resolveCredentials, output via GetOutputConfig, exit codes via
 // metiExitError (3=permanent, 4=transient) — so the operator gets the
 // same UX they learned from `sbomhub triage` / `sbomhub cra`.
@@ -98,6 +102,10 @@ var (
 	metiOverrideNote             string
 	metiOverrideImprovementAct   string
 	metiOverrideImprovementSet   bool // true when --improvement-action was passed on the CLI
+
+	// clear-override (M3 Codex review #F36)
+	metiClearOverrideCriterion string
+	metiClearOverrideNote      string
 )
 
 // ---------------------------------------------------------------------------
@@ -112,9 +120,10 @@ var metiCmd = &cobra.Command{
 担当者上書きを行うコマンド群です (M3 MVP)。
 
 Subcommands:
-  list      プロジェクトの自己評価行を一覧 (phase / status / 上書き有無で絞り込み)
-  refresh   evaluator を再実行して全 27 項目を Upsert (上書きは保持)
-  override  指定 criterion に担当者上書きを適用 (audit log に記録)
+  list            プロジェクトの自己評価行を一覧 (phase / status / 上書き有無で絞り込み)
+  refresh         evaluator を再実行して全 27 項目を Upsert (上書きは保持)
+  override        指定 criterion に担当者上書きを適用 (audit log に記録)
+  clear-override  指定 criterion の担当者上書きを取り消し (audit log に記録)
 
 使用例 / Examples:
   sbomhub meti list --project my-device
@@ -124,6 +133,9 @@ Subcommands:
   sbomhub meti override --project my-device \
       --criterion env_setup.policy_documented --status achieved \
       --note "verified by Tanaka 2026-09-10"
+  sbomhub meti clear-override --project my-device \
+      --criterion env_setup.policy_documented \
+      --note "re-evaluated 2026-09-12: original override was a mis-read"
 
 詳細は各 subcommand の --help を参照してください。
 See each subcommand's --help for the full flag set.`,
@@ -177,7 +189,7 @@ audit log (action=meti_assessment_overridden) も同 tx で書き込まれます
 
 書込権限 (write role) が必要です。 既に上書き済の行に対しては
 409 (state-machine guard) で reject されます — 上書きを差し替えたい
-場合はサーバ側の clear-override path (M4 予定) を待ってください。
+場合は先に ` + "`sbomhub meti clear-override`" + ` で既存の上書きを取り消してください。
 
 使用例:
   sbomhub meti override --project my-device \
@@ -192,11 +204,41 @@ Exit codes:
 	RunE: runMetiOverride,
 }
 
+var metiClearOverrideCmd = &cobra.Command{
+	Use:   "clear-override",
+	Short: "担当者上書きを取り消す / Clear an operator override on one criterion",
+	Long: `指定された criterion に既に適用済の担当者上書きを取り消します
+(M3 Codex review #F36 — 誤った上書きを修正するための公式 CLI 経路)。
+内部では DELETE /api/v1/projects/:id/meti/assessment/:criterion_id/override
+を呼び、 audit log (action=meti_assessment_override_cleared) も同 tx で
+書き込まれます。 取り消し理由メモ (--note) は 1-4096 文字必須で、
+監査トレースのため audit_logs.details に保存されます (F33/F34)。
+
+取り消し後は evaluator の verdict が再び有効になり、 必要であれば
+` + "`sbomhub meti override`" + ` で新しい上書きを適用できます。
+
+書込権限 (write role) と user identity (audit row tying) が必要です。
+上書きが存在しない (or 行自体が存在しない) 場合は 404 を返します。
+
+使用例:
+  sbomhub meti clear-override --project my-device \
+      --criterion env_setup.policy_documented \
+      --note "re-evaluated 2026-09-12: original override was a mis-read"
+
+Exit codes:
+  0  正常終了 / success
+  3  恒久エラー / permanent (400/401/403/404/409 — fix input, nothing to clear,
+     or TOCTOU race: reload state with ` + "`meti list`" + ` and re-decide)
+  4  一時エラー / transient (429/5xx — retry recommended)`,
+	RunE: runMetiClearOverride,
+}
+
 func init() {
 	rootCmd.AddCommand(metiCmd)
 	metiCmd.AddCommand(metiListCmd)
 	metiCmd.AddCommand(metiRefreshCmd)
 	metiCmd.AddCommand(metiOverrideCmd)
+	metiCmd.AddCommand(metiClearOverrideCmd)
 
 	// shared --project flag — duplicated on each subcommand rather than
 	// a persistent flag on metiCmd because cobra persistent flags
@@ -204,6 +246,7 @@ func init() {
 	metiListCmd.Flags().StringVarP(&metiProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
 	metiRefreshCmd.Flags().StringVarP(&metiProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
 	metiOverrideCmd.Flags().StringVarP(&metiProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
+	metiClearOverrideCmd.Flags().StringVarP(&metiProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
 
 	// list
 	metiListCmd.Flags().StringVar(&metiListPhase, "phase", "", "phase で絞り込み / filter by phase (env_setup|sbom_creation|sbom_operation)")
@@ -216,6 +259,10 @@ func init() {
 	metiOverrideCmd.Flags().StringVar(&metiOverrideStatus, "status", "", "上書き後 status / override status (achieved|not_achieved|needs_review|not_applicable)")
 	metiOverrideCmd.Flags().StringVar(&metiOverrideNote, "note", "", "上書き理由メモ (audit log に保存) / override note (persisted to audit log)")
 	metiOverrideCmd.Flags().StringVar(&metiOverrideImprovementAct, "improvement-action", "", "改善アクション (省略時は変更しない) / improvement action plan (omit to preserve existing)")
+
+	// clear-override
+	metiClearOverrideCmd.Flags().StringVar(&metiClearOverrideCriterion, "criterion", "", "対象 criterion ID (catalog 由来) / criterion id from the catalog")
+	metiClearOverrideCmd.Flags().StringVar(&metiClearOverrideNote, "note", "", "取り消し理由メモ (1-4096 文字必須, audit log に保存) / clear note (1-4096 chars, persisted to audit log)")
 }
 
 // ---------------------------------------------------------------------------
@@ -443,6 +490,67 @@ func runMetiOverride(cmd *cobra.Command, args []string) error {
 	if fresh.ImprovementAction != "" {
 		fmt.Fprintf(w, "  Improvement       : %s\n", fresh.ImprovementAction)
 	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// meti clear-override (M3 Codex review #F36)
+// ---------------------------------------------------------------------------
+
+// metiClearOverrideNoteMaxLen mirrors the server-side cap in
+// validateMetiOverrideNote (handler/meti.go: MaxMetiOverrideNoteLen).
+// Early validation in the CLI surfaces a friendlier error than a 400
+// round-trip and matches the F34 contract.
+const metiClearOverrideNoteMaxLen = 4096
+
+func runMetiClearOverride(cmd *cobra.Command, args []string) error {
+	out := GetOutputConfig()
+	if strings.TrimSpace(metiProject) == "" {
+		return fmt.Errorf("--project は必須です / --project is required")
+	}
+	if strings.TrimSpace(metiClearOverrideCriterion) == "" {
+		return fmt.Errorf("--criterion は必須です / --criterion is required")
+	}
+	cleanedNote := strings.TrimSpace(metiClearOverrideNote)
+	if cleanedNote == "" {
+		return fmt.Errorf("--note は必須です / --note is required (operator's rationale, persisted to audit log)")
+	}
+	if len(cleanedNote) > metiClearOverrideNoteMaxLen {
+		return fmt.Errorf("--note は %d 文字以内で指定してください (got %d) / --note must be at most %d characters (got %d)",
+			metiClearOverrideNoteMaxLen, len(cleanedNote), metiClearOverrideNoteMaxLen, len(cleanedNote))
+	}
+	client, err := loadConfigAndClient()
+	if err != nil {
+		return err
+	}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	req := api.MetiClearOverrideRequest{Note: cleanedNote}
+	if err := client.ClearOverrideCriterion(ctx, metiProject, metiClearOverrideCriterion, req); err != nil {
+		return metiFailureToExitError("meti clear-override", err)
+	}
+
+	if out.IsJSON() {
+		return out.PrintJSON(map[string]interface{}{
+			"cleared":      true,
+			"project_id":   metiProject,
+			"criterion_id": metiClearOverrideCriterion,
+			"note":         cleanedNote,
+		})
+	}
+
+	w := out.humanWriter()
+	fmt.Fprintf(w, "METI criterion %s の上書きを取り消しました\n", metiClearOverrideCriterion)
+	fmt.Fprintf(w, "  Project           : %s\n", metiProject)
+	fmt.Fprintf(w, "  Cleared note      : %s\n", cleanedNote)
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "次のステップ / Next steps:")
+	fmt.Fprintf(w, "  - sbomhub meti list --project %s --has-override   # 取り消し結果を確認\n", metiProject)
+	fmt.Fprintf(w, "  - sbomhub meti override --project %s --criterion %s --status <status> --note <text>  # 必要なら新しい上書きを適用\n",
+		metiProject, metiClearOverrideCriterion)
 	return nil
 }
 
