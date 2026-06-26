@@ -27,7 +27,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -480,6 +483,173 @@ func TestResolveEvalSetPath_Missing(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "eval-set") {
 		t.Errorf("error should mention eval-set: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F46 — subprocess exit-code propagation
+//
+// M4 Codex review round 2 finding: the bench wrapper used to fold
+// any non-zero subprocess exit into a fixed code=3, which destroyed
+// the M4-3 F42 typed contract (2 usage / 3 config / 4 no providers /
+// 5 execution failure). The fix wires `mapBenchSubprocessError` to
+// pass these codes through verbatim so CI can distinguish "no
+// providers configured" (4 → fix BYOK env) from "execution failure"
+// (5 → likely transient / retry).
+//
+// We exercise the helper directly with synthetic *exec.ExitError
+// values produced by `sh -c "exit N"` — that gives us a real
+// runtime *exec.ExitError without needing a populated sbomhub OSS
+// checkout in the test fixture. Skipped on Windows where /bin/sh
+// is not guaranteed (other M4 tests follow the same convention).
+// ---------------------------------------------------------------------------
+
+// runShExit launches `sh -c "exit N"` and returns the resulting
+// error from cmd.Run(). The returned error is always a real
+// *exec.ExitError with ExitCode() == N (per POSIX shell semantics),
+// which is exactly what the M4-3 bench subprocess would produce.
+//
+// We intentionally spawn a real subprocess (rather than fabricate
+// a synthetic *exec.ExitError) so the test exercises the same
+// errors.As path the production code hits — fakes have repeatedly
+// drifted from real os/exec semantics in past Codex reviews.
+func runShExit(t *testing.T, code int) error {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("F46 propagation test requires POSIX sh")
+	}
+	cmd := exec.Command("sh", "-c", "exit "+strconv.Itoa(code))
+	err := cmd.Run()
+	if err == nil {
+		t.Fatalf("sh -c 'exit %d' returned nil error", code)
+	}
+	return err
+}
+
+// TestRunLLMBench_ExitCodePropagation_F46 — `mapBenchSubprocessError`
+// must forward subprocess exit codes 2/3/4/5 verbatim into the
+// llmExitError envelope so CI pipelines can branch on the M4-3 F42
+// typed contract.
+func TestRunLLMBench_ExitCodePropagation_F46(t *testing.T) {
+	cases := []struct {
+		name     string
+		subExit  int
+		wantCode int
+		wantMsg  string
+	}{
+		{"M4-3 usage (2)", 2, 2, "exited with code 2"},
+		{"M4-3 config (3)", 3, 3, "exited with code 3"},
+		{"M4-3 no providers (4)", 4, 4, "exited with code 4"},
+		{"M4-3 execution failure (5)", 5, 5, "exited with code 5"},
+		// M4-3 might widen the contract in the future; a 6 should
+		// still flow through transparently rather than be silently
+		// remapped to 3. Guards against a future regression where
+		// someone re-introduces the "fold to 3" anti-pattern.
+		{"future M4-3 code (6)", 6, 6, "exited with code 6"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runErr := runShExit(t, tc.subExit)
+			got := mapBenchSubprocessError(runErr)
+			if got == nil {
+				t.Fatal("F46: mapBenchSubprocessError returned nil for non-nil run error")
+			}
+			if got.ExitCode() != tc.wantCode {
+				t.Errorf("F46: ExitCode = %d, want %d (M4-3 typed contract must pass through verbatim, not collapse to 3)",
+					got.ExitCode(), tc.wantCode)
+			}
+			if !strings.Contains(got.Error(), tc.wantMsg) {
+				t.Errorf("F46: error message %q missing %q (operator needs the underlying code surfaced)",
+					got.Error(), tc.wantMsg)
+			}
+			// The wrapper must also point operators at the M4-3
+			// doc so they can interpret the forwarded code.
+			if !strings.Contains(got.Error(), "M4-3") {
+				t.Errorf("F46: error message should reference the M4-3 doc, got %q", got.Error())
+			}
+		})
+	}
+}
+
+// TestMapBenchSubprocessError_LaunchFailure_F46 — a non-ExitError
+// (e.g. `go` binary missing → exec.ErrNotFound wrapped in
+// PathError) must still surface as a permanent exit-3 because the
+// operator's fix is environmental ("install Go") not retryable.
+func TestMapBenchSubprocessError_LaunchFailure_F46(t *testing.T) {
+	// Synthesise a launch failure by running a path that cannot
+	// possibly exist — exec.Cmd.Run reports this as a non-
+	// *exec.ExitError (typically *fs.PathError) so the helper's
+	// fallback branch fires.
+	cmd := exec.Command(filepath.Join(t.TempDir(), "definitely-not-a-binary"))
+	runErr := cmd.Run()
+	if runErr == nil {
+		t.Fatal("expected launch failure for non-existent binary")
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		t.Skipf("platform reports launch failure as *exec.ExitError, helper test N/A here: %v", runErr)
+	}
+	got := mapBenchSubprocessError(runErr)
+	if got == nil {
+		t.Fatal("F46: mapBenchSubprocessError returned nil for launch failure")
+	}
+	if got.ExitCode() != 3 {
+		t.Errorf("F46: launch-failure ExitCode = %d, want 3 (permanent — fix env)", got.ExitCode())
+	}
+	if !strings.Contains(got.Error(), "起動失敗") {
+		t.Errorf("F46: launch-failure message should mention 起動失敗, got %q", got.Error())
+	}
+}
+
+// TestMapBenchSubprocessError_NilPassthrough_F46 — a nil runErr
+// must return a nil envelope (no spurious exit-1 noise when the
+// subprocess succeeded).
+func TestMapBenchSubprocessError_NilPassthrough_F46(t *testing.T) {
+	if got := mapBenchSubprocessError(nil); got != nil {
+		t.Errorf("F46: mapBenchSubprocessError(nil) = %v, want nil", got)
+	}
+}
+
+// TestMapBenchSubprocessError_SignalKilled_F46 — a subprocess
+// killed by signal (ExitCode() == -1) maps to exit-4 (transient-
+// leaning) per the documented ※要確認 in llm.go. We simulate this
+// by spawning sh, letting it sleep, then killing the process; the
+// ProcessState.ExitCode() returns -1 because no clean exit
+// happened.
+func TestMapBenchSubprocessError_SignalKilled_F46(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("F46 signal-kill test requires POSIX kill semantics")
+	}
+	cmd := exec.Command("sh", "-c", "sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatalf("kill sleep: %v", err)
+	}
+	runErr := cmd.Wait()
+	if runErr == nil {
+		t.Fatal("expected non-nil error after kill")
+	}
+	got := mapBenchSubprocessError(runErr)
+	if got == nil {
+		t.Fatal("F46: mapBenchSubprocessError returned nil for signal-killed subprocess")
+	}
+	// Some platforms encode signal kills with a normal positive
+	// exit code via sh's reporting layer (128 + signo). On those
+	// platforms ExitCode() >= 0 and we forward verbatim per the
+	// M4-3 contract path — that is acceptable behaviour (the
+	// operator sees the underlying number). Only assert the
+	// negative-code branch when we actually hit it.
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) && exitErr.ExitCode() < 0 {
+		if got.ExitCode() != 4 {
+			t.Errorf("F46: signal-killed (ExitCode=-1) maps to %d, want 4 (transient-leaning default)",
+				got.ExitCode())
+		}
+		if !strings.Contains(got.Error(), "signal") {
+			t.Errorf("F46: signal-killed message should mention signal, got %q", got.Error())
+		}
 	}
 }
 

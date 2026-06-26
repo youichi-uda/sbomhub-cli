@@ -69,14 +69,34 @@ package commands
 //     non-source operators cannot use the bench subcommand. The
 //     --help text and the missing-source error message both call
 //     this out explicitly.
-//   - M4-3 (apps/api/cmd/llm-bench/main.go) exits 0 on success and
-//     1 on any failure (eval-set load fail / no providers
-//     available / I/O errors). The wrapper folds non-zero exits
-//     into our exit-3 (permanent) bucket because every M4-3
-//     failure mode is operator-actionable config (set provider
-//     env, fix eval-set path) rather than a transient outage.
+//   - M4-3 (apps/api/cmd/llm-bench/main.go) emits a *typed* exit-code
+//     contract after F42:
+//       0 success
+//       2 usage / flag validation
+//       3 fixture / config validation
+//       4 no providers available
+//       5 execution / output failure
+//     M4 Codex review #F46 fix: the wrapper now propagates these
+//     codes verbatim (option (a) — transparent pass-through) so CI
+//     pipelines can distinguish "no providers configured" (4 → fix
+//     BYOK env) from "execution failure" (5 → likely transient /
+//     retry candidate). The trade-off vs option (c) hybrid (compress
+//     2/3/4 → 3 and 5 → 4) is that exit code 4 then has two meanings
+//     depending on which sbomhub-cli subcommand emitted it:
+//     `triage`/`cra`/`meti`/`llm test` use 4 = transient HTTP, while
+//     `llm bench` uses 4 = "no providers configured" by reflecting
+//     the M4-3 contract. We accept that overload because the
+//     stderr/wrapper message names the M4-3 code explicitly and CI
+//     pipelines already branch on (subcommand, exit-code) pairs.
+//     ※要確認: if downstream automation assumes a single global
+//     permanent=3/transient=4 split across every subcommand, switch
+//     to option (c) and document the loss of "no providers" vs
+//     "execution failure" granularity.
+//     Signal-killed subprocesses (ExitCode == -1) map to 4 as a
+//     transient-leaning default — the operator's correct response
+//     is usually retry (CTRL-C / OOM kill / parent timeout).
 //     Network errors raised while LAUNCHING the binary
-//     (ENOENT on `go`) map to exit-3 too — "install Go" is also a
+//     (ENOENT on `go`) map to exit-3 because "install Go" is a
 //     permanent fix.
 
 import (
@@ -247,12 +267,21 @@ llm-bench) を実行し、 managed AI と local LLM (Ollama) の VEX-triage
   sbomhub llm bench --providers ollama,gemini --markdown
   sbomhub llm bench --sbomhub-source ../sbomhub --max-cases 10 --out result.jsonl
 
-Exit codes:
+Exit codes (wrapper preflight + M4-3 F42 typed pass-through):
   0  正常終了 / success
-  3  恒久エラー / permanent (sbomhub source 不在 / eval-set 不在 /
-     provider env 未設定 / Go toolchain 不在 — fix the surfaced cause)
-  4  一時エラー / transient (network blip while talking to a provider
-     — retry recommended)`,
+  2  usage / flag validation failure (forwarded from M4-3)
+  3  恒久エラー / permanent — wrapper preflight (sbomhub source 不在 /
+     eval-set 不在 / Go toolchain 不在 / launch failure) もしくは
+     M4-3 の fixture / config validation
+  4  no providers configured (forwarded from M4-3 — set BYOK env or
+     drop the missing provider from --providers) — または wrapper
+     subprocess の signal-killed / abnormal termination
+  5  execution / output failure (forwarded from M4-3 — likely
+     transient provider outage、 retry recommended)
+
+M4 Codex review #F46: codes 2/3/4/5 are forwarded verbatim from the
+M4-3 bench binary so CI pipelines can distinguish "no providers
+configured" (4) from "provider execution failure" (5).`,
 	RunE: runLLMBench,
 }
 
@@ -568,30 +597,70 @@ func runLLMBench(cmd *cobra.Command, args []string) error {
 	execCmd.Env = os.Environ()
 
 	if runErr := execCmd.Run(); runErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			// M4-3 exits 0=success / 1=failure (all surfaces). The
-			// failure modes (eval-set load fail / no providers
-			// configured / I/O error) are all operator-actionable
-			// config issues, so we map to exit-3 (permanent). A
-			// dedicated transient mapping would require M4-3 to
-			// emit a richer exit code surface; until then we err
-			// on "do not silently mask the failure as retryable".
-			return &llmExitError{
-				code: 3,
-				msg: fmt.Sprintf("llm bench 失敗 (exit=%d) — stderr の M4-3 メッセージで原因を確認してください",
-					exitErr.ExitCode()),
-			}
-		}
-		// Non-ExitError = launch failure (file not found, signal
-		// during spawn). Permanent — operator must fix env.
-		return &llmExitError{
-			code: 3,
-			msg:  fmt.Sprintf("llm bench 起動失敗: %v", runErr),
-		}
+		return mapBenchSubprocessError(runErr)
 	}
 
 	return nil
+}
+
+// mapBenchSubprocessError translates the error returned by
+// execCmd.Run() into the llmExitError envelope that main.go's
+// exitCoder hook will surface to the OS.
+//
+// M4 Codex review #F46 fix — option (a) transparent pass-through:
+// for *exec.ExitError we forward the M4-3 typed contract code
+// (2 usage / 3 config / 4 no providers / 5 execution) verbatim so
+// CI can branch on the underlying cause. Negative exit codes
+// (signal-killed / aborted before exit) map to 4 (retryable
+// default). Non-ExitError values (launch failure — `go` binary
+// missing, fork failure) map to 3 because the operator must fix
+// the local environment before re-running.
+//
+// Factored out of runLLMBench so unit tests can drive synthetic
+// *exec.ExitError values (sh -c "exit N") without a populated
+// sbomhub OSS checkout.
+func mapBenchSubprocessError(runErr error) *llmExitError {
+	if runErr == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		subExit := exitErr.ExitCode()
+		if subExit < 0 {
+			// Signal-killed or aborted before producing a typed
+			// exit code (CTRL-C, OOM, parent context cancel). The
+			// operator's usual next step is "retry", so we default
+			// to 4 (transient-leaning) rather than 3 (permanent).
+			// ※要確認: signal=SIGKILL by OOM-killer is arguably
+			// permanent (operator must add RAM); we still pick 4
+			// because the M1/F21 convention treats "no typed exit
+			// code" as transient and operators have learned that
+			// mapping.
+			return &llmExitError{
+				code: 4,
+				msg: fmt.Sprintf("llm bench abnormally terminated (signal / no exit code): %v",
+					runErr),
+			}
+		}
+		// Forward M4-3 (sbomhub apps/api/cmd/llm-bench) F42 typed
+		// contract verbatim: 2=usage / 3=config / 4=no providers /
+		// 5=execution. The wrapper does not re-interpret these
+		// codes — see the file-header ※要確認 for the option
+		// (a) vs (c) trade-off rationale.
+		return &llmExitError{
+			code: subExit,
+			msg: fmt.Sprintf("llm bench exited with code %d — see sbomhub M4-3 doc "+
+				"(apps/api/cmd/llm-bench) for the typed exit-code contract "+
+				"(2=usage / 3=config / 4=no providers / 5=execution failure)",
+				subExit),
+		}
+	}
+	// Non-ExitError = launch failure (file not found, fork
+	// failure). Permanent — operator must fix env.
+	return &llmExitError{
+		code: 3,
+		msg:  fmt.Sprintf("llm bench 起動失敗: %v", runErr),
+	}
 }
 
 // resolveSbomhubSource picks the source directory using the
