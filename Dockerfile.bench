@@ -14,7 +14,22 @@
 #
 # `sbomhub llm test` and every other subcommand work on the default
 # slim image; only `llm bench` needs this variant.
-FROM golang:1.22-alpine
+#
+# M4 Codex review #F56: bumped from golang:1.22-alpine to
+# golang:1.25-alpine to match the sbomhub OSS source's go.mod (apps/api
+# requires `go 1.25.0`). The previous 1.22 base ran the wrapper fine
+# (the CLI itself only needs 1.22+) but `sbomhub llm bench` shells out
+# to `go run ./cmd/llm-bench` inside the operator's sbomhub checkout,
+# and that subprocess refuses to start with:
+#   go: go.mod requires go >= 1.25.0 (running go 1.22.12; GOTOOLCHAIN=local)
+# Alpine images set GOTOOLCHAIN=local so the in-tree 1.22 toolchain
+# does not auto-download 1.25, which made the bench-variant image's
+# core workflow unrunnable. Bumping the base is the simplest fix —
+# `GOTOOLCHAIN=auto` would force a multi-hundred-MB toolchain download
+# on first run, which is worse than baking 1.25 in. ※要確認: when
+# sbomhub apps/api's go.mod is bumped again (1.26, 1.27, ...) this
+# base tag must move in lockstep.
+FROM golang:1.25-alpine
 
 WORKDIR /app
 
