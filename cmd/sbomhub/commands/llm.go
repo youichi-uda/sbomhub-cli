@@ -98,8 +98,19 @@ package commands
 //     Network errors raised while LAUNCHING the binary
 //     (ENOENT on `go`) map to exit-3 because "install Go" is a
 //     permanent fix.
+//     M4 Codex review #F57 (round 5): codes OUTSIDE the 2/3/4/5
+//     band (in particular exit 1, which `go run` itself emits on
+//     a toolchain mismatch — the bench binary never started, so
+//     no F42 code is meaningful) are renormalised to exit 3 by
+//     mapBenchSubprocessError + the captured-stderr tee in
+//     runLLMBench so the documented `llm bench` contract
+//     (0/2/3/4/5) is never silently widened. The captured tail
+//     of `go run`'s stderr is embedded in the error message so
+//     operators do not have to re-run to learn which toolchain
+//     mismatch or compile error triggered the failure.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -271,8 +282,10 @@ Exit codes (wrapper preflight + M4-3 F42 typed pass-through):
   0  正常終了 / success
   2  usage / flag validation failure (forwarded from M4-3)
   3  恒久エラー / permanent — wrapper preflight (sbomhub source 不在 /
-     eval-set 不在 / Go toolchain 不在 / launch failure) もしくは
-     M4-3 の fixture / config validation
+     eval-set 不在 / Go toolchain 不在 / launch failure)、
+     M4-3 の fixture / config validation、 もしくは ` + "`go run`" + ` 自体の
+     launch/compile failure (toolchain mismatch 等で bench binary
+     が起動しなかった場合は exit 1 ではなく exit 3 に正規化、 F57)
   4  no providers configured (forwarded from M4-3 — set BYOK env or
      drop the missing provider from --providers) — または wrapper
      subprocess の signal-killed / abnormal termination
@@ -281,7 +294,11 @@ Exit codes (wrapper preflight + M4-3 F42 typed pass-through):
 
 M4 Codex review #F46: codes 2/3/4/5 are forwarded verbatim from the
 M4-3 bench binary so CI pipelines can distinguish "no providers
-configured" (4) from "provider execution failure" (5).`,
+configured" (4) from "provider execution failure" (5).
+M4 Codex review #F57: codes OUTSIDE 2/3/4/5 (most commonly exit 1
+from a Go toolchain mismatch) are renormalised to exit 3 so the
+documented contract (0/2/3/4/5) is never silently widened; the
+captured ` + "`go run`" + ` stderr is quoted in the wrapper's error message.`,
 	RunE: runLLMBench,
 }
 
@@ -585,11 +602,24 @@ func runLLMBench(cmd *cobra.Command, args []string) error {
 	// Wire stdout / stderr straight through. JSONL lands on stdout
 	// (M4-3 default) so jq pipelines keep working; markdown +
 	// per-case slog warnings land on stderr.
+	//
+	// M4 Codex review #F57: tee stderr into a bounded buffer so the
+	// wrapper can quote the underlying `go run` / `go build` /
+	// compile-error message when the subprocess exits with a code
+	// OUTSIDE the M4-3 typed contract (e.g. exit 1 from a Go
+	// toolchain mismatch — the bench binary never started). Without
+	// this tee, operators saw "bench launch/compile failure: exit=1"
+	// with no further context and had to re-run manually to learn
+	// what `go run` actually complained about. The cap is kept small
+	// (mapBenchStderrCaptureLimit) so a runaway slog stream cannot
+	// inflate CLI memory; on-screen output is unaffected because we
+	// keep streaming through io.MultiWriter.
 	execCmd := exec.CommandContext(ctx, "go", goArgs...)
 	execCmd.Dir = workDir
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = out.Writer
-	execCmd.Stderr = out.ErrWriter
+	stderrCap := &cappedBuffer{limit: mapBenchStderrCaptureLimit}
+	execCmd.Stderr = io.MultiWriter(out.ErrWriter, stderrCap)
 
 	// Pass through any provider BYOK env vars the operator already
 	// exported. We do NOT redact / filter — the M4-3 binary is what
@@ -597,10 +627,66 @@ func runLLMBench(cmd *cobra.Command, args []string) error {
 	execCmd.Env = os.Environ()
 
 	if runErr := execCmd.Run(); runErr != nil {
-		return mapBenchSubprocessError(runErr)
+		return mapBenchSubprocessError(runErr, stderrCap.Bytes())
 	}
 
 	return nil
+}
+
+// mapBenchStderrCaptureLimit caps how much subprocess stderr we
+// retain for the F57 contract-violation error message. 8 KiB is
+// enough to fit a typical Go toolchain error
+// ("go: go.mod requires go >= 1.25.0 (running go 1.22.12; ...)")
+// + several frames of compile-error context, while keeping CLI
+// memory bounded even under a runaway slog burst.
+const mapBenchStderrCaptureLimit = 8 * 1024
+
+// mapBenchM4ContractMin / mapBenchM4ContractMax bracket the M4-3
+// F42 typed exit-code contract surface (2/3/4/5 inclusive). Codes
+// inside this band are forwarded verbatim per F46; codes OUTSIDE
+// (notably exit 1 from a `go run` toolchain mismatch — the bench
+// binary never started, so no F42 code is meaningful) are
+// re-normalised to exit 3 by F57 with the captured stderr quoted
+// in the error message so operators do not have to re-run to learn
+// what `go run` complained about.
+const (
+	mapBenchM4ContractMin = 2
+	mapBenchM4ContractMax = 5
+)
+
+// cappedBuffer is an io.Writer that retains at most `limit` bytes,
+// silently discarding the tail. Used to give mapBenchSubprocessError
+// the recent stderr context without exposing the CLI to memory
+// inflation if the subprocess emits an unbounded slog stream
+// before failing.
+type cappedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+// Write implements io.Writer. Once `limit` bytes are buffered any
+// further writes are dropped — the operator-visible stream is the
+// MultiWriter sibling (the OutputConfig.ErrWriter), so this buffer
+// only exists to be quoted on subprocess failure.
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	remaining := c.limit - c.buf.Len()
+	if remaining <= 0 {
+		return len(p), nil
+	}
+	if len(p) > remaining {
+		c.buf.Write(p[:remaining])
+		return len(p), nil
+	}
+	c.buf.Write(p)
+	return len(p), nil
+}
+
+// Bytes returns the captured slice. Safe to call after the
+// underlying subprocess has exited; the returned slice is not
+// mutated by subsequent Write calls (because writes after the cap
+// is reached are dropped).
+func (c *cappedBuffer) Bytes() []byte {
+	return c.buf.Bytes()
 }
 
 // mapBenchSubprocessError translates the error returned by
@@ -616,10 +702,26 @@ func runLLMBench(cmd *cobra.Command, args []string) error {
 // missing, fork failure) map to 3 because the operator must fix
 // the local environment before re-running.
 //
+// M4 Codex review #F57 fix — contract-band normalisation: exit
+// codes OUTSIDE the documented M4-3 surface (notably exit 1, which
+// `go run` emits for toolchain mismatch / compile errors — the
+// bench binary never started, so no F42 code is meaningful) are
+// re-mapped to exit 3 with the captured stderr quoted into the
+// error message. Pre-F57 the wrapper forwarded the bare code
+// verbatim, which silently widened the documented `llm bench`
+// contract (README + --help promise 0/2/3/4/5) and meant CI
+// pipelines branching on the contract could not distinguish
+// "bench launch failure" from a future M4-3 widening — exit 1
+// would just leak through as an undocumented code with no hint
+// at the cause. The bytes captured by runLLMBench's
+// io.MultiWriter tee are quoted (truncated to fit) so operators
+// see the underlying `go run` complaint directly.
+//
 // Factored out of runLLMBench so unit tests can drive synthetic
 // *exec.ExitError values (sh -c "exit N") without a populated
-// sbomhub OSS checkout.
-func mapBenchSubprocessError(runErr error) *llmExitError {
+// sbomhub OSS checkout. stderrTail may be nil for tests that do
+// not exercise the F57 path.
+func mapBenchSubprocessError(runErr error, stderrTail []byte) *llmExitError {
 	if runErr == nil {
 		return nil
 	}
@@ -642,6 +744,28 @@ func mapBenchSubprocessError(runErr error) *llmExitError {
 					runErr),
 			}
 		}
+		// M4 Codex review #F57: only forward codes inside the
+		// documented M4-3 typed contract band. Codes outside (most
+		// commonly exit 1 from `go run` toolchain mismatch — see
+		// F56 — or a future Go release that introduces a new
+		// non-contract exit) are renormalised to exit 3 (permanent
+		// — operator must fix env) and quote the captured stderr so
+		// the underlying `go run` complaint reaches the operator
+		// without a second run. Without this clamp, exit 1 leaked
+		// through as an undocumented code that CI pipelines
+		// branching on the published 0/2/3/4/5 contract could not
+		// route correctly.
+		if subExit < mapBenchM4ContractMin || subExit > mapBenchM4ContractMax {
+			snippet := summariseStderrTail(stderrTail)
+			msg := fmt.Sprintf(
+				"llm bench launch/compile failure: subprocess exited %d (outside the documented M4-3 contract %d-%d). "+
+					"This usually means `go run` itself failed (toolchain mismatch / compile error) and the bench binary never started.",
+				subExit, mapBenchM4ContractMin, mapBenchM4ContractMax)
+			if snippet != "" {
+				msg += "\n  stderr (truncated):\n" + snippet
+			}
+			return &llmExitError{code: 3, msg: msg}
+		}
 		// Forward M4-3 (sbomhub apps/api/cmd/llm-bench) F42 typed
 		// contract verbatim: 2=usage / 3=config / 4=no providers /
 		// 5=execution. The wrapper does not re-interpret these
@@ -661,6 +785,25 @@ func mapBenchSubprocessError(runErr error) *llmExitError {
 		code: 3,
 		msg:  fmt.Sprintf("llm bench 起動失敗: %v", runErr),
 	}
+}
+
+// summariseStderrTail trims a captured stderr slice for inclusion
+// in the F57 error message. Returns an empty string when there's
+// nothing useful (e.g. tests that did not tee anything in) so the
+// message stays clean. Indents every line so the embedded snippet
+// is visually distinct from the surrounding wrapper text.
+func summariseStderrTail(tail []byte) string {
+	trimmed := strings.TrimSpace(string(tail))
+	if trimmed == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(trimmed, "\n") {
+		b.WriteString("    ")
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 // resolveSbomhubSource picks the source directory using the

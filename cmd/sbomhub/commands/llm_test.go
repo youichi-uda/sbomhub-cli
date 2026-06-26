@@ -529,7 +529,10 @@ func runShExit(t *testing.T, code int) error {
 // TestRunLLMBench_ExitCodePropagation_F46 — `mapBenchSubprocessError`
 // must forward subprocess exit codes 2/3/4/5 verbatim into the
 // llmExitError envelope so CI pipelines can branch on the M4-3 F42
-// typed contract.
+// typed contract. Codes OUTSIDE that band (notably exit 1 from a
+// `go run` toolchain mismatch) are renormalised by F57 — that
+// behaviour is covered in TestMapBenchSubprocessError_ContractExitNormalization_F57
+// below.
 func TestRunLLMBench_ExitCodePropagation_F46(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -541,16 +544,11 @@ func TestRunLLMBench_ExitCodePropagation_F46(t *testing.T) {
 		{"M4-3 config (3)", 3, 3, "exited with code 3"},
 		{"M4-3 no providers (4)", 4, 4, "exited with code 4"},
 		{"M4-3 execution failure (5)", 5, 5, "exited with code 5"},
-		// M4-3 might widen the contract in the future; a 6 should
-		// still flow through transparently rather than be silently
-		// remapped to 3. Guards against a future regression where
-		// someone re-introduces the "fold to 3" anti-pattern.
-		{"future M4-3 code (6)", 6, 6, "exited with code 6"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			runErr := runShExit(t, tc.subExit)
-			got := mapBenchSubprocessError(runErr)
+			got := mapBenchSubprocessError(runErr, nil)
 			if got == nil {
 				t.Fatal("F46: mapBenchSubprocessError returned nil for non-nil run error")
 			}
@@ -589,7 +587,7 @@ func TestMapBenchSubprocessError_LaunchFailure_F46(t *testing.T) {
 	if errors.As(runErr, &exitErr) {
 		t.Skipf("platform reports launch failure as *exec.ExitError, helper test N/A here: %v", runErr)
 	}
-	got := mapBenchSubprocessError(runErr)
+	got := mapBenchSubprocessError(runErr, nil)
 	if got == nil {
 		t.Fatal("F46: mapBenchSubprocessError returned nil for launch failure")
 	}
@@ -605,8 +603,146 @@ func TestMapBenchSubprocessError_LaunchFailure_F46(t *testing.T) {
 // must return a nil envelope (no spurious exit-1 noise when the
 // subprocess succeeded).
 func TestMapBenchSubprocessError_NilPassthrough_F46(t *testing.T) {
-	if got := mapBenchSubprocessError(nil); got != nil {
+	if got := mapBenchSubprocessError(nil, nil); got != nil {
 		t.Errorf("F46: mapBenchSubprocessError(nil) = %v, want nil", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// F57 — contract-band normalisation
+//
+// M4 Codex review round 5 finding: the F46 pass-through forwarded
+// ANY subprocess exit code verbatim, including codes outside the
+// documented M4-3 0/2/3/4/5 contract. In particular exit 1 from
+// `go run` itself (toolchain mismatch / compile error — the bench
+// binary never started, so no F42 code is meaningful) leaked
+// through as an undocumented code that CI pipelines branching on
+// the published contract could not route. The fix re-normalises
+// any non-contract code to exit 3 (permanent — operator must fix
+// env) and quotes the captured `go run` stderr in the error
+// message so operators do not have to re-run to diagnose.
+// ---------------------------------------------------------------------------
+
+// TestMapBenchSubprocessError_ContractExitNormalization_F57 — exit
+// codes outside the documented M4-3 band (1 / 6 / 42 / 127, etc.)
+// must be renormalised to exit 3, preserving the documented
+// `llm bench` exit-code contract (0/2/3/4/5). Codes INSIDE the
+// band continue to forward verbatim (F46 pass-through, covered by
+// TestRunLLMBench_ExitCodePropagation_F46).
+func TestMapBenchSubprocessError_ContractExitNormalization_F57(t *testing.T) {
+	cases := []struct {
+		name    string
+		subExit int
+	}{
+		// Most realistic case: `go run` toolchain mismatch
+		// ("go: go.mod requires go >= 1.25.0 ...") emits exit 1.
+		{"go-run toolchain/compile failure (1)", 1},
+		// Hypothetical future M4-3 widening; before F57 this would
+		// also leak through verbatim. After F57 it normalises to 3
+		// so the documented contract holds until the wrapper is
+		// updated to acknowledge the new code.
+		{"undocumented future code (6)", 6},
+		// Shell-style "command not found" exit, which a misnamed
+		// `go` shim could produce.
+		{"shell command-not-found (127)", 127},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runErr := runShExit(t, tc.subExit)
+			got := mapBenchSubprocessError(runErr, nil)
+			if got == nil {
+				t.Fatal("F57: mapBenchSubprocessError returned nil for non-nil run error")
+			}
+			if got.ExitCode() != 3 {
+				t.Errorf("F57: subprocess exit %d should be renormalised to 3 (documented contract is 0/2/3/4/5), got %d",
+					tc.subExit, got.ExitCode())
+			}
+			if !strings.Contains(got.Error(), "launch/compile failure") {
+				t.Errorf("F57: error message should mention launch/compile failure, got %q", got.Error())
+			}
+			// The error must surface the underlying subprocess
+			// exit number so an operator can correlate with the
+			// `go run` output the captured-stderr tee already
+			// streamed to the terminal.
+			if !strings.Contains(got.Error(), strconv.Itoa(tc.subExit)) {
+				t.Errorf("F57: error message should include subprocess exit number %d, got %q",
+					tc.subExit, got.Error())
+			}
+		})
+	}
+}
+
+// TestMapBenchSubprocessError_StderrTailQuoted_F57 — the captured
+// `go run` stderr tail must be embedded in the normalised exit-3
+// error message so operators see the underlying complaint without
+// a second run. Pre-F57 the wrapper emitted only "exit=1" with no
+// context.
+func TestMapBenchSubprocessError_StderrTailQuoted_F57(t *testing.T) {
+	runErr := runShExit(t, 1)
+	tail := []byte("go: go.mod requires go >= 1.25.0 (running go 1.22.12; GOTOOLCHAIN=local)\n")
+	got := mapBenchSubprocessError(runErr, tail)
+	if got == nil {
+		t.Fatal("F57: mapBenchSubprocessError returned nil")
+	}
+	if got.ExitCode() != 3 {
+		t.Errorf("F57: ExitCode = %d, want 3", got.ExitCode())
+	}
+	if !strings.Contains(got.Error(), "go.mod requires go >= 1.25.0") {
+		t.Errorf("F57: error message should quote captured stderr, got %q", got.Error())
+	}
+	if !strings.Contains(got.Error(), "stderr (truncated)") {
+		t.Errorf("F57: error message should label the embedded stderr block, got %q", got.Error())
+	}
+}
+
+// TestMapBenchSubprocessError_StderrTailNilOK_F57 — when the
+// stderr tail is nil (early-failure path, or tests that don't
+// exercise the tee), the F57 message must still be coherent — no
+// dangling "stderr:" label, no panic.
+func TestMapBenchSubprocessError_StderrTailNilOK_F57(t *testing.T) {
+	runErr := runShExit(t, 1)
+	got := mapBenchSubprocessError(runErr, nil)
+	if got == nil {
+		t.Fatal("F57: nil stderr tail produced nil error envelope")
+	}
+	if got.ExitCode() != 3 {
+		t.Errorf("F57: ExitCode = %d, want 3", got.ExitCode())
+	}
+	if strings.Contains(got.Error(), "stderr (truncated):") {
+		t.Errorf("F57: empty stderr tail should not emit a 'stderr (truncated):' header, got %q",
+			got.Error())
+	}
+}
+
+// TestCappedBuffer_Cap_F57 — the bounded buffer used to tee
+// `go run` stderr must drop bytes past its limit while still
+// reporting the full write count (so io.MultiWriter is satisfied
+// and the parallel stream to the operator's terminal is not
+// disturbed).
+func TestCappedBuffer_Cap_F57(t *testing.T) {
+	buf := &cappedBuffer{limit: 16}
+	payload := bytes.Repeat([]byte("x"), 64)
+	n, err := buf.Write(payload)
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if n != len(payload) {
+		t.Errorf("F57: Write returned n=%d, want %d (MultiWriter contract)", n, len(payload))
+	}
+	if got := buf.Bytes(); len(got) != 16 {
+		t.Errorf("F57: buffered len=%d, want 16 (capped)", len(got))
+	}
+	// A second write past the cap is a no-op for the buffer but
+	// still returns the full length.
+	n, err = buf.Write([]byte("more"))
+	if err != nil {
+		t.Fatalf("write 2: %v", err)
+	}
+	if n != 4 {
+		t.Errorf("F57: post-cap Write returned n=%d, want 4", n)
+	}
+	if got := buf.Bytes(); len(got) != 16 {
+		t.Errorf("F57: post-cap buffered len=%d, want 16 (unchanged)", len(got))
 	}
 }
 
@@ -631,16 +767,18 @@ func TestMapBenchSubprocessError_SignalKilled_F46(t *testing.T) {
 	if runErr == nil {
 		t.Fatal("expected non-nil error after kill")
 	}
-	got := mapBenchSubprocessError(runErr)
+	got := mapBenchSubprocessError(runErr, nil)
 	if got == nil {
 		t.Fatal("F46: mapBenchSubprocessError returned nil for signal-killed subprocess")
 	}
 	// Some platforms encode signal kills with a normal positive
-	// exit code via sh's reporting layer (128 + signo). On those
-	// platforms ExitCode() >= 0 and we forward verbatim per the
-	// M4-3 contract path — that is acceptable behaviour (the
-	// operator sees the underlying number). Only assert the
-	// negative-code branch when we actually hit it.
+	// exit code via sh's reporting layer (128 + signo, e.g. 137 for
+	// SIGKILL). On those platforms ExitCode() >= 0 — but post-F57
+	// the wrapper now renormalises codes outside the M4-3 band to
+	// exit 3 rather than forwarding 137 verbatim (which would have
+	// silently widened the documented contract). Only the negative-
+	// code branch is asserted because that's the one F46's
+	// transient-leaning default targets.
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) && exitErr.ExitCode() < 0 {
 		if got.ExitCode() != 4 {
