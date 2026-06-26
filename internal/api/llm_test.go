@@ -337,3 +337,105 @@ func TestHealth_2xxMalformedJSON(t *testing.T) {
 		t.Fatalf("expected JSON parse error, got res=%+v", res)
 	}
 }
+
+// ----------------------------------------------------------------------------
+// F39 — 2xx (non-200) contract validation
+//
+// Codex review M4 #F39: before the fix `Health` only treated
+// `resp.StatusCode != 200` as an error path, so 204 / 206 fell
+// through to the JSON decode and surfaced as plain fmt.Errorf —
+// classified by the command layer's default branch as exit-3
+// permanent. The contract per F23 is that a 2xx with a contract
+// violation is transient (ProtocolError=true → exit-4).
+// ----------------------------------------------------------------------------
+
+// TestHealth_204NoContent_F39 — a 204 No Content (empty body, no
+// status field) must surface as a ProtocolError transient. Reverting
+// the F39 fix re-introduces the exit-3 misclassification.
+func TestHealth_204NoContent_F39(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// http.ResponseWriter clears the body for 204 automatically;
+		// we set it explicitly here as documentation of intent.
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	_, err := client.Health(context.Background())
+	if err == nil {
+		t.Fatal("F39: expected error for 204 No Content (no status field)")
+	}
+	var le *LLMError
+	if !errors.As(err, &le) {
+		t.Fatalf("F39: err = %v (%T), want *LLMError", err, err)
+	}
+	if le.StatusCode != http.StatusNoContent {
+		t.Errorf("F39: StatusCode = %d, want 204", le.StatusCode)
+	}
+	if !le.ProtocolError {
+		t.Errorf("F39: ProtocolError must be true for 204 with no status field")
+	}
+	if !le.IsTransient() {
+		t.Errorf("F39: 204 ProtocolError must classify transient (exit-4)")
+	}
+	if le.IsPermanent() {
+		t.Errorf("F39: 204 ProtocolError must NOT classify permanent")
+	}
+}
+
+// TestHealth_206PartialContent_F39 — a 206 with a non-empty but
+// status-less JSON body must also surface as ProtocolError
+// transient. 206 is plausible if a misconfigured reverse proxy
+// hands back partial Range responses for the health probe.
+func TestHealth_206PartialContent_F39(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, `{"mode":"byok"}`)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	_, err := client.Health(context.Background())
+	if err == nil {
+		t.Fatal("F39: expected error for 206 without status field")
+	}
+	var le *LLMError
+	if !errors.As(err, &le) {
+		t.Fatalf("F39: err = %v (%T), want *LLMError", err, err)
+	}
+	if le.StatusCode != http.StatusPartialContent {
+		t.Errorf("F39: StatusCode = %d, want 206", le.StatusCode)
+	}
+	if !le.ProtocolError {
+		t.Errorf("F39: ProtocolError must be true for 206 with no status field")
+	}
+	if !le.IsTransient() {
+		t.Errorf("F39: 206 ProtocolError must classify transient (exit-4)")
+	}
+	if le.IsPermanent() {
+		t.Errorf("F39: 206 ProtocolError must NOT classify permanent")
+	}
+}
+
+// TestHealth_202Accepted_WithStatus_F39 — a 202 Accepted that does
+// carry a valid status field must succeed (the widened 2xx check
+// must not break legitimate non-200 successes that fulfil the
+// contract).
+func TestHealth_202Accepted_WithStatus_F39(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status": "ok",
+			"mode":   "byok",
+		})
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	res, err := client.Health(context.Background())
+	if err != nil {
+		t.Fatalf("F39: 202 with status field should succeed, got err: %v", err)
+	}
+	if res.Status != "ok" {
+		t.Errorf("F39: Status = %q, want ok", res.Status)
+	}
+}

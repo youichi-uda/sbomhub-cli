@@ -284,24 +284,46 @@ func (c *Client) Health(ctx context.Context) (*LLMHealthResponse, error) {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
+	// M4 Codex review #F39 fix: treat any non-2xx response (not just
+	// the narrow != 200 case) as an LLMError. Previously a 204 No
+	// Content / 206 Partial Content would skip this branch, then
+	// fall into the JSON-parse / status-validation path and surface
+	// as a plain fmt.Errorf — which the command layer's default
+	// switch maps to exit-3 instead of the intended transient
+	// exit-4 (F23 contract). With the wider range, 2xx-but-not-200
+	// responses with empty / missing-status bodies now correctly
+	// flow through the ProtocolError=true transient bucket below.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, decodeLLMError(http.MethodGet, endpoint, resp.StatusCode, respBody)
 	}
 
 	var out LLMHealthResponse
-	if err := json.Unmarshal(respBody, &out); err != nil {
-		return nil, fmt.Errorf("llm health レスポンス解析エラー: %w", err)
+	// 204 No Content (and any other empty-body 2xx) must NOT be
+	// flagged as a JSON parse error — skip the unmarshal when the
+	// body is blank and let the status check below classify the
+	// empty payload as a ProtocolError. A malformed (non-empty)
+	// body still falls into the parse-error path so the operator
+	// sees a precise diagnostic.
+	if len(strings.TrimSpace(string(respBody))) > 0 {
+		if err := json.Unmarshal(respBody, &out); err != nil {
+			return nil, fmt.Errorf("llm health レスポンス解析エラー: %w", err)
+		}
 	}
 	if strings.TrimSpace(out.Status) == "" {
 		// F23 carry-over: a 2xx without a recognisable status field
 		// is a server protocol violation. Surface as ProtocolError /
 		// transient so the CLI retries instead of silently
 		// confirming a no-op probe.
+		//
+		// F39 carry-over: this branch now also catches 204 / 206
+		// / any other "success but non-OK" response that the
+		// widened status check above lets through to the decode
+		// stage.
 		return nil, &LLMError{
 			StatusCode:    resp.StatusCode,
 			URL:           endpoint,
 			Method:        http.MethodGet,
-			Message:       "llm health success response missing status field (server protocol error — F23 contract violation)",
+			Message:       "llm health success response missing status field (server protocol error — F23 / F39 contract violation)",
 			Raw:           string(respBody),
 			ProtocolError: true,
 		}
