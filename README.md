@@ -146,14 +146,50 @@ sbomhub llm bench --sbomhub-source ../sbomhub --max-cases 10 --out result.jsonl
 
 **BYOK 環境変数**:
 
+CLI の API server 認証 ( `SBOMHUB_API_KEY` ) と LLM provider key
+( `SBOMHUB_LLM_API_KEY` / provider-native env ) は別物。 LLM provider
+key は canonical ( `SBOMHUB_LLM_API_KEY` ) を first precedence、
+provider-native env を alias fallback として読む (M4 Codex review #F47)。
+
+*sbomhub CLI 自身の API 認証* (LLM とは無関係):
+
 | 環境変数 | 用途 |
 |----------|------|
-| `SBOMHUB_LLM_API_KEY` | sbomhub API server 認証 (`sbomhub login` で保存可) |
-| `OPENAI_API_KEY` | OpenAI provider |
-| `ANTHROPIC_API_KEY` | Anthropic provider |
-| `GOOGLE_API_KEY` | Google / Gemini provider |
-| `AZURE_OPENAI_API_KEY` | Azure OpenAI provider |
-| `OLLAMA_HOST` | local Ollama endpoint (default `http://localhost:11434`) |
+| `SBOMHUB_API_KEY` | sbomhub API server 認証 ( `sbomhub login` でも `~/.sbomhub/config.yaml` に保存可) |
+
+*LLM provider API key* (canonical first、 provider-native alias fallback):
+
+| Provider | Canonical | Alias |
+|----------|-----------|-------|
+| OpenAI | `SBOMHUB_LLM_API_KEY` | `OPENAI_API_KEY` |
+| Anthropic | `SBOMHUB_LLM_API_KEY` | `ANTHROPIC_API_KEY` |
+| Gemini | `SBOMHUB_LLM_API_KEY` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
+| Azure OpenAI | `SBOMHUB_LLM_API_KEY` | `AZURE_OPENAI_API_KEY` |
+| Ollama | (不要 / not required) | — |
+
+*Azure OpenAI 追加設定* (M4 Codex review #F52):
+
+| 環境変数 (canonical) | 用途 | Alias |
+|----------------------|------|-------|
+| `SBOMHUB_LLM_AZURE_ENDPOINT` | Azure endpoint URL | `AZURE_OPENAI_ENDPOINT` |
+| `SBOMHUB_LLM_AZURE_DEPLOYMENT` | deployment 名 | `AZURE_OPENAI_DEPLOYMENT` |
+| `SBOMHUB_LLM_AZURE_API_VERSION` | API version (省略時 azure_openai.go default) | `AZURE_OPENAI_API_VERSION` |
+
+*Ollama 設定* (M4 Codex review #F47):
+
+| 環境変数 (canonical) | 用途 | Alias |
+|----------------------|------|-------|
+| `SBOMHUB_LLM_OLLAMA_URL` | Ollama base URL (省略時 `http://localhost:11434`) | `OLLAMA_HOST` |
+
+*bench 専用 model 上書き* ( `SBOMHUB_LLM_MODEL` を汚染せずに provider 別 model を bench 時のみ指定):
+
+| 環境変数 | 用途 |
+|----------|------|
+| `SBOMHUB_LLM_BENCH_OPENAI_MODEL` | bench-only OpenAI model 上書き |
+| `SBOMHUB_LLM_BENCH_ANTHROPIC_MODEL` | bench-only Anthropic model 上書き |
+| `SBOMHUB_LLM_BENCH_GEMINI_MODEL` | bench-only Gemini model 上書き |
+| `SBOMHUB_LLM_BENCH_AZURE_OPENAI_MODEL` | bench-only Azure OpenAI model 上書き |
+| `SBOMHUB_LLM_BENCH_OLLAMA_MODEL` | bench-only Ollama model (Ollama では必須、 例 `qwen2.5-coder:7b`) |
 
 Exit code (wrapper preflight + M4-3 typed pass-through):
 

@@ -149,14 +149,51 @@ sbomhub llm bench --sbomhub-source ../sbomhub --max-cases 10 --out result.jsonl
 
 **BYOK environment variables**:
 
+The CLI's API-server authentication ( `SBOMHUB_API_KEY` ) and the LLM
+provider key ( `SBOMHUB_LLM_API_KEY` / provider-native env ) are
+separate. LLM provider keys read the canonical
+( `SBOMHUB_LLM_API_KEY` ) first and fall back to the provider-native
+env names (M4 Codex review #F47).
+
+*sbomhub CLI's own API auth* (unrelated to LLM):
+
 | Variable | Purpose |
 |----------|---------|
-| `SBOMHUB_LLM_API_KEY` | SBOMHub API auth (also savable via `sbomhub login`) |
-| `OPENAI_API_KEY` | OpenAI provider |
-| `ANTHROPIC_API_KEY` | Anthropic provider |
-| `GOOGLE_API_KEY` | Google / Gemini provider |
-| `AZURE_OPENAI_API_KEY` | Azure OpenAI provider |
-| `OLLAMA_HOST` | Local Ollama endpoint (default `http://localhost:11434`) |
+| `SBOMHUB_API_KEY` | sbomhub API server authentication (also savable via `sbomhub login` into `~/.sbomhub/config.yaml`) |
+
+*LLM provider API key* (canonical first, provider-native alias fallback):
+
+| Provider | Canonical | Alias |
+|----------|-----------|-------|
+| OpenAI | `SBOMHUB_LLM_API_KEY` | `OPENAI_API_KEY` |
+| Anthropic | `SBOMHUB_LLM_API_KEY` | `ANTHROPIC_API_KEY` |
+| Gemini | `SBOMHUB_LLM_API_KEY` | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
+| Azure OpenAI | `SBOMHUB_LLM_API_KEY` | `AZURE_OPENAI_API_KEY` |
+| Ollama | (not required) | — |
+
+*Azure OpenAI additional config* (M4 Codex review #F52):
+
+| Variable (canonical) | Purpose | Alias |
+|----------------------|---------|-------|
+| `SBOMHUB_LLM_AZURE_ENDPOINT` | Azure endpoint URL | `AZURE_OPENAI_ENDPOINT` |
+| `SBOMHUB_LLM_AZURE_DEPLOYMENT` | Deployment name | `AZURE_OPENAI_DEPLOYMENT` |
+| `SBOMHUB_LLM_AZURE_API_VERSION` | API version (defaults to `azure_openai.go`'s default when unset) | `AZURE_OPENAI_API_VERSION` |
+
+*Ollama config* (M4 Codex review #F47):
+
+| Variable (canonical) | Purpose | Alias |
+|----------------------|---------|-------|
+| `SBOMHUB_LLM_OLLAMA_URL` | Ollama base URL (default `http://localhost:11434`) | `OLLAMA_HOST` |
+
+*bench-only model overrides* (let you target a specific managed-vs-local pair without polluting the runtime `SBOMHUB_LLM_MODEL`):
+
+| Variable | Purpose |
+|----------|---------|
+| `SBOMHUB_LLM_BENCH_OPENAI_MODEL` | Bench-only OpenAI model override |
+| `SBOMHUB_LLM_BENCH_ANTHROPIC_MODEL` | Bench-only Anthropic model override |
+| `SBOMHUB_LLM_BENCH_GEMINI_MODEL` | Bench-only Gemini model override |
+| `SBOMHUB_LLM_BENCH_AZURE_OPENAI_MODEL` | Bench-only Azure OpenAI model override |
+| `SBOMHUB_LLM_BENCH_OLLAMA_MODEL` | Bench-only Ollama model (required for Ollama, e.g. `qwen2.5-coder:7b`) |
 
 Exit codes (wrapper preflight + M4-3 typed pass-through):
 
