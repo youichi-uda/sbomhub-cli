@@ -114,7 +114,13 @@ func (e *llmExitError) ExitCode() int { return e.code }
 // Mirrors sbomhub/apps/api/cmd/llm-bench/main.go's default fixture
 // reference. The wrapper joins this with --sbomhub-source to form
 // the absolute --eval-set passed to `go run`.
-const llmBenchDefaultEvalSetRel = "test/fixtures/llm-bench/cve-20-50.json"
+//
+// M4 Codex review #F38 fix: the fixture lives under apps/api/ on the
+// sbomhub side (the M4-3 binary's `apps/api` working dir makes that
+// path implicit there). resolveEvalSetPath joins this against the
+// sbomhub repo *root*, so the apps/api/ prefix must be embedded here
+// — otherwise the preflight os.Stat fails on a fresh checkout.
+const llmBenchDefaultEvalSetRel = "apps/api/test/fixtures/llm-bench/cve-20-50.json"
 
 // llmBenchDefaultSbomhubSource is the conventional checkout layout
 // for the M4 docker-compose stack (sbom-all/sbomhub-cli sits next

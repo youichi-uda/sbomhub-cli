@@ -290,6 +290,11 @@ func TestLLMHealthFailureToExitError_Classification_F21(t *testing.T) {
 		{"503 generic transient", &api.LLMError{StatusCode: 503, Raw: "gateway down"}, 4},
 		{"503 AI-disabled permanent", &api.LLMError{StatusCode: 503, Reason: "BYOK key not configured"}, 3},
 		{"protocol error transient", &api.LLMError{StatusCode: 200, ProtocolError: true}, 4},
+		// F39 regression: 204 / 206 with ProtocolError=true must
+		// still surface as transient exit-4 (not the default exit-3
+		// permanent bucket) at the classifier layer.
+		{"204 protocol error transient (F39)", &api.LLMError{StatusCode: 204, ProtocolError: true}, 4},
+		{"206 protocol error transient (F39)", &api.LLMError{StatusCode: 206, ProtocolError: true}, 4},
 		{"network error transient", errors.New("connection refused"), 4},
 	}
 	for _, tc := range cases {
@@ -385,10 +390,19 @@ func TestResolveSbomhubSource_IsFile(t *testing.T) {
 
 // TestResolveEvalSetPath_DefaultFromSource — empty --eval-set picks
 // the M4-3 canonical fixture under the sbomhub source root.
+//
+// M4 Codex review #F38 regression: the default rel path must be
+// joined against the sbomhub repo *root* and resolve to
+// apps/api/test/fixtures/llm-bench/cve-20-50.json (the M4-3 binary's
+// working dir is apps/api, but resolveEvalSetPath sees the repo root
+// — so the apps/api/ prefix must be embedded in the default
+// constant).
 func TestResolveEvalSetPath_DefaultFromSource(t *testing.T) {
 	tmp := t.TempDir()
 	// Lay down the M4-3 fixture path so the resolver can stat it.
-	fixture := filepath.Join(tmp, "test", "fixtures", "llm-bench", "cve-20-50.json")
+	// Must mirror the actual sbomhub layout (apps/api/test/...) —
+	// F38 fix moved the default to include the apps/api/ prefix.
+	fixture := filepath.Join(tmp, "apps", "api", "test", "fixtures", "llm-bench", "cve-20-50.json")
 	if err := os.MkdirAll(filepath.Dir(fixture), 0o755); err != nil {
 		t.Fatalf("seed dir: %v", err)
 	}
@@ -403,6 +417,18 @@ func TestResolveEvalSetPath_DefaultFromSource(t *testing.T) {
 	wantAbs, _ := filepath.Abs(fixture)
 	if got != wantAbs {
 		t.Errorf("got %s, want %s", got, wantAbs)
+	}
+}
+
+// TestLLMBenchDefaultEvalSetRel_MatchesSbomhubLayout — guards the
+// constant directly so a future refactor that drops the apps/api/
+// prefix re-introduces F38 with a loud unit-level failure rather
+// than only being caught by the path-resolution test below.
+func TestLLMBenchDefaultEvalSetRel_MatchesSbomhubLayout(t *testing.T) {
+	const want = "apps/api/test/fixtures/llm-bench/cve-20-50.json"
+	if llmBenchDefaultEvalSetRel != want {
+		t.Errorf("llmBenchDefaultEvalSetRel = %q, want %q (M4 Codex #F38 — must be joined against repo root, not apps/api workdir)",
+			llmBenchDefaultEvalSetRel, want)
 	}
 }
 
