@@ -255,6 +255,101 @@ jobs:
             kill "$(cat "$RUNNER_TEMP/mock_health.pid")" 2>/dev/null || true
           fi
 
+  # M4 Codex review #F71: README documents
+  # `ghcr.io/youichi-uda/sbomhub-cli:bench` (and the default image) as
+  # the production Docker path for operators running `sbomhub llm bench`
+  # / other subcommands, but the release pipeline previously only
+  # published binaries via GoReleaser — no Docker image was ever pushed
+  # to GHCR on a tag. The F66 `docker-smoke` gate above verified the
+  # Dockerfile contract on every push but did not publish; operators
+  # following the README `docker run ghcr.io/...:bench` instructions
+  # would 404. This job closes that gap.
+  #
+  # Approach: option (b) from the F71 fix proposal — keep the existing
+  # `.goreleaser.yaml` binary release shape untouched and add a separate
+  # workflow job that uses `docker/build-push-action` against the
+  # existing `Dockerfile` / `Dockerfile.bench`. The alternative (adding
+  # GoReleaser `dockers` entries) would require refactoring both
+  # Dockerfiles to `COPY` a pre-built binary instead of building from
+  # source, which is out of scope for an F71 ci-only fix.
+  #
+  # Tags published per release (vX.Y.Z):
+  #   ghcr.io/youichi-uda/sbomhub-cli:vX.Y.Z          (default, slim)
+  #   ghcr.io/youichi-uda/sbomhub-cli:latest          (default, slim)
+  #   ghcr.io/youichi-uda/sbomhub-cli:vX.Y.Z-bench    (bench variant)
+  #   ghcr.io/youichi-uda/sbomhub-cli:bench           (bench variant)
+  #
+  # `:latest` and `:bench` are floating tags that always point at the
+  # most recent tag-driven release so the README's
+  # `ghcr.io/youichi-uda/sbomhub-cli:bench` instruction keeps resolving
+  # without operators having to track version numbers.
+  #
+  # Multi-arch: both images are built for linux/amd64 + linux/arm64 via
+  # docker buildx + QEMU emulation. The default `Dockerfile` (alpine
+  # base, `golang:1.22-alpine` build stage) and `Dockerfile.bench`
+  # (`golang:1.25-alpine`) both pull multi-arch base images from
+  # Docker Hub, so the cross-build is a straightforward QEMU `go build`
+  # with no Dockerfile changes required.
+  #
+  # Gate: runs only on `v*` tag pushes, after the same
+  # `[test, build, docker-smoke]` chain that gates `release`. The
+  # `release` job (GoReleaser) and this job run in parallel — a Docker
+  # publish failure does not block the binary release, and vice versa.
+  # That keeps the two distribution paths independently recoverable on
+  # transient registry / runner failures; if either fails the maintainer
+  # can re-run the single failed job without re-cutting the tag.
+  docker-publish:
+    name: Publish Docker images to GHCR
+    runs-on: ubuntu-latest
+    needs: [test, build, docker-smoke]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push default image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/youichi-uda/sbomhub-cli:${{ github.ref_name }}
+            ghcr.io/youichi-uda/sbomhub-cli:latest
+          cache-from: type=gha,scope=sbomhub-cli-default
+          cache-to: type=gha,scope=sbomhub-cli-default,mode=max
+
+      - name: Build and push bench image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.bench
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/youichi-uda/sbomhub-cli:${{ github.ref_name }}-bench
+            ghcr.io/youichi-uda/sbomhub-cli:bench
+          cache-from: type=gha,scope=sbomhub-cli-bench
+          cache-to: type=gha,scope=sbomhub-cli-bench,mode=max
+
   release:
     name: Release
     runs-on: ubuntu-latest
@@ -262,6 +357,12 @@ jobs:
     # Dockerfile / Dockerfile.bench / bench wrapper exit-code contract
     # is verified before any tag is published. lint stays excluded
     # until golangci-lint supports Go 1.25.
+    #
+    # M4 Codex review #F71: docker image publish (`docker-publish` job
+    # above) runs in parallel with this job on the same gate — both
+    # need [test, build, docker-smoke] — so binary and Docker
+    # distribution paths are independently recoverable on a failed
+    # publish.
     needs: [test, build, docker-smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
