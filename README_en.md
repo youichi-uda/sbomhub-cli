@@ -96,6 +96,95 @@ sbomhub check ./sbom.json
 sbomhub projects list
 ```
 
+### LLM Provider Operations (M4)
+
+Connectivity check and quality benchmark commands for the BYOK LLM
+providers (OpenAI / Anthropic / Gemini / Azure OpenAI / Ollama) that
+your self-host SBOMHub server is wired up to. See `sbomhub llm --help`
+and each subcommand's `--help` for the full flag set.
+
+#### `sbomhub llm test` — connectivity probe
+
+Probes `/api/v1/health` on the configured SBOMHub API server and
+prints connectivity + (when published) provider / model.
+
+```bash
+# Human-readable output
+sbomhub llm test
+
+# JSON (for CI / jq)
+sbomhub llm test --json
+```
+
+Exit codes:
+
+| code | meaning |
+|------|---------|
+| 0 | success |
+| 3 | permanent (401/403/404, BYOK not configured — set it in `/settings/llm`) |
+| 4 | transient (429/5xx / network — retry recommended) |
+
+#### `sbomhub llm bench` — quality benchmark
+
+Wraps the `llm-bench` harness shipped in the sbomhub OSS source and
+launches it via `go run`, comparing managed AI vs local LLM (Ollama)
+VEX-triage quality across a 20-case eval-set.
+
+```bash
+# Default: source at ./sbomhub, all providers
+sbomhub llm bench
+
+# Subset of providers + aggregation table
+sbomhub llm bench --providers ollama,gemini --markdown
+
+# Source at a different path + reduced case count
+sbomhub llm bench --sbomhub-source ../sbomhub --max-cases 10 --out result.jsonl
+```
+
+**Prerequisites**:
+- A Go toolchain (1.22+) installed on the host
+- The sbomhub OSS source checked out locally (`--sbomhub-source` /
+  env `SBOMHUB_SOURCE` / default `./sbomhub`)
+- BYOK env vars exported for each provider under test (see the table)
+
+**BYOK environment variables**:
+
+| Variable | Purpose |
+|----------|---------|
+| `SBOMHUB_LLM_API_KEY` | SBOMHub API auth (also savable via `sbomhub login`) |
+| `OPENAI_API_KEY` | OpenAI provider |
+| `ANTHROPIC_API_KEY` | Anthropic provider |
+| `GOOGLE_API_KEY` | Google / Gemini provider |
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI provider |
+| `OLLAMA_HOST` | Local Ollama endpoint (default `http://localhost:11434`) |
+
+Exit codes (wrapper preflight + M4-3 typed pass-through):
+
+| code | meaning |
+|------|---------|
+| 0 | success |
+| 2 | usage / flag validation (forwarded from M4-3) |
+| 3 | permanent (wrapper preflight: missing sbomhub source / eval-set / Go toolchain / launch failure, or M4-3 fixture / config validation) |
+| 4 | no providers configured (forwarded from M4-3 — set BYOK env or drop the provider from `--providers`), or subprocess signal-killed |
+| 5 | execution failure (forwarded from M4-3 — likely transient provider outage; retry recommended) |
+
+**Running `llm bench` from Docker**: the default `sbomhub-cli` image
+is slim (`alpine` + `ca-certificates`) and does not include a Go
+toolchain. A `sbomhub-cli:bench` variant image ships Go for this
+workflow:
+
+```bash
+docker run --rm \
+  -v "$(pwd)/sbomhub:/workspace/sbomhub" \
+  -e OPENAI_API_KEY \
+  -e ANTHROPIC_API_KEY \
+  ghcr.io/youichi-uda/sbomhub-cli:bench \
+  llm bench --sbomhub-source /workspace/sbomhub
+```
+
+Every other subcommand — including `sbomhub llm test` — talks HTTP
+only and works on the default slim image.
+
 ## Roadmap (M1 and beyond)
 
 The following commands are planned for M1–M2 to round out CRA 2026-09 readiness. Every one of them is built on an AI-drafts-with-human-approval model (no auto-approval).

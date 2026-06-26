@@ -96,6 +96,91 @@ sbomhub check ./sbom.json
 sbomhub projects list
 ```
 
+### LLM プロバイダ操作 (M4)
+
+self-host SBOMHub に接続済の BYOK LLM プロバイダ (OpenAI / Anthropic /
+Gemini / Azure OpenAI / Ollama) の疎通確認と品質ベンチマーク用コマンド群。
+詳細は `sbomhub llm --help` および各 subcommand の `--help` を参照。
+
+#### `sbomhub llm test` — 疎通確認
+
+`sbomhub` API server の `/api/v1/health` を叩き、 接続性 +
+(server が公開していれば) provider / model を表示する。
+
+```bash
+# 人間向け表示
+sbomhub llm test
+
+# JSON (CI / jq 用)
+sbomhub llm test --json
+```
+
+Exit code:
+
+| code | 意味 |
+|------|------|
+| 0 | 正常 |
+| 3 | 恒久エラー (401/403/404、 BYOK 未設定 — `/settings/llm` で設定) |
+| 4 | 一時エラー (429/5xx / network — retry 推奨) |
+
+#### `sbomhub llm bench` — 品質ベンチマーク
+
+sbomhub OSS source 配下の `llm-bench` harness を `go run` 経由で起動し、
+managed AI vs local LLM (Ollama) の VEX-triage 品質を 20 件の eval-set で比較する。
+
+```bash
+# default: ./sbomhub を source として、 全 provider を bench
+sbomhub llm bench
+
+# provider 限定 + 集計 markdown
+sbomhub llm bench --providers ollama,gemini --markdown
+
+# 別 location の source + 件数縮小
+sbomhub llm bench --sbomhub-source ../sbomhub --max-cases 10 --out result.jsonl
+```
+
+**前提**:
+- ローカルに Go toolchain (1.22+) がインストールされていること
+- sbomhub OSS の source が手元に checkout 済 (`--sbomhub-source` / 環境変数 `SBOMHUB_SOURCE` / 既定 `./sbomhub`)
+- 比較したい provider の BYOK 環境変数が export 済 (下の表)
+
+**BYOK 環境変数**:
+
+| 環境変数 | 用途 |
+|----------|------|
+| `SBOMHUB_LLM_API_KEY` | sbomhub API server 認証 (`sbomhub login` で保存可) |
+| `OPENAI_API_KEY` | OpenAI provider |
+| `ANTHROPIC_API_KEY` | Anthropic provider |
+| `GOOGLE_API_KEY` | Google / Gemini provider |
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI provider |
+| `OLLAMA_HOST` | local Ollama endpoint (default `http://localhost:11434`) |
+
+Exit code (wrapper preflight + M4-3 typed pass-through):
+
+| code | 意味 |
+|------|------|
+| 0 | 正常 |
+| 2 | usage / flag validation (M4-3 から透過) |
+| 3 | 恒久エラー (wrapper preflight: sbomhub source / eval-set / Go 不在 / 起動失敗、 もしくは M4-3 の fixture / config validation) |
+| 4 | no providers configured (M4-3 から透過 — BYOK env を設定 or `--providers` から外す)、 または subprocess signal-killed |
+| 5 | execution failure (M4-3 から透過 — provider 一時障害の可能性、 retry 推奨) |
+
+**Docker で `llm bench` を実行する場合**: default の `sbomhub-cli` image は
+slim 構成 (`alpine` + `ca-certificates`) で Go toolchain を含まないため、
+`llm bench` 用の variant image (`sbomhub-cli:bench`) を別途用意している。
+
+```bash
+docker run --rm \
+  -v "$(pwd)/sbomhub:/workspace/sbomhub" \
+  -e OPENAI_API_KEY \
+  -e ANTHROPIC_API_KEY \
+  ghcr.io/youichi-uda/sbomhub-cli:bench \
+  llm bench --sbomhub-source /workspace/sbomhub
+```
+
+`sbomhub llm test` を含む他の subcommand は HTTP API call のみで動作するため
+default slim image でも問題なく動く。
+
 ## Roadmap (M1 以降)
 
 CRA 2026/9 期限対応に向け、 以下のコマンドを M1〜M2 で順次実装予定。 いずれも AI 下書き + 人間承認モデル (自動承認なし)。
