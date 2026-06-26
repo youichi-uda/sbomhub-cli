@@ -170,13 +170,23 @@ provider-native env を alias fallback として読む (M4 Codex review #F47)。
 | Azure OpenAI | `SBOMHUB_LLM_API_KEY` | `AZURE_OPENAI_API_KEY` |
 | Ollama | (不要 / not required) | — |
 
-*Azure OpenAI 追加設定* (M4 Codex review #F52):
+*Azure OpenAI 追加設定* (M4 Codex review #F52 + #F59):
 
-| 環境変数 (canonical) | 用途 | Alias |
-|----------------------|------|-------|
+Canonical (`SBOMHUB_LLM_*`) を first precedence、 Azure-native env を
+alias fallback として読む。 deployment 名のみ Microsoft 公式ドキュメント間で
+3 種類の Azure-native env name が混在するため、 4-layer precedence
+ladder で順次解決する (#F59)。
+
+| 環境変数 (canonical) | 用途 | Alias (precedence order) |
+|----------------------|------|--------------------------|
 | `SBOMHUB_LLM_AZURE_ENDPOINT` | Azure endpoint URL | `AZURE_OPENAI_ENDPOINT` |
-| `SBOMHUB_LLM_AZURE_DEPLOYMENT` | deployment 名 | `AZURE_OPENAI_DEPLOYMENT` |
+| `SBOMHUB_LLM_AZURE_DEPLOYMENT` | deployment 名 | `AZURE_OPENAI_DEPLOYMENT` > `AZURE_OPENAI_DEPLOYMENT_NAME` > `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` |
 | `SBOMHUB_LLM_AZURE_API_VERSION` | API version (省略時 azure_openai.go default) | `AZURE_OPENAI_API_VERSION` |
+
+deployment alias の出典:
+- `AZURE_OPENAI_DEPLOYMENT` — 多くの Azure code sample (F52)
+- `AZURE_OPENAI_DEPLOYMENT_NAME` — Microsoft Learn の AKS OpenAI quickstart、 Azure SDK for JS / Python OpenAI library (F59)
+- `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` — Azure Agent Framework ドキュメント (F59)
 
 *Ollama 設定* (M4 Codex review #F47):
 

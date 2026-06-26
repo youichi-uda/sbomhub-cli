@@ -175,13 +175,24 @@ env names (M4 Codex review #F47).
 | Azure OpenAI | `SBOMHUB_LLM_API_KEY` | `AZURE_OPENAI_API_KEY` |
 | Ollama | (not required) | — |
 
-*Azure OpenAI additional config* (M4 Codex review #F52):
+*Azure OpenAI additional config* (M4 Codex review #F52 + #F59):
 
-| Variable (canonical) | Purpose | Alias |
-|----------------------|---------|-------|
+The canonical (`SBOMHUB_LLM_*`) names take first precedence and the
+Azure-native env names act as alias fallbacks. The deployment name
+walks a 4-layer precedence ladder because Microsoft's own
+documentation uses three different Azure-native env names across
+different products (#F59).
+
+| Variable (canonical) | Purpose | Alias (precedence order) |
+|----------------------|---------|---------------------------|
 | `SBOMHUB_LLM_AZURE_ENDPOINT` | Azure endpoint URL | `AZURE_OPENAI_ENDPOINT` |
-| `SBOMHUB_LLM_AZURE_DEPLOYMENT` | Deployment name | `AZURE_OPENAI_DEPLOYMENT` |
+| `SBOMHUB_LLM_AZURE_DEPLOYMENT` | Deployment name | `AZURE_OPENAI_DEPLOYMENT` > `AZURE_OPENAI_DEPLOYMENT_NAME` > `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` |
 | `SBOMHUB_LLM_AZURE_API_VERSION` | API version (defaults to `azure_openai.go`'s default when unset) | `AZURE_OPENAI_API_VERSION` |
+
+Deployment alias provenance:
+- `AZURE_OPENAI_DEPLOYMENT` — most Azure code samples (#F52)
+- `AZURE_OPENAI_DEPLOYMENT_NAME` — Microsoft Learn's AKS OpenAI quickstart, Azure SDK for JS / Python OpenAI library (#F59)
+- `AZURE_OPENAI_CHAT_DEPLOYMENT_NAME` — Azure Agent Framework documentation (#F59)
 
 *Ollama config* (M4 Codex review #F47):
 
