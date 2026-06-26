@@ -6,6 +6,7 @@ package api
 //	GET    /api/v1/projects/:id/meti/assessment
 //	POST   /api/v1/projects/:id/meti/assessment/refresh
 //	PUT    /api/v1/projects/:id/meti/assessment/:criterion_id/override
+//	DELETE /api/v1/projects/:id/meti/assessment/:criterion_id/override
 //	GET    /api/v1/projects/:id/meti/improvement-actions
 //
 // The CLI's `sbomhub meti` subcommand uses these to list / refresh /
@@ -141,6 +142,18 @@ type MetiOverrideRequest struct {
 	OverrideStatus    string  `json:"override_status"`
 	OverrideNote      string  `json:"override_note,omitempty"`
 	ImprovementAction *string `json:"improvement_action,omitempty"`
+}
+
+// MetiClearOverrideRequest is the body of DELETE
+// /meti/assessment/:criterion_id/override (M3 Codex review #F33/#F36).
+//
+// Note is REQUIRED and must be 1..MaxMetiOverrideNoteLen (4096) chars
+// after trim — the server's validateMetiOverrideNote rejects empty /
+// over-long values with 400. The operator's rationale for the clear
+// is persisted in the audit_logs row so an auditor can reconstruct
+// the correction.
+type MetiClearOverrideRequest struct {
+	Note string `json:"note"`
 }
 
 // ImprovementAction mirrors handler.metiImprovementAction. Used by the
@@ -526,6 +539,70 @@ func (c *Client) OverrideCriterion(ctx context.Context, projectID, criterionID s
 		}
 	}
 	return &out, nil
+}
+
+// ----------------------------------------------------------------------------
+// ClearOverrideCriterion — DELETE /api/v1/projects/:id/meti/assessment/:criterion_id/override
+// ----------------------------------------------------------------------------
+
+// ClearOverrideCriterion drops a prior operator override on a
+// meti_assessments row (M3 Codex review #F33 / #F36). Without this
+// verb, an erroneous override is a one-way trip — it continues to win
+// over the evaluator's verdict and re-override is rejected with 409
+// until the existing override is cleared.
+//
+// Server semantics (M3-4 handler):
+//   - 400 if note is missing / empty / over 4096 chars after trim
+//   - 401 / 403 if the caller lacks write permission (or user identity
+//     for the audit row)
+//   - 404 if (tenant, project, criterion) row does not exist OR the
+//     row exists but has no override to clear (generic body — no
+//     oracle to probe prior override state)
+//   - 409 if a concurrent clear / re-override raced (TOCTOU)
+//
+// The handler returns 200 OK with the post-clear row in the body so
+// the operator can confirm override_status is now empty without a
+// second round-trip; the body is discarded here (caller signature is
+// error-only) and a follow-up GetAssessment is the way to render the
+// post-clear state. 204 No Content is also accepted in case the
+// handler migrates to a body-less success shape.
+func (c *Client) ClearOverrideCriterion(ctx context.Context, projectID, criterionID string, req MetiClearOverrideRequest) error {
+	if strings.TrimSpace(criterionID) == "" {
+		return fmt.Errorf("criterion_id is required")
+	}
+	// F34 mirror: server bounds note at 1..4096 after trim. CLI-side
+	// early validation surfaces a friendlier error than a 400 round-trip.
+	cleaned := strings.TrimSpace(req.Note)
+	if len(cleaned) < 1 || len(cleaned) > 4096 {
+		return fmt.Errorf("note is required and must be 1-4096 characters")
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/meti/assessment/%s/override",
+		c.baseURL, projectID, url.PathEscape(criterionID))
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("meti clear-override リクエストのシリアライズに失敗: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return fmt.Errorf("meti clear-override リクエスト送信エラー: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return decodeMetiError(http.MethodDelete, endpoint, resp.StatusCode, respBody)
+	}
+	return nil
 }
 
 // ----------------------------------------------------------------------------

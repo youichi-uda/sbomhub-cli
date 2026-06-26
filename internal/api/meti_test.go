@@ -592,6 +592,187 @@ func TestOverrideCriterion_2xxEmptyBody_F23(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// ClearOverrideCriterion (M3 Codex review #F33/#F36)
+// ----------------------------------------------------------------------------
+
+// TestClearOverrideCriterion_HappyPath_F36 verifies the URL, the DELETE
+// method, the JSON body shape, and that a 200 OK round-trips with no
+// error. Mirrors the M3-4 server handler's success path.
+func TestClearOverrideCriterion_HappyPath_F36(t *testing.T) {
+	const projectID = "00000000-0000-0000-0000-000000000aaa"
+	const criterionID = "env_setup.policy_documented"
+
+	var seenMethod string
+	var seenPath string
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		// Server returns 200 OK with the post-clear row in the body
+		// (handler reloads after the ClearOverride UPDATE).
+		_ = json.NewEncoder(w).Encode(MetiAssessment{
+			ID:          "rid",
+			CriterionID: criterionID,
+			Status:      "needs_review",
+			// override_* are nulled post-clear
+		})
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+
+	err := client.ClearOverrideCriterion(context.Background(), projectID, criterionID, MetiClearOverrideRequest{
+		Note: "re-evaluated 2026-09-12: original override was a mis-read",
+	})
+	if err != nil {
+		t.Fatalf("F36: ClearOverrideCriterion error: %v", err)
+	}
+	if seenMethod != http.MethodDelete {
+		t.Errorf("F36: method = %s, want DELETE", seenMethod)
+	}
+	wantPath := "/api/v1/projects/" + projectID + "/meti/assessment/" + criterionID + "/override"
+	if seenPath != wantPath {
+		t.Errorf("F36: path = %s, want %s", seenPath, wantPath)
+	}
+	var req MetiClearOverrideRequest
+	if err := json.Unmarshal(seenBody, &req); err != nil {
+		t.Fatalf("F36: body parse: %v", err)
+	}
+	if !strings.Contains(req.Note, "re-evaluated") {
+		t.Errorf("F36: body Note = %q, want note round-trip", req.Note)
+	}
+}
+
+// TestClearOverrideCriterion_204Success — the client must also accept
+// 204 No Content (in case the handler ever switches to a body-less
+// success shape).
+func TestClearOverrideCriterion_204Success(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	err := client.ClearOverrideCriterion(context.Background(), "p", "c1", MetiClearOverrideRequest{Note: "ok"})
+	if err != nil {
+		t.Fatalf("204 success path: err = %v, want nil", err)
+	}
+}
+
+// TestClearOverrideCriterion_NoteValidation — empty / whitespace-only
+// / over-long notes must be rejected BEFORE hitting the server (F34
+// carry-over: 1..4096 chars after trim).
+func TestClearOverrideCriterion_NoteValidation(t *testing.T) {
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+
+	cases := []struct {
+		name string
+		note string
+	}{
+		{"empty", ""},
+		{"whitespace only", "   \t\n"},
+		{"over 4096 chars", strings.Repeat("x", 4097)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := client.ClearOverrideCriterion(context.Background(), "p", "c1", MetiClearOverrideRequest{Note: tc.note})
+			if err == nil {
+				t.Fatalf("expected error for note=%q", tc.note)
+			}
+		})
+	}
+	if hits != 0 {
+		t.Errorf("note validation must short-circuit BEFORE API call, hits = %d", hits)
+	}
+}
+
+// TestClearOverrideCriterion_EmptyCriterion_Validates — the CLI must
+// reject an empty criterion_id BEFORE hitting the server.
+func TestClearOverrideCriterion_EmptyCriterion_Validates(t *testing.T) {
+	var hits int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	err := client.ClearOverrideCriterion(context.Background(), "p", "   ", MetiClearOverrideRequest{Note: "ok"})
+	if err == nil {
+		t.Fatal("expected error for empty criterion_id")
+	}
+	if hits != 0 {
+		t.Errorf("validation must short-circuit BEFORE API call, hits = %d", hits)
+	}
+}
+
+// TestClearOverrideCriterion_404Permanent — the server returns 404
+// (generic body — no oracle) when the row does not exist OR there is
+// no override to clear. Permanent classification so CI does not retry.
+func TestClearOverrideCriterion_404Permanent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `{"error":"meti assessment override not found"}`)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	err := client.ClearOverrideCriterion(context.Background(), "p", "c1", MetiClearOverrideRequest{Note: "ok"})
+	var me *MetiError
+	if !errors.As(err, &me) {
+		t.Fatalf("err = %v, want *MetiError", err)
+	}
+	if !me.IsPermanent() {
+		t.Errorf("404 must classify permanent")
+	}
+}
+
+// TestClearOverrideCriterion_400NoteRejected — the server's
+// validateMetiOverrideNote 400 must be classified permanent (input
+// error, retry will not help).
+func TestClearOverrideCriterion_400NoteRejected(t *testing.T) {
+	// CLI-side note validation passes a non-empty payload; we then
+	// simulate the server-side validator rejecting the body (e.g. a
+	// hypothetical future tighter rule the CLI does not mirror).
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"override_note is required and must be 1-4096 characters"}`)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	err := client.ClearOverrideCriterion(context.Background(), "p", "c1", MetiClearOverrideRequest{Note: "ok"})
+	var me *MetiError
+	if !errors.As(err, &me) {
+		t.Fatalf("err = %v, want *MetiError", err)
+	}
+	if !me.IsPermanent() {
+		t.Errorf("400 (note validation) must classify permanent")
+	}
+}
+
+// TestClearOverrideCriterion_403Permanent — RequireWrite middleware
+// 403 must classify permanent.
+func TestClearOverrideCriterion_403Permanent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":"write permission required"}`)
+	}))
+	defer server.Close()
+	client := NewClient(server.URL, "k")
+	err := client.ClearOverrideCriterion(context.Background(), "p", "c1", MetiClearOverrideRequest{Note: "ok"})
+	var me *MetiError
+	if !errors.As(err, &me) {
+		t.Fatalf("err = %v, want *MetiError", err)
+	}
+	if !me.IsPermanent() {
+		t.Errorf("403 must classify permanent")
+	}
+}
+
+// ----------------------------------------------------------------------------
 // GetImprovementActions
 // ----------------------------------------------------------------------------
 
