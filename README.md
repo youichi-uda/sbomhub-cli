@@ -125,8 +125,11 @@ Exit code:
 
 #### `sbomhub llm bench` — 品質ベンチマーク
 
-sbomhub OSS source 配下の `llm-bench` harness を `go run` 経由で起動し、
-managed AI vs local LLM (Ollama) の VEX-triage 品質を 20 件の eval-set で比較する。
+sbomhub OSS source 配下の `llm-bench` harness を `go build` でコンパイル
+してから直接 exec し、 managed AI vs local LLM (Ollama) の VEX-triage 品質
+を 20 件の eval-set で比較する (M4 Codex review #F61: `go run` 経由では
+inner exit code が常に 1 にマスクされ、 M4-3 の F42 typed exit-code
+contract が壊れるため build + 直接 exec に切替)。
 
 ```bash
 # default: ./sbomhub を source として、 全 provider を bench
@@ -197,9 +200,14 @@ Exit code (wrapper preflight + M4-3 typed pass-through):
 |------|------|
 | 0 | 正常 |
 | 2 | usage / flag validation (M4-3 から透過) |
-| 3 | 恒久エラー (wrapper preflight: sbomhub source / eval-set / Go 不在 / 起動失敗、 もしくは M4-3 の fixture / config validation) |
+| 3 | 恒久エラー (wrapper preflight: sbomhub source / eval-set / Go 不在 / `go build` 失敗 / 起動失敗、 もしくは M4-3 の fixture / config validation、 もしくは M4-3 が contract 外の exit code を emit した場合の正規化 #F57) |
 | 4 | no providers configured (M4-3 から透過 — BYOK env を設定 or `--providers` から外す)、 または subprocess signal-killed |
 | 5 | execution failure (M4-3 から透過 — provider 一時障害の可能性、 retry 推奨) |
+
+※ M4 Codex review #F61: M4-3 binary は `go build` でコンパイル後に直接 exec
+されるため、 inner os.Exit(N) が wrapper の exit code にそのまま伝搬する
+(`go run` 経由では `go` 自体が常に exit 1 を返し、 F42 typed contract が
+silent にマスクされていた)。
 
 **Docker で `llm bench` を実行する場合**: default の `sbomhub-cli` image は
 slim 構成 (`alpine` + `ca-certificates`) で Go toolchain を含まないため、

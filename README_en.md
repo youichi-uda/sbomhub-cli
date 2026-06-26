@@ -126,9 +126,13 @@ Exit codes:
 
 #### `sbomhub llm bench` — quality benchmark
 
-Wraps the `llm-bench` harness shipped in the sbomhub OSS source and
-launches it via `go run`, comparing managed AI vs local LLM (Ollama)
-VEX-triage quality across a 20-case eval-set.
+Wraps the `llm-bench` harness shipped in the sbomhub OSS source:
+the wrapper compiles the bench binary on demand via `go build` and
+execs the resulting binary directly, then compares managed AI vs
+local LLM (Ollama) VEX-triage quality across a 20-case eval-set
+(M4 Codex review #F61: shelling out via `go run` masked the inner
+exit code as 1 and silently broke the M4-3 F42 typed exit-code
+contract — the wrapper now compiles + execs directly instead).
 
 ```bash
 # Default: source at ./sbomhub, all providers
@@ -201,9 +205,15 @@ Exit codes (wrapper preflight + M4-3 typed pass-through):
 |------|---------|
 | 0 | success |
 | 2 | usage / flag validation (forwarded from M4-3) |
-| 3 | permanent (wrapper preflight: missing sbomhub source / eval-set / Go toolchain / launch failure, or M4-3 fixture / config validation) |
+| 3 | permanent (wrapper preflight: missing sbomhub source / eval-set / Go toolchain / `go build` failure / launch failure, or M4-3 fixture / config validation, or renormalisation of an M4-3 exit code outside the documented contract #F57) |
 | 4 | no providers configured (forwarded from M4-3 — set BYOK env or drop the provider from `--providers`), or subprocess signal-killed |
 | 5 | execution failure (forwarded from M4-3 — likely transient provider outage; retry recommended) |
+
+Note: M4 Codex review #F61 — the M4-3 binary is compiled via
+`go build` and exec'd directly, so its inner `os.Exit(N)` propagates
+through to the wrapper's exit code (the pre-fix `go run` path
+always returned exit 1 from the `go` driver and silently masked
+the F42 typed contract).
 
 **Running `llm bench` from Docker**: the default `sbomhub-cli` image
 is slim (`alpine` + `ca-certificates`) and does not include a Go

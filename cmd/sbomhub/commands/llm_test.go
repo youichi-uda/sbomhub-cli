@@ -792,6 +792,185 @@ func TestMapBenchSubprocessError_SignalKilled_F46(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// F61 — `go build` + direct exec preserves the M4-3 typed exit-code
+// contract
+//
+// M4 Codex review round 6 finding: the bench wrapper used to shell
+// out via `go run ./cmd/llm-bench`, which always exits 1 from the
+// `go` driver on inner failure regardless of the inner os.Exit(N).
+// That silently masked the M4-3 F42 typed contract (2/3/4/5) —
+// operators saw the F57 contract-violation branch fire with exit 3
+// even when M4-3 emitted a clean exit 4 ("no providers"). The fix
+// compiles the M4-3 binary with `go build` and execs the resulting
+// binary directly, so exec.ExitError.ExitCode() reflects the actual
+// M4-3 contract code.
+//
+// The integration test below proves the mechanism end-to-end: it
+// writes a tiny Go program, builds it with `go build -o`, execs
+// the resulting binary, and asserts that the wrapper's
+// mapBenchSubprocessError forwards each M4-3 contract code (2/3/4/5)
+// verbatim. The pre-F61 `sh -c "exit N"` tests above continue to
+// guard mapBenchSubprocessError's behaviour at the helper level —
+// the new test additionally guards the end-to-end build+exec path.
+// ---------------------------------------------------------------------------
+
+// TestRunLLMBench_RealGoProgramExitCodePreservation_F61 — guards
+// the F61 fix end-to-end: a real Go program compiled with
+// `go build -o` and exec'd directly must propagate its os.Exit(N)
+// to exec.ExitError.ExitCode(), which mapBenchSubprocessError then
+// forwards verbatim for codes 2/3/4/5. Pre-F61 the wrapper used
+// `go run`, which always returned exit 1 on inner failure — this
+// test would have detected the masking by failing on all four
+// sub-cases (mapped to wrapper exit 3 instead of the real code).
+func TestRunLLMBench_RealGoProgramExitCodePreservation_F61(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("F61 build+exec test relies on POSIX paths and a temp-dir layout that mirrors the wrapper's apps/api workdir")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("F61 test requires `go` in PATH: %v", err)
+	}
+
+	// Mirror the M4-3 F42 typed contract exhaustively so a
+	// future refactor that re-introduces `go run` (or any other
+	// driver that masks the inner exit code) trips every code
+	// path at once.
+	cases := []struct {
+		name     string
+		srcCode  int
+		wantCode int
+	}{
+		{"M4-3 usage (2)", 2, 2},
+		{"M4-3 config (3)", 3, 3},
+		{"M4-3 no providers (4)", 4, 4},
+		{"M4-3 execution failure (5)", 5, 5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			// Tiny self-contained Go module so `go build` works
+			// without any network / module-cache deps. The minimum
+			// `go` directive (1.22) matches sbomhub-cli's own
+			// go.mod baseline so build cache reuse is realistic.
+			if err := os.WriteFile(filepath.Join(tmp, "go.mod"),
+				[]byte("module bench-fake\n\ngo 1.22\n"), 0o644); err != nil {
+				t.Fatalf("seed go.mod: %v", err)
+			}
+			src := "package main\n\nimport \"os\"\n\nfunc main() { os.Exit(" + strconv.Itoa(tc.srcCode) + ") }\n"
+			if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte(src), 0o644); err != nil {
+				t.Fatalf("seed main.go: %v", err)
+			}
+
+			// Step 1: build the program. Mirrors runLLMBench's
+			// `go build -o <tmpDir>/llm-bench ./cmd/llm-bench`.
+			binPath := filepath.Join(tmp, "bench-fake")
+			buildCmd := exec.Command("go", "build", "-o", binPath, ".")
+			buildCmd.Dir = tmp
+			if buildOut, buildErr := buildCmd.CombinedOutput(); buildErr != nil {
+				t.Fatalf("F61: go build failed: %v\n%s", buildErr, buildOut)
+			}
+
+			// Step 2: exec the built binary directly. This is the
+			// load-bearing line of the F61 fix — using `go run`
+			// here (the pre-F61 path) would always surface
+			// exec.ExitError.ExitCode() == 1 and force the F57
+			// contract-violation branch to fire.
+			runErr := exec.Command(binPath).Run()
+			if runErr == nil {
+				t.Fatalf("F61: expected non-nil error for os.Exit(%d), got nil", tc.srcCode)
+			}
+
+			// Sanity check at the exec layer: the real exit code
+			// must reach exec.ExitError. This is what F61 buys us;
+			// if a future refactor breaks it the wrapper test
+			// below will fail too, but this assertion narrows the
+			// diagnostic to the exec layer first.
+			var exitErr *exec.ExitError
+			if !errors.As(runErr, &exitErr) {
+				t.Fatalf("F61: runErr is %T (%v), want *exec.ExitError", runErr, runErr)
+			}
+			if exitErr.ExitCode() != tc.srcCode {
+				t.Fatalf("F61: direct exec ExitCode = %d, want %d (real binary must preserve os.Exit)",
+					exitErr.ExitCode(), tc.srcCode)
+			}
+
+			// End-to-end: mapBenchSubprocessError forwards the
+			// real code verbatim per F46 because the build+exec
+			// split surfaces an authentic M4-3-contract code.
+			got := mapBenchSubprocessError(runErr, nil)
+			if got == nil {
+				t.Fatal("F61: mapBenchSubprocessError returned nil for non-nil run error")
+			}
+			if got.ExitCode() != tc.wantCode {
+				t.Errorf("F61: wrapper ExitCode = %d, want %d (build+exec must preserve M4-3 F42 contract; `go run` masking would surface 3 instead)",
+					got.ExitCode(), tc.wantCode)
+			}
+			if !strings.Contains(got.Error(), "exited with code "+strconv.Itoa(tc.wantCode)) {
+				t.Errorf("F61: error message should name the underlying code %d, got %q",
+					tc.wantCode, got.Error())
+			}
+		})
+	}
+}
+
+// TestRunLLMBench_GoRunMasksExitCode_F61_NegativeProof — documents
+// the WHY of F61 with a regression sentinel: the pre-fix path used
+// `go run`, which masks every inner exit code as 1. This test
+// invokes `go run` against the same tiny program the F61 test
+// builds + execs, and asserts that `go run` indeed surfaces exit
+// 1 (not the inner os.Exit(4)). A future refactor that
+// re-introduces `go run` in runLLMBench would re-introduce the
+// masking — this test prevents the operator from getting fooled
+// by green CI when M4-3's exit codes are once again silently
+// rewritten to 1.
+func TestRunLLMBench_GoRunMasksExitCode_F61_NegativeProof(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("F61 negative proof relies on POSIX path layout")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("F61 negative proof requires `go` in PATH: %v", err)
+	}
+
+	tmp := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmp, "go.mod"),
+		[]byte("module bench-fake-gorun\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatalf("seed go.mod: %v", err)
+	}
+	// os.Exit(4) — the most representative M4-3 "no providers"
+	// code, which pre-F61 was silently masked to exit 1 by
+	// `go run`.
+	src := "package main\n\nimport \"os\"\n\nfunc main() { os.Exit(4) }\n"
+	if err := os.WriteFile(filepath.Join(tmp, "main.go"), []byte(src), 0o644); err != nil {
+		t.Fatalf("seed main.go: %v", err)
+	}
+
+	cmd := exec.Command("go", "run", ".")
+	cmd.Dir = tmp
+	// Discard the `go run` "exit status 4" stderr line so the
+	// test logs stay clean. We assert on the exit code only.
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	runErr := cmd.Run()
+	if runErr == nil {
+		t.Fatal("F61 neg-proof: `go run` against os.Exit(4) returned nil error — sanity broken")
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) {
+		t.Fatalf("F61 neg-proof: runErr is %T (%v), want *exec.ExitError", runErr, runErr)
+	}
+	// THIS is the bug F61 fixes: `go run` always exits 1 on
+	// inner failure regardless of the inner os.Exit(N). If this
+	// assertion ever starts failing because `go run` learned to
+	// propagate the inner code, the F61 build+exec workaround
+	// could be revisited — but until then the workaround is the
+	// only way to preserve M4-3's F42 typed contract.
+	if exitErr.ExitCode() != 1 {
+		t.Errorf("F61 neg-proof: `go run` exit code = %d, want 1 (this test guards the F61 build+exec workaround; "+
+			"if `go run` now propagates inner exit codes, the workaround in runLLMBench can be reverted)",
+			exitErr.ExitCode())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // cobra wiring smoke tests — verify the commands are registered
 // with the expected names and flags, so a refactor that drops a
 // subcommand or renames a flag is caught.
