@@ -1,0 +1,35 @@
+# Reduce the docker build context so `docker build` does not stream
+# the .git history (~MB) or local binaries to the daemon. Mirrors
+# .gitignore where relevant.
+
+# Git
+.git
+.gitignore
+.github
+
+# Editors / IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build outputs
+/sbomhub
+/sbomhub.exe
+dist/
+vendor/
+
+# Local config (must never enter an image)
+config.yaml
+
+# Docs and Dockerfiles themselves (the build context only needs the
+# Go source; the active Dockerfile is read directly by the daemon).
+README.md
+README_en.md
+LICENSE
+Dockerfile
+Dockerfile.bench

@@ -1,0 +1,55 @@
+# SBOMHub CLI - bench variant (M4-7 / Codex review #F54)
+#
+# The default `Dockerfile` produces a slim `alpine:3.19 + ca-certificates`
+# runtime image. That image cannot run `sbomhub llm bench` because the
+# bench subcommand shells out to `go run ./cmd/llm-bench` against the
+# operator's sbomhub OSS source checkout (see cmd/sbomhub/commands/llm.go
+# `runLLMBench`), and Go is not present in the slim runtime.
+#
+# This variant image bundles the Go toolchain + git so operators who
+# need `sbomhub llm bench` can pull a single image instead of
+# installing Go on the host. The trade-off is image size (~300MB
+# vs ~15MB for the slim default), so this is published as a separate
+# tag (`sbomhub-cli:bench`) rather than replacing the default.
+#
+# `sbomhub llm test` and every other subcommand work on the default
+# slim image; only `llm bench` needs this variant.
+FROM golang:1.22-alpine
+
+WORKDIR /app
+
+# git is required for `go run` to resolve module deps on a cold
+# cache. ca-certificates is required for HTTPS calls to LLM provider
+# endpoints (OpenAI / Anthropic / Gemini / Azure / Ollama).
+RUN apk add --no-cache git ca-certificates
+
+# Build the CLI from source.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=linux go build -o /usr/local/bin/sbomhub ./cmd/sbomhub
+
+# Config directory matches the default image.
+RUN mkdir -p /root/.sbomhub
+
+# Default to a working directory the operator can mount the sbomhub
+# OSS source into. Usage:
+#
+#   docker run --rm \
+#     -v "$(pwd)/sbomhub:/workspace/sbomhub" \
+#     -e OPENAI_API_KEY \
+#     -e ANTHROPIC_API_KEY \
+#     -e GOOGLE_API_KEY \
+#     ghcr.io/youichi-uda/sbomhub-cli:bench \
+#     llm bench --sbomhub-source /workspace/sbomhub
+#
+# The mount must be read-write because `go run` writes build artefacts
+# into $GOCACHE (defaults to /root/.cache/go-build inside the container
+# — outside the mount — but `go run` may also update go.sum on cold
+# module resolution).
+WORKDIR /workspace
+
+ENTRYPOINT ["sbomhub"]
+CMD ["llm", "bench", "--help"]
