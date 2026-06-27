@@ -126,30 +126,58 @@ Exit codes:
 
 #### `sbomhub llm bench` — quality benchmark
 
-Wraps the `llm-bench` harness shipped in the sbomhub OSS source:
-the wrapper compiles the bench binary on demand via `go build` and
-execs the resulting binary directly, then compares managed AI vs
-local LLM (Ollama) VEX-triage quality across a 20-case eval-set
-(M4 Codex review #F61: shelling out via `go run` masked the inner
-exit code as 1 and silently broke the M4-3 F42 typed exit-code
-contract — the wrapper now compiles + execs directly instead).
+By default (`SBOMHUB_BENCH_MODE=binary`), the wrapper downloads the
+pre-built `llm-bench` archive from the sbomhub GitHub Release,
+verifies it against `checksums.txt`, caches it, and execs the binary
+directly. Operators can compare managed AI vs local LLM (Ollama)
+VEX-triage quality across the 20-case eval-set without installing Go
+or checking out the sbomhub source.
+
+The old source-build path remains available with
+`SBOMHUB_BENCH_MODE=source` for upstream pre-release testing, patched
+local harnesses, or fully offline custom builds.
 
 ```bash
-# Default: source at ./sbomhub, all providers
+# Default: binary mode. Uses the CLI version or the latest release.
 sbomhub llm bench
 
 # Subset of providers + aggregation table
 sbomhub llm bench --providers ollama,gemini --markdown
 
-# Source at a different path + reduced case count
-sbomhub llm bench --sbomhub-source ../sbomhub --max-cases 10 --out result.jsonl
+# Pin the bench binary version
+SBOMHUB_BENCH_VERSION=v1.4.1 sbomhub llm bench --max-cases 10 --out result.jsonl
+
+# Offline / air-gapped: run a local binary and bypass download/cache
+sbomhub llm bench --bench-binary /opt/sbomhub/llm-bench
+
+# Backward compatibility: build from a source checkout
+SBOMHUB_BENCH_MODE=source sbomhub llm bench --sbomhub-source ../sbomhub
 ```
 
 **Prerequisites**:
-- A Go toolchain (1.22+) installed on the host
-- The sbomhub OSS source checked out locally (`--sbomhub-source` /
-  env `SBOMHUB_SOURCE` / default `./sbomhub`)
+- Binary mode needs HTTPS access to GitHub Releases
+- With `--bench-binary`, place `fixtures/llm-bench/cve-20-50.json`
+  beside the binary or pass `--eval-set`
+- Source mode needs a Go toolchain (1.22+) and a local sbomhub OSS
+  checkout (`--sbomhub-source` / env `SBOMHUB_SOURCE` / default
+  `./sbomhub`)
 - BYOK env vars exported for each provider under test (see the table)
+
+**Binary-mode version / cache**:
+
+| Setting | Purpose |
+|---------|---------|
+| `SBOMHUB_BENCH_MODE=binary` | Default. Download/cache the release archive and exec it |
+| `SBOMHUB_BENCH_MODE=source` | Old source checkout + `go build` path |
+| `SBOMHUB_BENCH_VERSION=v1.4.1` | Pin the sbomhub release tag |
+| `--bench-binary /path/to/llm-bench` | Bypass download/cache and exec this binary |
+
+Version resolution is `SBOMHUB_BENCH_VERSION` → the sbomhub-cli
+release version → GitHub API `releases/latest`. The cache path is
+`~/.cache/sbomhub-cli/llm-bench/<version>-<os>-<arch>/llm-bench`.
+The archive SHA-256 is checked against the same release's
+`checksums.txt`; if the cache marker (`.archive.sha256`) does not
+match, the wrapper warns and re-downloads.
 
 **BYOK environment variables**:
 
@@ -216,7 +244,7 @@ Exit codes (wrapper preflight + M4-3 typed pass-through):
 |------|---------|
 | 0 | success |
 | 2 | usage / flag validation (forwarded from M4-3) |
-| 3 | permanent (wrapper preflight: missing sbomhub source / eval-set / Go toolchain / `go build` failure / launch failure, or M4-3 fixture / config validation, or renormalisation of an M4-3 exit code outside the documented contract #F57) |
+| 3 | permanent (wrapper preflight: download/cache/checksum / missing sbomhub source / eval-set / Go toolchain / `go build` failure / launch failure, or M4-3 fixture / config validation, or renormalisation of an M4-3 exit code outside the documented contract #F57) |
 | 4 | no providers configured (forwarded from M4-3 — set BYOK env or drop the provider from `--providers`), or subprocess signal-killed |
 | 5 | execution failure (forwarded from M4-3 — likely transient provider outage; retry recommended) |
 
@@ -226,16 +254,21 @@ through to the wrapper's exit code (the pre-fix `go run` path
 always returned exit 1 from the `go` driver and silently masked
 the F42 typed contract).
 
-**Running `llm bench` from Docker**: the default `sbomhub-cli` image
-is slim (`alpine` + `ca-certificates`) and does not include a Go
-toolchain. A `sbomhub-cli:bench` variant image ships Go for this
-workflow:
+**Running `llm bench` from Docker**: binary mode works from the
+default slim image. Use the Go-equipped `sbomhub-cli:bench` variant
+only when you need source mode.
 
 ```bash
 docker run --rm \
-  -v "$(pwd)/sbomhub:/workspace/sbomhub" \
   -e OPENAI_API_KEY \
   -e ANTHROPIC_API_KEY \
+  ghcr.io/youichi-uda/sbomhub-cli:latest \
+  llm bench --providers openai,anthropic
+
+docker run --rm \
+  -v "$(pwd)/sbomhub:/workspace/sbomhub" \
+  -e SBOMHUB_BENCH_MODE=source \
+  -e OPENAI_API_KEY \
   ghcr.io/youichi-uda/sbomhub-cli:bench \
   llm bench --sbomhub-source /workspace/sbomhub
 ```

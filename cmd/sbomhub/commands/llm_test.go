@@ -19,8 +19,12 @@ package commands
 // sbomhub repo's M4-3 cmd/llm-bench harness.
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -34,6 +38,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
 )
 
@@ -971,6 +976,311 @@ func TestRunLLMBench_GoRunMasksExitCode_F61_NegativeProof(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// M5-2 — binary-mode release download/cache wrapper
+// ---------------------------------------------------------------------------
+
+func withFakeBenchReleaseServer(t *testing.T, archiveName string, archiveBytes []byte, checksumOverride string) *httptest.Server {
+	t.Helper()
+	sum := sha256.Sum256(archiveBytes)
+	checksum := hex.EncodeToString(sum[:])
+	if checksumOverride != "" {
+		checksum = checksumOverride
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/latest", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]string{"tag_name": "v9.8.7"})
+	})
+	mux.HandleFunc("/download/v9.8.7/checksums.txt", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, checksum+"  "+archiveName+"\n")
+	})
+	mux.HandleFunc("/download/v9.8.7/"+archiveName, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(archiveBytes)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func withBenchReleaseGlobals(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	oldDownloadBase := llmBenchReleaseDownloadBaseURL
+	oldLatestAPI := llmBenchLatestReleaseAPIURL
+	oldClient := llmBenchHTTPClient
+	llmBenchReleaseDownloadBaseURL = srv.URL + "/download"
+	llmBenchLatestReleaseAPIURL = srv.URL + "/api/latest"
+	llmBenchHTTPClient = srv.Client()
+	t.Cleanup(func() {
+		llmBenchReleaseDownloadBaseURL = oldDownloadBase
+		llmBenchLatestReleaseAPIURL = oldLatestAPI
+		llmBenchHTTPClient = oldClient
+	})
+}
+
+func buildFakeBenchTarGz(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	entries := []struct {
+		name string
+		mode int64
+		body string
+	}{
+		{"llm-bench", 0o755, "#!/bin/sh\nexit ${FAKE_BENCH_EXIT:-0}\n"},
+		{"LICENSE", 0o644, "test license\n"},
+		{"README.md", 0o644, "test readme\n"},
+		{"fixtures/llm-bench/cve-20-50.json", 0o644, "[]\n"},
+	}
+	for _, entry := range entries {
+		if err := tw.WriteHeader(&tar.Header{
+			Name: entry.name,
+			Mode: entry.mode,
+			Size: int64(len(entry.body)),
+		}); err != nil {
+			t.Fatalf("tar header: %v", err)
+		}
+		if _, err := io.WriteString(tw, entry.body); err != nil {
+			t.Fatalf("tar body: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func resetBenchBinaryGlobals(t *testing.T) {
+	t.Helper()
+	oldVersion := version
+	oldBinary := llmBenchBinary
+	oldEvalSet := llmBenchEvalSet
+	oldProviders := llmBenchProviders
+	oldMaxCases := llmBenchMaxCases
+	oldOut := llmBenchOut
+	oldMarkdown := llmBenchMarkdown
+	oldTimeout := llmBenchTimeoutSec
+	version = "dev"
+	llmBenchBinary = ""
+	llmBenchEvalSet = ""
+	llmBenchProviders = llmBenchDefaultProviders
+	llmBenchMaxCases = llmBenchDefaultMaxCases
+	llmBenchOut = ""
+	llmBenchMarkdown = false
+	llmBenchTimeoutSec = llmBenchDefaultTimeoutSec
+	t.Cleanup(func() {
+		version = oldVersion
+		llmBenchBinary = oldBinary
+		llmBenchEvalSet = oldEvalSet
+		llmBenchProviders = oldProviders
+		llmBenchMaxCases = oldMaxCases
+		llmBenchOut = oldOut
+		llmBenchMarkdown = oldMarkdown
+		llmBenchTimeoutSec = oldTimeout
+	})
+}
+
+func TestLLMBenchBinaryReleaseTarget_URLAndPlatform_M5(t *testing.T) {
+	t.Setenv("SBOMHUB_BENCH_VERSION", "v1.4.1")
+	target, err := resolveLLMBenchReleaseTarget(context.Background())
+	if err != nil {
+		t.Fatalf("resolve target: %v", err)
+	}
+	if target.Tag != "v1.4.1" {
+		t.Fatalf("tag = %s, want v1.4.1", target.Tag)
+	}
+	if target.OS != runtime.GOOS || target.Arch != runtime.GOARCH {
+		t.Fatalf("platform = %s/%s, want %s/%s", target.OS, target.Arch, runtime.GOOS, runtime.GOARCH)
+	}
+	wantExt := ".tar.gz"
+	if runtime.GOOS == "windows" {
+		wantExt = ".zip"
+	}
+	if !strings.HasSuffix(target.FileName, wantExt) {
+		t.Errorf("filename = %s, want suffix %s", target.FileName, wantExt)
+	}
+	url := llmBenchArchiveURL(target)
+	if !strings.Contains(url, "/download/v1.4.1/llm-bench-v1.4.1-"+runtime.GOOS+"-"+runtime.GOARCH) {
+		t.Errorf("archive URL = %s", url)
+	}
+}
+
+func TestLLMBenchVersionResolution_LatestFallback_M5(t *testing.T) {
+	resetBenchBinaryGlobals(t)
+	t.Setenv("SBOMHUB_BENCH_VERSION", "")
+	archiveName := "llm-bench-v9.8.7-" + runtime.GOOS + "-" + runtime.GOARCH + ".tar.gz"
+	srv := withFakeBenchReleaseServer(t, archiveName, buildFakeBenchTarGz(t), "")
+	withBenchReleaseGlobals(t, srv)
+	got, err := resolveLLMBenchVersion(context.Background())
+	if err != nil {
+		t.Fatalf("resolve version: %v", err)
+	}
+	if got != "v9.8.7" {
+		t.Errorf("version = %s, want v9.8.7", got)
+	}
+}
+
+func TestLLMBenchBinaryCacheMissDownloadsAndExtracts_M5(t *testing.T) {
+	resetBenchBinaryGlobals(t)
+	t.Setenv("SBOMHUB_BENCH_VERSION", "v9.8.7")
+	cacheRoot := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	archiveName := "llm-bench-v9.8.7-" + runtime.GOOS + "-" + runtime.GOARCH + ".tar.gz"
+	srv := withFakeBenchReleaseServer(t, archiveName, buildFakeBenchTarGz(t), "")
+	withBenchReleaseGlobals(t, srv)
+
+	var stderr bytes.Buffer
+	got, err := ensureCachedLLMBenchBinary(context.Background(), &OutputConfig{Writer: io.Discard, ErrWriter: &stderr})
+	if err != nil {
+		t.Fatalf("ensure cache: %v", err)
+	}
+	if !strings.HasPrefix(got.BinaryPath, cacheRoot) {
+		t.Errorf("binary path = %s, want under %s", got.BinaryPath, cacheRoot)
+	}
+	if !isExecutableFile(got.BinaryPath) {
+		t.Fatalf("cached binary is not executable: %s", got.BinaryPath)
+	}
+	if _, err := os.Stat(filepath.Join(got.WorkDir, "fixtures", "llm-bench", "cve-20-50.json")); err != nil {
+		t.Fatalf("fixture not extracted: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(got.WorkDir, ".archive.sha256")); err != nil {
+		t.Fatalf("checksum marker not written: %v", err)
+	}
+	if stderr.Len() != 0 {
+		t.Errorf("unexpected stderr: %s", stderr.String())
+	}
+}
+
+func TestLLMBenchBinaryCacheHitSkipsArchiveDownload_M5(t *testing.T) {
+	resetBenchBinaryGlobals(t)
+	t.Setenv("SBOMHUB_BENCH_VERSION", "v9.8.7")
+	cacheRoot := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	archiveBytes := buildFakeBenchTarGz(t)
+	archiveName := "llm-bench-v9.8.7-" + runtime.GOOS + "-" + runtime.GOARCH + ".tar.gz"
+	sum := sha256.Sum256(archiveBytes)
+	wantChecksum := hex.EncodeToString(sum[:])
+	target := llmBenchReleaseTarget{Tag: "v9.8.7", OS: runtime.GOOS, Arch: runtime.GOARCH, Ext: ".tar.gz", FileName: archiveName}
+	cacheDir, err := llmBenchCacheDir(target)
+	if err != nil {
+		t.Fatalf("cache dir: %v", err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+	bin := filepath.Join(cacheDir, llmBenchBinaryName(runtime.GOOS))
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("seed binary: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, ".archive.sha256"), []byte(wantChecksum+"\n"), 0o644); err != nil {
+		t.Fatalf("seed checksum: %v", err)
+	}
+
+	archiveHits := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/download/v9.8.7/checksums.txt", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, wantChecksum+"  "+archiveName+"\n")
+	})
+	mux.HandleFunc("/download/v9.8.7/"+archiveName, func(w http.ResponseWriter, r *http.Request) {
+		archiveHits++
+		_, _ = w.Write(archiveBytes)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	withBenchReleaseGlobals(t, srv)
+
+	got, err := ensureCachedLLMBenchBinary(context.Background(), &OutputConfig{Writer: io.Discard, ErrWriter: io.Discard})
+	if err != nil {
+		t.Fatalf("ensure cache: %v", err)
+	}
+	if got.BinaryPath != bin {
+		t.Errorf("binary path = %s, want %s", got.BinaryPath, bin)
+	}
+	if archiveHits != 0 {
+		t.Errorf("archive downloads = %d, want 0 on cache hit", archiveHits)
+	}
+}
+
+func TestLLMBenchBinaryCacheCorruptionRedownloads_M5(t *testing.T) {
+	resetBenchBinaryGlobals(t)
+	t.Setenv("SBOMHUB_BENCH_VERSION", "v9.8.7")
+	cacheRoot := t.TempDir()
+	t.Setenv("XDG_CACHE_HOME", cacheRoot)
+	archiveBytes := buildFakeBenchTarGz(t)
+	archiveName := "llm-bench-v9.8.7-" + runtime.GOOS + "-" + runtime.GOARCH + ".tar.gz"
+	target := llmBenchReleaseTarget{Tag: "v9.8.7", OS: runtime.GOOS, Arch: runtime.GOARCH, Ext: ".tar.gz", FileName: archiveName}
+	cacheDir, err := llmBenchCacheDir(target)
+	if err != nil {
+		t.Fatalf("cache dir: %v", err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		t.Fatalf("mkdir cache: %v", err)
+	}
+	bin := filepath.Join(cacheDir, llmBenchBinaryName(runtime.GOOS))
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 7\n"), 0o755); err != nil {
+		t.Fatalf("seed corrupt binary: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, ".archive.sha256"), []byte(strings.Repeat("0", 64)+"\n"), 0o644); err != nil {
+		t.Fatalf("seed corrupt checksum: %v", err)
+	}
+	srv := withFakeBenchReleaseServer(t, archiveName, archiveBytes, "")
+	withBenchReleaseGlobals(t, srv)
+
+	var stderr bytes.Buffer
+	got, err := ensureCachedLLMBenchBinary(context.Background(), &OutputConfig{Writer: io.Discard, ErrWriter: &stderr})
+	if err != nil {
+		t.Fatalf("ensure cache: %v", err)
+	}
+	if got.BinaryPath != bin {
+		t.Errorf("binary path = %s, want %s", got.BinaryPath, bin)
+	}
+	if !strings.Contains(stderr.String(), "checksum mismatch") {
+		t.Errorf("stderr missing checksum warning: %s", stderr.String())
+	}
+	body, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatalf("read binary: %v", err)
+	}
+	if !strings.Contains(string(body), "FAKE_BENCH_EXIT") {
+		t.Errorf("binary was not replaced by archive payload: %q", string(body))
+	}
+}
+
+func TestLLMBenchBinaryModeExitCodePropagation_M5(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("binary-mode shell fixture requires POSIX sh")
+	}
+	resetBenchBinaryGlobals(t)
+	workDir := t.TempDir()
+	bin := filepath.Join(workDir, "llm-bench")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit \"$FAKE_BENCH_EXIT\"\n"), 0o755); err != nil {
+		t.Fatalf("seed binary: %v", err)
+	}
+	fixture := filepath.Join(workDir, "fixtures", "llm-bench", "cve-20-50.json")
+	if err := os.MkdirAll(filepath.Dir(fixture), 0o755); err != nil {
+		t.Fatalf("fixture dir: %v", err)
+	}
+	if err := os.WriteFile(fixture, []byte("[]"), 0o644); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	llmBenchBinary = bin
+	llmBenchProviders = "openai"
+	llmBenchMaxCases = 1
+	llmBenchTimeoutSec = 1
+	t.Setenv("FAKE_BENCH_EXIT", "5")
+	got := runLLMBenchBinaryMode(&cobra.Command{}, &OutputConfig{Writer: io.Discard, ErrWriter: io.Discard})
+	exitErr, ok := got.(*llmExitError)
+	if !ok {
+		t.Fatalf("err = %v (%T), want *llmExitError", got, got)
+	}
+	if exitErr.ExitCode() != 5 {
+		t.Errorf("binary-mode exit = %d, want 5", exitErr.ExitCode())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // cobra wiring smoke tests — verify the commands are registered
 // with the expected names and flags, so a refactor that drops a
 // subcommand or renames a flag is caught.
@@ -1020,7 +1330,7 @@ func TestLLMBenchCmd_Flags(t *testing.T) {
 	}
 	for _, want := range []string{
 		"providers", "eval-set", "max-cases",
-		"sbomhub-source", "out", "markdown", "timeout",
+		"sbomhub-source", "bench-binary", "out", "markdown", "timeout",
 	} {
 		if cmd.Flags().Lookup(want) == nil {
 			t.Errorf("--%s flag missing on `llm bench`", want)

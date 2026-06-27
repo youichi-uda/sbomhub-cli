@@ -82,13 +82,13 @@ jobs:
   #   2. Spin up a tiny stdlib python http.server that mimics sbomhub's
   #      public /api/v1/health response ({"status":"ok","mode":"self-host"})
   #      and verify the default image's `llm test --json` exits 0 against it.
-  #   3. Materialise a throwaway fake sbomhub OSS checkout containing a
-  #      stub `apps/api/cmd/llm-bench/main.go` that exits with whatever
-  #      $FAKE_BENCH_EXIT requests, plus the canonical eval-set fixture
-  #      path the wrapper preflights via os.Stat. Run the bench image
-  #      against it four times (FAKE_BENCH_EXIT in {2,3,4,5}) and assert
-  #      the wrapper's exit code matches verbatim — that's the M4-3 F42
-  #      typed contract the wrapper promises via M4 review #F46.
+  #   3. Materialise a throwaway fake pre-built llm-bench binary plus the
+  #      archive-style fixtures/llm-bench/cve-20-50.json path used by
+  #      binary mode. Run the bench image with SBOMHUB_BENCH_MODE=binary
+  #      and --bench-binary against it four times (FAKE_BENCH_EXIT in
+  #      {2,3,4,5}) and assert the wrapper's exit code matches verbatim —
+  #      that's the M4-3 F42 typed contract the wrapper promises via M4
+  #      review #F46 and M5-2 binary execution.
   #
   # Network: the smoke step uses `--network=host` so the in-container CLI
   # can hit the host-side mock health server. ubuntu-latest exposes the
@@ -220,66 +220,38 @@ jobs:
             sbomhub-cli:ci-test \
             llm test --json
 
-      - name: Prepare fake sbomhub source for bench exit-code smoke
+      - name: Prepare fake pre-built llm-bench binary for bench exit-code smoke
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/fake-sbomhub"
-          mkdir -p "$ROOT/apps/api/cmd/llm-bench"
-          mkdir -p "$ROOT/apps/api/test/fixtures/llm-bench"
-          # apps/api/go.mod must satisfy the wrapper's preflight
-          # (os.Stat <workDir>/go.mod) AND match the bench image's
-          # baked-in Go toolchain (golang:1.25-alpine — see
-          # Dockerfile.bench's M4 #F56 rationale).
-          cat > "$ROOT/apps/api/go.mod" <<'EOF'
-          module github.com/sbomhub/sbomhub/apps/api
-
-          go 1.25
+          ROOT="$RUNNER_TEMP/fake-llm-bench"
+          mkdir -p "$ROOT/fixtures/llm-bench"
+          # Fake pre-built bench binary: ignores every wrapper flag and
+          # exits with whatever $FAKE_BENCH_EXIT requests. This exercises
+          # the M5-2 binary-mode exec path without depending on GitHub
+          # Releases during CI.
+          cat > "$ROOT/llm-bench" <<'EOF'
+          #!/bin/sh
+          exit "${FAKE_BENCH_EXIT:-0}"
           EOF
-          # Fake bench binary: ignores every wrapper flag and exits with
-          # whatever $FAKE_BENCH_EXIT requests. Uses only stdlib so the
-          # `go build` step inside the container completes without
-          # touching GOPROXY / the public module mirror.
-          cat > "$ROOT/apps/api/cmd/llm-bench/main.go" <<'EOF'
-          // Stub bench binary for sbomhub-cli CI docker-smoke.
-          // Substitutes for sbomhub/apps/api/cmd/llm-bench so the
-          // M4-3 F42 typed exit-code contract (2/3/4/5) can be
-          // exercised end-to-end against the bench Docker image
-          // without pulling the full sbomhub OSS checkout into CI.
-          package main
-
-          import (
-              "os"
-              "strconv"
-          )
-
-          func main() {
-              // FAKE_BENCH_EXIT is set by the CI smoke step; default 0
-              // when unset so an accidental invocation behaves as
-              // "successful run" rather than a crash.
-              code, _ := strconv.Atoi(os.Getenv("FAKE_BENCH_EXIT"))
-              os.Exit(code)
-          }
-          EOF
-          # The wrapper resolves --eval-set against <source>/apps/api/
-          # test/fixtures/llm-bench/cve-20-50.json and os.Stat()s it
-          # before exec'ing the bench binary; provide a stub so the
-          # preflight passes. The fake bench binary itself ignores the
-          # contents.
-          echo '[]' > "$ROOT/apps/api/test/fixtures/llm-bench/cve-20-50.json"
+          chmod +x "$ROOT/llm-bench"
+          # Binary mode resolves the default eval-set beside the
+          # executable, matching the release archive layout.
+          echo '[]' > "$ROOT/fixtures/llm-bench/cve-20-50.json"
 
       - name: Bench image inner exit code pass-through smoke (N=2/3/4/5)
         run: |
           set -uo pipefail
-          ROOT="$RUNNER_TEMP/fake-sbomhub"
+          ROOT="$RUNNER_TEMP/fake-llm-bench"
           FAIL=0
           for N in 2 3 4 5; do
             set +e
             docker run --rm \
               -v "$ROOT:/workspace/sbomhub" \
+              -e SBOMHUB_BENCH_MODE=binary \
               -e FAKE_BENCH_EXIT="$N" \
               sbomhub-cli:ci-bench \
               llm bench \
-                --sbomhub-source /workspace/sbomhub \
+                --bench-binary /workspace/sbomhub/llm-bench \
                 --providers openai \
                 --max-cases 1 \
                 --timeout 5
@@ -471,38 +443,22 @@ jobs:
             sbomhub-cli:ci-test \
             llm test --json
 
-      - name: Prepare fake sbomhub source for bench exit-code smoke
+      - name: Prepare fake pre-built llm-bench binary for bench exit-code smoke
         run: |
           set -euo pipefail
-          ROOT="$RUNNER_TEMP/fake-sbomhub"
-          mkdir -p "$ROOT/apps/api/cmd/llm-bench"
-          mkdir -p "$ROOT/apps/api/test/fixtures/llm-bench"
-          cat > "$ROOT/apps/api/go.mod" <<'EOF'
-          module github.com/sbomhub/sbomhub/apps/api
-
-          go 1.25
+          ROOT="$RUNNER_TEMP/fake-llm-bench"
+          mkdir -p "$ROOT/fixtures/llm-bench"
+          cat > "$ROOT/llm-bench" <<'EOF'
+          #!/bin/sh
+          exit "${FAKE_BENCH_EXIT:-0}"
           EOF
-          cat > "$ROOT/apps/api/cmd/llm-bench/main.go" <<'EOF'
-          // Stub bench binary — mirrors the Linux smoke job. See the
-          // `docker-smoke` (Linux) prepare step for full rationale.
-          package main
-
-          import (
-              "os"
-              "strconv"
-          )
-
-          func main() {
-              code, _ := strconv.Atoi(os.Getenv("FAKE_BENCH_EXIT"))
-              os.Exit(code)
-          }
-          EOF
-          echo '[]' > "$ROOT/apps/api/test/fixtures/llm-bench/cve-20-50.json"
+          chmod +x "$ROOT/llm-bench"
+          echo '[]' > "$ROOT/fixtures/llm-bench/cve-20-50.json"
 
       - name: Bench image inner exit code pass-through smoke (N=2/3/4/5)
         run: |
           set -uo pipefail
-          ROOT="$RUNNER_TEMP/fake-sbomhub"
+          ROOT="$RUNNER_TEMP/fake-llm-bench"
           FAIL=0
           for N in 2 3 4 5; do
             set +e
@@ -511,10 +467,11 @@ jobs:
             # --network flag — works identically on Linux and macOS.
             docker run --rm \
               -v "$ROOT:/workspace/sbomhub" \
+              -e SBOMHUB_BENCH_MODE=binary \
               -e FAKE_BENCH_EXIT="$N" \
               sbomhub-cli:ci-bench \
               llm bench \
-                --sbomhub-source /workspace/sbomhub \
+                --bench-binary /workspace/sbomhub/llm-bench \
                 --providers openai \
                 --max-cases 1 \
                 --timeout 5

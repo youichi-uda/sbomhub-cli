@@ -125,27 +125,53 @@ Exit code:
 
 #### `sbomhub llm bench` — 品質ベンチマーク
 
-sbomhub OSS source 配下の `llm-bench` harness を `go build` でコンパイル
-してから直接 exec し、 managed AI vs local LLM (Ollama) の VEX-triage 品質
-を 20 件の eval-set で比較する (M4 Codex review #F61: `go run` 経由では
-inner exit code が常に 1 にマスクされ、 M4-3 の F42 typed exit-code
-contract が壊れるため build + 直接 exec に切替)。
+既定 (`SBOMHUB_BENCH_MODE=binary`) では sbomhub GitHub Release から
+pre-built `llm-bench` archive を download し、 checksum 検証後に cache して
+直接 exec する。 operator は Go toolchain や sbomhub source checkout なしで
+managed AI vs local LLM (Ollama) の VEX-triage 品質を 20 件の eval-set で
+比較できる。
+
+旧来の source build 経路は `SBOMHUB_BENCH_MODE=source` で維持している。
+sbomhub upstream の pre-release を試す、 source patch 済み harness を使う、
+または完全 offline の custom build を実行する場合に使う。
 
 ```bash
-# default: ./sbomhub を source として、 全 provider を bench
+# default: binary mode。自身の CLI version または latest release の llm-bench を使う
 sbomhub llm bench
 
 # provider 限定 + 集計 markdown
 sbomhub llm bench --providers ollama,gemini --markdown
 
-# 別 location の source + 件数縮小
-sbomhub llm bench --sbomhub-source ../sbomhub --max-cases 10 --out result.jsonl
+# bench binary version を固定
+SBOMHUB_BENCH_VERSION=v1.4.1 sbomhub llm bench --max-cases 10 --out result.jsonl
+
+# offline / air-gapped: 手元の binary を直接実行し、download/cache を bypass
+sbomhub llm bench --bench-binary /opt/sbomhub/llm-bench
+
+# backward compat: source checkout から go build して実行
+SBOMHUB_BENCH_MODE=source sbomhub llm bench --sbomhub-source ../sbomhub
 ```
 
 **前提**:
-- ローカルに Go toolchain (1.22+) がインストールされていること
-- sbomhub OSS の source が手元に checkout 済 (`--sbomhub-source` / 環境変数 `SBOMHUB_SOURCE` / 既定 `./sbomhub`)
+- binary mode では GitHub Release へ HTTPS 接続できること
+- `--bench-binary` 指定時は手元の binary と同じ directory 配下に `fixtures/llm-bench/cve-20-50.json` があること、または `--eval-set` で明示すること
+- source mode では Go toolchain (1.22+) と sbomhub OSS source checkout があること (`--sbomhub-source` / 環境変数 `SBOMHUB_SOURCE` / 既定 `./sbomhub`)
 - 比較したい provider の BYOK 環境変数が export 済 (下の表)
+
+**binary mode の version / cache**:
+
+| 設定 | 内容 |
+|------|------|
+| `SBOMHUB_BENCH_MODE=binary` | 既定。 release archive を download/cache して実行 |
+| `SBOMHUB_BENCH_MODE=source` | 旧 source checkout + `go build` 経路 |
+| `SBOMHUB_BENCH_VERSION=v1.4.1` | 使用する sbomhub release tag を固定 |
+| `--bench-binary /path/to/llm-bench` | download/cache を bypass して指定 binary を直接実行 |
+
+version 解決は `SBOMHUB_BENCH_VERSION` → sbomhub-cli 自身の release version
+→ GitHub API `releases/latest` の順。 cache は
+`~/.cache/sbomhub-cli/llm-bench/<version>-<os>-<arch>/llm-bench` に置く。
+archive は同じ release の `checksums.txt` に載る SHA-256 と照合し、 cache
+marker (`.archive.sha256`) が不一致なら warning を出して再 download する。
 
 **BYOK 環境変数**:
 
@@ -210,7 +236,7 @@ Exit code (wrapper preflight + M4-3 typed pass-through):
 |------|------|
 | 0 | 正常 |
 | 2 | usage / flag validation (M4-3 から透過) |
-| 3 | 恒久エラー (wrapper preflight: sbomhub source / eval-set / Go 不在 / `go build` 失敗 / 起動失敗、 もしくは M4-3 の fixture / config validation、 もしくは M4-3 が contract 外の exit code を emit した場合の正規化 #F57) |
+| 3 | 恒久エラー (wrapper preflight: download/cache/checksum / sbomhub source / eval-set / Go 不在 / `go build` 失敗 / 起動失敗、 もしくは M4-3 の fixture / config validation、 もしくは M4-3 が contract 外の exit code を emit した場合の正規化 #F57) |
 | 4 | no providers configured (M4-3 から透過 — BYOK env を設定 or `--providers` から外す)、 または subprocess signal-killed |
 | 5 | execution failure (M4-3 から透過 — provider 一時障害の可能性、 retry 推奨) |
 
@@ -219,15 +245,21 @@ Exit code (wrapper preflight + M4-3 typed pass-through):
 (`go run` 経由では `go` 自体が常に exit 1 を返し、 F42 typed contract が
 silent にマスクされていた)。
 
-**Docker で `llm bench` を実行する場合**: default の `sbomhub-cli` image は
-slim 構成 (`alpine` + `ca-certificates`) で Go toolchain を含まないため、
-`llm bench` 用の variant image (`sbomhub-cli:bench`) を別途用意している。
+**Docker で `llm bench` を実行する場合**: binary mode は default の slim
+image でも動作する。 source mode が必要な場合だけ Go toolchain 入りの
+variant image (`sbomhub-cli:bench`) を使う。
 
 ```bash
 docker run --rm \
-  -v "$(pwd)/sbomhub:/workspace/sbomhub" \
   -e OPENAI_API_KEY \
   -e ANTHROPIC_API_KEY \
+  ghcr.io/youichi-uda/sbomhub-cli:latest \
+  llm bench --providers openai,anthropic
+
+docker run --rm \
+  -v "$(pwd)/sbomhub:/workspace/sbomhub" \
+  -e SBOMHUB_BENCH_MODE=source \
+  -e OPENAI_API_KEY \
   ghcr.io/youichi-uda/sbomhub-cli:bench \
   llm bench --sbomhub-source /workspace/sbomhub
 ```

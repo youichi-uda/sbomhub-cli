@@ -131,16 +131,25 @@ package commands
 //     production.
 
 import (
+	"archive/tar"
+	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
@@ -212,9 +221,16 @@ var (
 	llmBenchEvalSet       string
 	llmBenchMaxCases      int
 	llmBenchSbomhubSource string
+	llmBenchBinary        string
 	llmBenchOut           string
 	llmBenchMarkdown      bool
 	llmBenchTimeoutSec    int
+)
+
+var (
+	llmBenchReleaseDownloadBaseURL = "https://github.com/youichi-uda/sbomhub/releases/download"
+	llmBenchLatestReleaseAPIURL    = "https://api.github.com/repos/youichi-uda/sbomhub/releases/latest"
+	llmBenchHTTPClient             = &http.Client{Timeout: 60 * time.Second}
 )
 
 // ---------------------------------------------------------------------------
@@ -233,10 +249,11 @@ Subcommands:
           (公開されていれば) provider / model 情報を表示
           Probe /api/v1/health and report connectivity + (when published)
           provider / model
-  bench   sbomhub source 配下の llm-bench harness を実行し、 managed
-          AI vs local LLM の品質を 20 件 eval-set で比較
-          Run the sbomhub-side llm-bench harness against the bundled
-          20-case eval-set to compare managed AI vs local LLM quality
+  bench   llm-bench release binary (default) または sbomhub source build
+          を実行し、 managed AI vs local LLM の品質を 20 件 eval-set で比較
+          Run the llm-bench release binary (default) or source build
+          against the bundled 20-case eval-set to compare managed AI
+          vs local LLM quality
 
 使用例 / Examples:
   sbomhub llm test
@@ -273,19 +290,22 @@ Exit codes:
 var llmBenchCmd = &cobra.Command{
 	Use:   "bench",
 	Short: "LLM プロバイダの品質ベンチマーク / Benchmark LLM provider quality",
-	Long: `sbomhub source 配下の llm-bench harness (sbomhub/apps/api/cmd/
-llm-bench) を実行し、 managed AI と local LLM (Ollama) の VEX-triage
-品質を 20 件の eval-set で比較します。
+	Long: `sbomhub release artifact として配布される llm-bench binary を実行し、
+managed AI と local LLM (Ollama) の VEX-triage 品質を 20 件の eval-set で
+比較します。既定は SBOMHUB_BENCH_MODE=binary です。
 
 前提 / Prerequisites:
-  - Go toolchain がインストールされていること (M4-3 を ` + "`go build`" + ` で
-    コンパイルしてから直接 exec)
-    A Go toolchain must be installed (the wrapper compiles the
-    M4-3 bench binary on demand via ` + "`go build`" + ` and execs the
-    resulting binary directly — M4 Codex review #F61)
-  - sbomhub OSS の source が手元に checkout されていること
-    The sbomhub OSS source must be checked out locally
-    (--sbomhub-source / SBOMHUB_SOURCE / ./sbomhub のいずれか)
+  - binary mode は GitHub Release から llm-bench archive を download し、
+    ~/.cache/sbomhub-cli/llm-bench/<version>-<os>-<arch>/ に cache します
+    Binary mode downloads the pre-built llm-bench archive from GitHub
+    Releases and caches it under ~/.cache/sbomhub-cli/llm-bench/...
+  - offline / air-gapped では --bench-binary <path> で manual binary を指定
+    Use --bench-binary <path> to bypass download/cache in offline or
+    air-gapped environments
+  - source mode が必要な場合は SBOMHUB_BENCH_MODE=source を指定し、
+    sbomhub OSS source を --sbomhub-source / SBOMHUB_SOURCE / ./sbomhub で渡します
+    Set SBOMHUB_BENCH_MODE=source to keep the old source checkout +
+    ` + "`go build`" + ` path
   - 比較したい provider の BYOK env が設定されていること
     BYOK env vars for the providers under test must be set
     (OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY /
@@ -300,16 +320,18 @@ llm-bench) を実行し、 managed AI と local LLM (Ollama) の VEX-triage
 使用例 / Examples:
   sbomhub llm bench
   sbomhub llm bench --providers ollama,gemini --markdown
-  sbomhub llm bench --sbomhub-source ../sbomhub --max-cases 10 --out result.jsonl
+  SBOMHUB_BENCH_VERSION=v1.4.1 sbomhub llm bench --max-cases 10
+  sbomhub llm bench --bench-binary /opt/sbomhub/llm-bench
+  SBOMHUB_BENCH_MODE=source sbomhub llm bench --sbomhub-source ../sbomhub
 
 Exit codes (wrapper preflight + M4-3 F42 typed pass-through):
   0  正常終了 / success
   2  usage / flag validation failure (forwarded from M4-3)
-  3  恒久エラー / permanent — wrapper preflight (sbomhub source 不在 /
-     eval-set 不在 / Go toolchain 不在 / ` + "`go build`" + ` 失敗 / launch
-     failure)、 M4-3 の fixture / config validation、 もしくは M4-3
-     binary が documented contract 外の exit code を emit した場合の
-     正規化 (F57)
+  3  恒久エラー / permanent — wrapper preflight (download/cache/checksum /
+     sbomhub source 不在 / eval-set 不在 / Go toolchain 不在 /
+     ` + "`go build`" + ` 失敗 / launch failure)、 M4-3 の fixture / config
+     validation、 もしくは M4-3 binary が documented contract 外の exit
+     code を emit した場合の正規化 (F57)
   4  no providers configured (forwarded from M4-3 — set BYOK env or
      drop the missing provider from --providers) — または wrapper
      subprocess の signal-killed / abnormal termination
@@ -351,6 +373,8 @@ func init() {
 		"1 provider あたり最大 case 数 (F25 fan-out cap) / per-provider case cap")
 	llmBenchCmd.Flags().StringVar(&llmBenchSbomhubSource, "sbomhub-source", "",
 		"sbomhub OSS source の path (env SBOMHUB_SOURCE / 既定 ./sbomhub) / path to sbomhub OSS source")
+	llmBenchCmd.Flags().StringVar(&llmBenchBinary, "bench-binary", "",
+		"download/cache を bypass して実行する llm-bench binary path / manual llm-bench binary path (bypasses download/cache)")
 	llmBenchCmd.Flags().StringVar(&llmBenchOut, "out", "",
 		"JSONL 出力 file path (省略時 stdout) / JSONL output file (default stdout)")
 	llmBenchCmd.Flags().BoolVar(&llmBenchMarkdown, "markdown", false,
@@ -431,14 +455,14 @@ func renderLLMTest(out *OutputConfig, res *api.LLMHealthResponse, baseURL string
 		// questions ("can the CLI reach the API server" vs "does the
 		// API server believe its LLM is reachable").
 		payload := map[string]interface{}{
-			"connectivity":      "ok",
-			"api_url":           baseURL,
-			"status":            res.Status,
-			"mode":              res.Mode,
-			"provider":          res.Provider,
-			"model":             res.Model,
-			"llm_connected":     nil,
-			"llm_reason":        res.Reason,
+			"connectivity":  "ok",
+			"api_url":       baseURL,
+			"status":        res.Status,
+			"mode":          res.Mode,
+			"provider":      res.Provider,
+			"model":         res.Model,
+			"llm_connected": nil,
+			"llm_reason":    res.Reason,
 		}
 		if res.Connected != nil {
 			payload["llm_connected"] = *res.Connected
@@ -536,10 +560,9 @@ func llmHealthFailureToExitError(op string, err error) error {
 // ---------------------------------------------------------------------------
 
 // runLLMBench is the cobra entrypoint for `sbomhub llm bench`.
-// Resolves --sbomhub-source / --eval-set, builds the `go run`
-// command line, and execs the M4-3 bench harness inside the sbomhub
-// source tree. Stdout / stderr stream through so the operator sees
-// JSONL + (optional) markdown table without any CLI buffering.
+// Selects binary/source mode, resolves --eval-set, and execs the
+// M4-3 bench harness. Stdout / stderr stream through so the operator
+// sees JSONL + (optional) markdown table without any CLI buffering.
 //
 // The wrapper does NOT parse or rewrite the M4-3 output — that
 // would duplicate the M4-3 semantics in the CLI and force the
@@ -547,16 +570,6 @@ func llmHealthFailureToExitError(op string, err error) error {
 // Pass-through is the explicit design choice for Option A.
 func runLLMBench(cmd *cobra.Command, args []string) error {
 	out := GetOutputConfig()
-
-	source, err := resolveSbomhubSource(llmBenchSbomhubSource)
-	if err != nil {
-		return &llmExitError{code: 3, msg: err.Error()}
-	}
-
-	evalSetPath, err := resolveEvalSetPath(llmBenchEvalSet, source)
-	if err != nil {
-		return &llmExitError{code: 3, msg: err.Error()}
-	}
 
 	if llmBenchMaxCases <= 0 {
 		return &llmExitError{
@@ -571,6 +584,31 @@ func runLLMBench(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	mode := resolveBenchMode(os.Getenv("SBOMHUB_BENCH_MODE"))
+	switch mode {
+	case "binary":
+		return runLLMBenchBinaryMode(cmd, out)
+	case "source":
+		return runLLMBenchSourceMode(cmd, out)
+	default:
+		return &llmExitError{
+			code: 3,
+			msg:  fmt.Sprintf("SBOMHUB_BENCH_MODE must be binary or source (got %q)", mode),
+		}
+	}
+}
+
+func runLLMBenchSourceMode(cmd *cobra.Command, out *OutputConfig) error {
+	source, err := resolveSbomhubSource(llmBenchSbomhubSource)
+	if err != nil {
+		return &llmExitError{code: 3, msg: err.Error()}
+	}
+
+	evalSetPath, err := resolveEvalSetPath(llmBenchEvalSet, source)
+	if err != nil {
+		return &llmExitError{code: 3, msg: err.Error()}
+	}
+
 	// `go` toolchain pre-flight. Surfacing this before we exec gives
 	// a friendlier error than the bare "executable file not found"
 	// from os/exec. ENOENT here is permanent (operator must install
@@ -579,7 +617,7 @@ func runLLMBench(cmd *cobra.Command, args []string) error {
 		return &llmExitError{
 			code: 3,
 			msg: fmt.Sprintf("`go` toolchain が見つかりません: %v\n"+
-				"  `sbomhub llm bench` は sbomhub source の M4-3 bench を `go run` 経由で実行します。\n"+
+				"  SBOMHUB_BENCH_MODE=source は sbomhub source の M4-3 bench を `go build` してから実行します。\n"+
 				"  Install Go from https://go.dev/dl/ and ensure `go` is in PATH.",
 				lookErr),
 		}
@@ -610,18 +648,7 @@ func runLLMBench(cmd *cobra.Command, args []string) error {
 	//      M4-3-documented exit-code table directly, without the
 	//      pre-F61 "wrapper says exit 3 but bench printed exit 4"
 	//      confusion.
-	benchArgs := []string{
-		"--providers", llmBenchProviders,
-		"--eval-set", evalSetPath,
-		"--max-cases", fmt.Sprintf("%d", llmBenchMaxCases),
-		"--timeout", fmt.Sprintf("%d", llmBenchTimeoutSec),
-	}
-	if llmBenchOut != "" {
-		benchArgs = append(benchArgs, "--out", llmBenchOut)
-	}
-	if llmBenchMarkdown {
-		benchArgs = append(benchArgs, "--markdown")
-	}
+	benchArgs := buildLLMBenchArgs(evalSetPath)
 
 	// M4-3 binary lives under apps/api/cmd/llm-bench so the
 	// working directory for `go build` and the subsequent exec is
@@ -712,23 +739,464 @@ func runLLMBench(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(out.ErrWriter, "[DEBUG] cd %s && %s %s\n", workDir, benchBin, strings.Join(benchArgs, " "))
 	}
 
+	return execLLMBenchBinary(ctx, out, benchBin, workDir, benchArgs)
+}
+
+func runLLMBenchBinaryMode(cmd *cobra.Command, out *OutputConfig) error {
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	benchBin := strings.TrimSpace(llmBenchBinary)
+	var workDir string
+	if benchBin != "" {
+		abs, err := filepath.Abs(benchBin)
+		if err != nil {
+			return &llmExitError{code: 3, msg: fmt.Sprintf("--bench-binary の絶対パス解決に失敗: %v", err)}
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return &llmExitError{code: 3, msg: fmt.Sprintf("--bench-binary が見つかりません (%s): %v", abs, err)}
+		}
+		if info.IsDir() {
+			return &llmExitError{code: 3, msg: fmt.Sprintf("--bench-binary は file を指定してください: %s", abs)}
+		}
+		benchBin = abs
+		workDir = filepath.Dir(abs)
+	} else {
+		resolved, err := ensureCachedLLMBenchBinary(ctx, out)
+		if err != nil {
+			return &llmExitError{code: 3, msg: err.Error()}
+		}
+		benchBin = resolved.BinaryPath
+		workDir = resolved.WorkDir
+	}
+
+	evalSetPath, err := resolveBinaryEvalSetPath(llmBenchEvalSet, workDir)
+	if err != nil {
+		return &llmExitError{code: 3, msg: err.Error()}
+	}
+
+	return execLLMBenchBinary(ctx, out, benchBin, workDir, buildLLMBenchArgs(evalSetPath))
+}
+
+func resolveBenchMode(raw string) string {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	if mode == "" {
+		return "binary"
+	}
+	return mode
+}
+
+func buildLLMBenchArgs(evalSetPath string) []string {
+	benchArgs := []string{
+		"--providers", llmBenchProviders,
+		"--eval-set", evalSetPath,
+		"--max-cases", fmt.Sprintf("%d", llmBenchMaxCases),
+		"--timeout", fmt.Sprintf("%d", llmBenchTimeoutSec),
+	}
+	if llmBenchOut != "" {
+		benchArgs = append(benchArgs, "--out", llmBenchOut)
+	}
+	if llmBenchMarkdown {
+		benchArgs = append(benchArgs, "--markdown")
+	}
+	return benchArgs
+}
+
+func execLLMBenchBinary(ctx context.Context, out *OutputConfig, benchBin, workDir string, benchArgs []string) error {
+	if out.IsVerbose() {
+		fmt.Fprintf(out.ErrWriter, "[DEBUG] cd %s && %s %s\n", workDir, benchBin, strings.Join(benchArgs, " "))
+	}
+
 	execStderr := &cappedBuffer{limit: mapBenchStderrCaptureLimit}
 	execCmd := exec.CommandContext(ctx, benchBin, benchArgs...)
 	execCmd.Dir = workDir
 	execCmd.Stdin = os.Stdin
 	execCmd.Stdout = out.Writer
 	execCmd.Stderr = io.MultiWriter(out.ErrWriter, execStderr)
-
-	// Pass through any provider BYOK env vars the operator already
-	// exported. We do NOT redact / filter — the M4-3 binary is what
-	// uses them and it has its own no-log discipline.
 	execCmd.Env = os.Environ()
 
 	if runErr := execCmd.Run(); runErr != nil {
 		return mapBenchSubprocessError(runErr, execStderr.Bytes())
 	}
-
 	return nil
+}
+
+type llmBenchCachedBinary struct {
+	BinaryPath string
+	WorkDir    string
+}
+
+type llmBenchReleaseTarget struct {
+	Tag      string
+	OS       string
+	Arch     string
+	Ext      string
+	FileName string
+}
+
+func ensureCachedLLMBenchBinary(ctx context.Context, out *OutputConfig) (llmBenchCachedBinary, error) {
+	target, err := resolveLLMBenchReleaseTarget(ctx)
+	if err != nil {
+		return llmBenchCachedBinary{}, err
+	}
+	cacheDir, err := llmBenchCacheDir(target)
+	if err != nil {
+		return llmBenchCachedBinary{}, err
+	}
+	binaryPath := filepath.Join(cacheDir, llmBenchBinaryName(target.OS))
+	checksumPath := filepath.Join(cacheDir, ".archive.sha256")
+
+	checksums, err := fetchLLMBenchChecksums(ctx, target)
+	if err != nil {
+		if isExecutableFile(binaryPath) {
+			fmt.Fprintf(out.ErrWriter, "warning: llm-bench checksums.txt fetch failed; using existing cached binary %s: %v\n", binaryPath, err)
+			return llmBenchCachedBinary{BinaryPath: binaryPath, WorkDir: cacheDir}, nil
+		}
+		return llmBenchCachedBinary{}, err
+	}
+	wantChecksum, ok := checksums[target.FileName]
+	if !ok {
+		return llmBenchCachedBinary{}, fmt.Errorf("checksums.txt does not contain %s", target.FileName)
+	}
+
+	if isExecutableFile(binaryPath) {
+		if cached, readErr := os.ReadFile(checksumPath); readErr == nil && strings.EqualFold(strings.TrimSpace(string(cached)), wantChecksum) {
+			return llmBenchCachedBinary{BinaryPath: binaryPath, WorkDir: cacheDir}, nil
+		}
+		fmt.Fprintf(out.ErrWriter, "warning: llm-bench cache checksum mismatch for %s; re-downloading\n", binaryPath)
+		_ = os.RemoveAll(cacheDir)
+	}
+
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return llmBenchCachedBinary{}, fmt.Errorf("llm-bench cache directory creation failed: %w", err)
+	}
+	archiveURL := llmBenchArchiveURL(target)
+	archiveBytes, gotChecksum, err := downloadLLMBenchArchive(ctx, archiveURL)
+	if err != nil {
+		return llmBenchCachedBinary{}, err
+	}
+	if !strings.EqualFold(gotChecksum, wantChecksum) {
+		_ = os.RemoveAll(cacheDir)
+		return llmBenchCachedBinary{}, fmt.Errorf("llm-bench archive checksum mismatch for %s: got %s, want %s", target.FileName, gotChecksum, wantChecksum)
+	}
+	if err := extractLLMBenchArchive(archiveBytes, target, cacheDir); err != nil {
+		_ = os.RemoveAll(cacheDir)
+		return llmBenchCachedBinary{}, err
+	}
+	if !isExecutableFile(binaryPath) {
+		_ = os.RemoveAll(cacheDir)
+		return llmBenchCachedBinary{}, fmt.Errorf("llm-bench archive did not contain executable %s", llmBenchBinaryName(target.OS))
+	}
+	if err := os.WriteFile(checksumPath, []byte(wantChecksum+"\n"), 0o644); err != nil {
+		return llmBenchCachedBinary{}, fmt.Errorf("llm-bench checksum marker write failed: %w", err)
+	}
+	return llmBenchCachedBinary{BinaryPath: binaryPath, WorkDir: cacheDir}, nil
+}
+
+func resolveLLMBenchReleaseTarget(ctx context.Context) (llmBenchReleaseTarget, error) {
+	tag, err := resolveLLMBenchVersion(ctx)
+	if err != nil {
+		return llmBenchReleaseTarget{}, err
+	}
+	osName, arch, err := llmBenchPlatform(runtime.GOOS, runtime.GOARCH)
+	if err != nil {
+		return llmBenchReleaseTarget{}, err
+	}
+	ext := ".tar.gz"
+	if osName == "windows" {
+		ext = ".zip"
+	}
+	fileName := fmt.Sprintf("llm-bench-%s-%s-%s%s", tag, osName, arch, ext)
+	return llmBenchReleaseTarget{Tag: tag, OS: osName, Arch: arch, Ext: ext, FileName: fileName}, nil
+}
+
+func resolveLLMBenchVersion(ctx context.Context) (string, error) {
+	if env := strings.TrimSpace(os.Getenv("SBOMHUB_BENCH_VERSION")); env != "" {
+		return normaliseLLMBenchTag(env), nil
+	}
+	if self := strings.TrimSpace(version); self != "" && self != "dev" {
+		return normaliseLLMBenchTag(self), nil
+	}
+	return fetchLatestLLMBenchTag(ctx)
+}
+
+func normaliseLLMBenchTag(v string) string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return ""
+	}
+	if strings.HasPrefix(v, "v") {
+		return v
+	}
+	return "v" + v
+}
+
+func fetchLatestLLMBenchTag(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, llmBenchLatestReleaseAPIURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	res, err := llmBenchHTTPClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("GitHub latest release lookup failed: %w", err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return "", fmt.Errorf("GitHub latest release lookup failed: HTTP %d", res.StatusCode)
+	}
+	var payload struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+		return "", fmt.Errorf("GitHub latest release JSON parse failed: %w", err)
+	}
+	tag := normaliseLLMBenchTag(payload.TagName)
+	if tag == "" {
+		return "", errors.New("GitHub latest release did not include tag_name")
+	}
+	return tag, nil
+}
+
+func llmBenchPlatform(goos, goarch string) (string, string, error) {
+	switch goos {
+	case "linux", "darwin", "windows":
+	default:
+		return "", "", fmt.Errorf("unsupported llm-bench OS %q (supported: linux, darwin, windows)", goos)
+	}
+	switch goarch {
+	case "amd64", "arm64":
+	default:
+		return "", "", fmt.Errorf("unsupported llm-bench arch %q (supported: amd64, arm64)", goarch)
+	}
+	return goos, goarch, nil
+}
+
+func llmBenchCacheDir(target llmBenchReleaseTarget) (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("user cache directory resolution failed: %w", err)
+	}
+	return filepath.Join(base, "sbomhub-cli", "llm-bench", fmt.Sprintf("%s-%s-%s", target.Tag, target.OS, target.Arch)), nil
+}
+
+func llmBenchArchiveURL(target llmBenchReleaseTarget) string {
+	base := strings.TrimRight(llmBenchReleaseDownloadBaseURL, "/")
+	return base + "/" + url.PathEscape(target.Tag) + "/" + url.PathEscape(target.FileName)
+}
+
+func llmBenchChecksumsURL(target llmBenchReleaseTarget) string {
+	base := strings.TrimRight(llmBenchReleaseDownloadBaseURL, "/")
+	return base + "/" + url.PathEscape(target.Tag) + "/checksums.txt"
+}
+
+func fetchLLMBenchChecksums(ctx context.Context, target llmBenchReleaseTarget) (map[string]string, error) {
+	body, err := httpGetBytes(ctx, llmBenchChecksumsURL(target))
+	if err != nil {
+		return nil, fmt.Errorf("llm-bench checksums.txt download failed: %w", err)
+	}
+	checksums := map[string]string{}
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		sum := strings.ToLower(fields[0])
+		name := strings.TrimPrefix(fields[len(fields)-1], "*")
+		if _, err := hex.DecodeString(sum); err != nil || len(sum) != sha256.Size*2 {
+			continue
+		}
+		checksums[filepath.Base(name)] = sum
+	}
+	if len(checksums) == 0 {
+		return nil, errors.New("checksums.txt did not contain SHA-256 entries")
+	}
+	return checksums, nil
+}
+
+func downloadLLMBenchArchive(ctx context.Context, archiveURL string) ([]byte, string, error) {
+	body, err := httpGetBytes(ctx, archiveURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("llm-bench archive download failed: %w", err)
+	}
+	sum := sha256.Sum256(body)
+	return body, hex.EncodeToString(sum[:]), nil
+}
+
+func httpGetBytes(ctx context.Context, rawURL string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	res, err := llmBenchHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, fmt.Errorf("GET %s: HTTP %d", rawURL, res.StatusCode)
+	}
+	return io.ReadAll(res.Body)
+}
+
+func extractLLMBenchArchive(archiveBytes []byte, target llmBenchReleaseTarget, destDir string) error {
+	if target.OS == "windows" {
+		return extractLLMBenchZip(archiveBytes, destDir)
+	}
+	return extractLLMBenchTarGz(archiveBytes, destDir)
+}
+
+func extractLLMBenchTarGz(archiveBytes []byte, destDir string) error {
+	gz, err := gzip.NewReader(bytes.NewReader(archiveBytes))
+	if err != nil {
+		return fmt.Errorf("open tar.gz: %w", err)
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read tar.gz: %w", err)
+		}
+		if header == nil {
+			continue
+		}
+		targetPath, err := safeArchivePath(destDir, header.Name)
+		if err != nil {
+			return err
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(targetPath, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+				return err
+			}
+			mode := os.FileMode(header.Mode) & 0o777
+			if mode == 0 {
+				mode = 0o644
+			}
+			f, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				_ = f.Close()
+				return err
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func extractLLMBenchZip(archiveBytes []byte, destDir string) error {
+	zr, err := zip.NewReader(bytes.NewReader(archiveBytes), int64(len(archiveBytes)))
+	if err != nil {
+		return fmt.Errorf("open zip: %w", err)
+	}
+	for _, zf := range zr.File {
+		targetPath, err := safeArchivePath(destDir, zf.Name)
+		if err != nil {
+			return err
+		}
+		if zf.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetPath, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			return err
+		}
+		src, err := zf.Open()
+		if err != nil {
+			return err
+		}
+		mode := zf.Mode() & 0o777
+		if mode == 0 {
+			mode = 0o644
+		}
+		dst, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+		if err != nil {
+			_ = src.Close()
+			return err
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			_ = src.Close()
+			_ = dst.Close()
+			return err
+		}
+		if err := src.Close(); err != nil {
+			_ = dst.Close()
+			return err
+		}
+		if err := dst.Close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func safeArchivePath(destDir, name string) (string, error) {
+	clean := filepath.Clean(name)
+	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, ".."+string(filepath.Separator)) || clean == ".." {
+		return "", fmt.Errorf("unsafe path in llm-bench archive: %s", name)
+	}
+	targetPath := filepath.Join(destDir, clean)
+	destClean := filepath.Clean(destDir) + string(filepath.Separator)
+	targetClean := filepath.Clean(targetPath)
+	if !strings.HasPrefix(targetClean, destClean) && targetClean != filepath.Clean(destDir) {
+		return "", fmt.Errorf("unsafe path in llm-bench archive: %s", name)
+	}
+	return targetPath, nil
+}
+
+func resolveBinaryEvalSetPath(flagValue, workDir string) (string, error) {
+	path := strings.TrimSpace(flagValue)
+	if path == "" {
+		path = filepath.Join(workDir, "fixtures", "llm-bench", "cve-20-50.json")
+	} else if !filepath.IsAbs(path) {
+		path = filepath.Join(workDir, path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("--eval-set の絶対パス解決に失敗: %w", err)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", fmt.Errorf("eval-set fixture が見つかりません (%s): %w\n"+
+			"  binary mode では archive 同梱 fixtures/llm-bench/cve-20-50.json を既定で使います。\n"+
+			"  Pass --eval-set <path> to point at a custom fixture or verify the llm-bench archive/manual binary directory",
+			abs, err)
+	}
+	return abs, nil
+}
+
+func llmBenchBinaryName(goos string) string {
+	if goos == "windows" {
+		return "llm-bench.exe"
+	}
+	return "llm-bench"
+}
+
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return info.Mode()&0o111 != 0
 }
 
 // mapBenchStderrCaptureLimit caps how much subprocess stderr we

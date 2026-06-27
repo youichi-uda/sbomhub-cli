@@ -1,25 +1,27 @@
-# SBOMHub CLI - bench variant (M4-7 / Codex review #F54)
+# SBOMHub CLI - source-mode bench variant (M4-7 / M5-2)
 #
 # The default `Dockerfile` produces a slim `alpine:3.19 + ca-certificates`
-# runtime image. That image cannot run `sbomhub llm bench` because the
-# bench subcommand shells out to `go run ./cmd/llm-bench` against the
-# operator's sbomhub OSS source checkout (see cmd/sbomhub/commands/llm.go
-# `runLLMBench`), and Go is not present in the slim runtime.
+# runtime image. Since M5-2, that image can run `sbomhub llm bench` in
+# the default binary mode: the CLI downloads the pre-built llm-bench
+# release archive, verifies it against checksums.txt, caches it under
+# ~/.cache/sbomhub-cli/llm-bench, and execs the binary directly.
 #
-# This variant image bundles the Go toolchain + git so operators who
-# need `sbomhub llm bench` can pull a single image instead of
-# installing Go on the host. The trade-off is image size (~300MB
-# vs ~15MB for the slim default), so this is published as a separate
-# tag (`sbomhub-cli:bench`) rather than replacing the default.
+# This variant image is retained for SBOMHUB_BENCH_MODE=source, where
+# operators intentionally compile llm-bench from a local sbomhub OSS
+# checkout (offline custom builds, pre-release upstream testing, or
+# source-level debugging). It bundles Go + git for that compatibility
+# path. The trade-off is image size (~300MB vs ~15MB for the slim
+# default), so this remains a separate tag (`sbomhub-cli:bench`).
 #
-# `sbomhub llm test` and every other subcommand work on the default
-# slim image; only `llm bench` needs this variant.
+# `sbomhub llm test`, binary-mode `sbomhub llm bench`, and every other
+# subcommand work on the default slim image; only source-mode bench
+# needs this variant.
 #
 # M4 Codex review #F56: bumped from golang:1.22-alpine to
 # golang:1.25-alpine to match the sbomhub OSS source's go.mod (apps/api
 # requires `go 1.25.0`). The previous 1.22 base ran the wrapper fine
 # (the CLI itself only needs 1.22+) but `sbomhub llm bench` shells out
-# to `go run ./cmd/llm-bench` inside the operator's sbomhub checkout,
+# to `go build ./cmd/llm-bench` inside the operator's sbomhub checkout,
 # and that subprocess refuses to start with:
 #   go: go.mod requires go >= 1.25.0 (running go 1.22.12; GOTOOLCHAIN=local)
 # Alpine images set GOTOOLCHAIN=local so the in-tree 1.22 toolchain
@@ -33,7 +35,7 @@ FROM golang:1.25-alpine
 
 WORKDIR /app
 
-# git is required for `go run` to resolve module deps on a cold
+# git is required for `go build` to resolve module deps on a cold
 # cache. ca-certificates is required for HTTPS calls to LLM provider
 # endpoints (OpenAI / Anthropic / Gemini / Azure / Ollama).
 RUN apk add --no-cache git ca-certificates
@@ -72,19 +74,20 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 RUN mkdir -p /root/.sbomhub
 
 # Default to a working directory the operator can mount the sbomhub
-# OSS source into. Usage:
+# OSS source into for source mode. Usage:
 #
 #   docker run --rm \
 #     -v "$(pwd)/sbomhub:/workspace/sbomhub" \
+#     -e SBOMHUB_BENCH_MODE=source \
 #     -e OPENAI_API_KEY \
 #     -e ANTHROPIC_API_KEY \
 #     -e GOOGLE_API_KEY \
 #     ghcr.io/youichi-uda/sbomhub-cli:bench \
 #     llm bench --sbomhub-source /workspace/sbomhub
 #
-# The mount must be read-write because `go run` writes build artefacts
+# The mount should be read-write because `go build` writes build artefacts
 # into $GOCACHE (defaults to /root/.cache/go-build inside the container
-# — outside the mount — but `go run` may also update go.sum on cold
+# — outside the mount — but module resolution may also update go.sum on cold
 # module resolution).
 WORKDIR /workspace
 
