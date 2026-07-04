@@ -385,3 +385,109 @@ type cobraCmdShape struct {
 	use           string
 	formatDefault string
 }
+
+// ---------------------------------------------------------------------------
+// F409 — --project is a UUID, not a name.
+// ---------------------------------------------------------------------------
+
+// TestEvidencePack_ProjectFlagUUIDOnly pins F409: the value is forwarded
+// verbatim as the :id path segment and the server parses it with uuid.Parse,
+// so the flag help + examples must NOT advertise name support (a name 400s).
+// This command deliberately does NOT resolve names to IDs.
+func TestEvidencePack_ProjectFlagUUIDOnly(t *testing.T) {
+	flag := evidencePackCmd.Flags().Lookup("project")
+	if flag == nil {
+		t.Fatal("evidence-pack missing --project flag")
+	}
+	if strings.Contains(flag.Usage, "名前") || strings.Contains(strings.ToLower(flag.Usage), "name") {
+		t.Errorf("--project usage must not advertise name support (server 400s a non-UUID): %q", flag.Usage)
+	}
+	// The Long help examples must not use the ambiguous non-UUID "my-device"
+	// value a user would copy-paste into a 400.
+	if strings.Contains(evidencePackCmd.Long, "my-device") {
+		t.Errorf("evidence-pack Long help must not use the non-UUID 'my-device' example")
+	}
+}
+
+// looksLikeUUIDForTest mirrors internal/api.looksLikeUUID (unexported) so the
+// test can model the server's uuid.Parse gate without adding a uuid dep.
+func looksLikeUUIDForTest(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, r := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if r != '-' {
+				return false
+			}
+		default:
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// TestRunEvidencePack_ForwardsProjectAsPathSegment models the real server
+// shape (handler/evidence_pack.go parses :id with uuid.Parse -> 400 on a
+// non-UUID): a UUID --project is forwarded verbatim into the path and
+// succeeds; a name is forwarded unchanged and the server rejects it with 400
+// -> permanent exit 3 with no file written. This documents that names are
+// NOT resolved client-side (F409).
+func TestRunEvidencePack_ForwardsProjectAsPathSegment(t *testing.T) {
+	const goodUUID = "3f1c2d4e-5a6b-7c8d-9e0f-1a2b3c4d5e6f"
+
+	var seenPathSegment string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Extract the :id segment from /api/v1/projects/<id>/evidence-pack/build.
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) >= 4 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "projects" {
+			seenPathSegment = parts[3]
+		}
+		if !looksLikeUUIDForTest(seenPathSegment) {
+			// Mirror handler/evidence_pack.go: uuid.Parse fails -> 400.
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"invalid project id"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("PK\x03\x04ok"))
+	}))
+	defer server.Close()
+
+	client := api.NewClient(server.URL, "test-key")
+
+	// 1. A UUID is forwarded verbatim as the path segment and succeeds.
+	outUUID := filepath.Join(t.TempDir(), "uuid.zip")
+	res, _, stderr := runEvidencePackAndCapture(t, client, defaultEvidencePackArgs(goodUUID, "zip", outUUID))
+	if res.err != nil {
+		t.Fatalf("UUID project returned err: %v (stderr=%s)", res.err, stderr.String())
+	}
+	if seenPathSegment != goodUUID {
+		t.Errorf("server saw path segment %q, want the UUID forwarded verbatim %q", seenPathSegment, goodUUID)
+	}
+	if _, statErr := os.Stat(outUUID); statErr != nil {
+		t.Errorf("expected pack written for UUID project: %v", statErr)
+	}
+
+	// 2. A name (not a UUID) is forwarded unchanged and the server 400s it
+	//    -> permanent exit 3, no file written. Names are NOT resolved here.
+	outName := filepath.Join(t.TempDir(), "name.zip")
+	resName, _, _ := runEvidencePackAndCapture(t, client, defaultEvidencePackArgs("my-device", "zip", outName))
+	if resName.err == nil {
+		t.Fatal("expected a 400 error for a non-UUID --project (name), got nil")
+	}
+	if seenPathSegment != "my-device" {
+		t.Errorf("server saw path segment %q, want the name forwarded verbatim (no client-side resolution)", seenPathSegment)
+	}
+	var ec interface{ ExitCode() int }
+	if !errors.As(resName.err, &ec) || ec.ExitCode() != 3 {
+		t.Errorf("name -> want permanent exit 3, got err=%v", resName.err)
+	}
+	if _, statErr := os.Stat(outName); !os.IsNotExist(statErr) {
+		t.Errorf("no file must be written when the server 400s the name")
+	}
+}

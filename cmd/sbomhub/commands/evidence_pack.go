@@ -8,7 +8,7 @@ package commands
 // rows and streamed back as either a machine-readable Zip bundle
 // (default) or the legacy Markdown report:
 //
-//	sbomhub evidence-pack --project <id|name> \
+//	sbomhub evidence-pack --project <PROJECT_UUID> \
 //	    [--format zip|markdown] \
 //	    [--output <path>] \
 //	    [--include-vex-approved] \
@@ -83,10 +83,13 @@ Formats:
 本文をそのまま file に書き出します。 --output 省略時は
 ./evidence-pack-<project>-<timestamp>.<zip|md> に保存します。
 
-使用例 / Examples:
-  sbomhub evidence-pack --project my-device
-  sbomhub evidence-pack --project my-device --format markdown -o report.md
-  sbomhub evidence-pack --project my-device --include-meti-assessment=false
+--project にはプロジェクトの UUID を指定します (名前ではありません)。
+UUID は sbomhub projects list で確認できます。
+
+使用例 / Examples (--project takes the project UUID, not a name):
+  sbomhub evidence-pack --project 3f1c2d4e-5a6b-7c8d-9e0f-1a2b3c4d5e6f
+  sbomhub evidence-pack --project 3f1c2d4e-5a6b-7c8d-9e0f-1a2b3c4d5e6f --format markdown -o report.md
+  sbomhub evidence-pack --project 3f1c2d4e-5a6b-7c8d-9e0f-1a2b3c4d5e6f --include-meti-assessment=false
 
 ※ このコマンドは download 専用です。 pack を当局へ自動提出はしません。
    24h/72h の CRA 提出 clock と提出可否の判断は人間が行ってください。
@@ -101,7 +104,10 @@ Exit codes:
 func init() {
 	rootCmd.AddCommand(evidencePackCmd)
 
-	evidencePackCmd.Flags().StringVarP(&evidencePackProject, "project", "p", "", "対象プロジェクト ID (UUID) または名前 / project ID (UUID) or name (必須)")
+	// UUID only: the value is forwarded verbatim as the :id path segment and
+	// the server parses it with uuid.Parse (handler/evidence_pack.go), so a
+	// name would 400. This command does NOT resolve names to IDs (F409).
+	evidencePackCmd.Flags().StringVarP(&evidencePackProject, "project", "p", "", "対象プロジェクトの UUID / project UUID (必須)")
 	evidencePackCmd.Flags().StringVar(&evidencePackFormat, "format", api.EvidencePackFormatZip, "出力形式 / output format (zip | markdown)")
 	evidencePackCmd.Flags().StringVarP(&evidencePackOutput, "output", "o", "", "書き出し先 path / output file path (省略時は自動命名)")
 	evidencePackCmd.Flags().BoolVar(&evidencePackIncludeVEX, "include-vex-approved", true, "承認済 VEX draft を含める / include approved VEX drafts")
