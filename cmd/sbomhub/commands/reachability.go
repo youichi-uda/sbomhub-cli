@@ -64,9 +64,9 @@ client-side and uploads ONLY the per-(component, cve) verdicts. The
 source never leaves your machine.
 
 使用例 / Examples:
-  sbomhub reachability . --project my-device
+  sbomhub reachability . --project <uuid>
   sbomhub reachability ./src --project <uuid> --ecosystem go
-  sbomhub reachability . --project my-device --cve CVE-2024-12345
+  sbomhub reachability . --project <uuid> --cve CVE-2024-12345
 
 フロー / Flow:
   1. プロジェクトの脆弱性 (+ 影響コンポーネント) を取得
@@ -90,7 +90,7 @@ source never leaves your machine.
 func init() {
 	rootCmd.AddCommand(reachabilityCmd)
 
-	reachabilityCmd.Flags().StringVarP(&reachProject, "project", "p", "", "対象プロジェクト ID (UUID) または名前 / project ID (UUID) or name")
+	reachabilityCmd.Flags().StringVarP(&reachProject, "project", "p", "", "対象プロジェクトの UUID / project UUID (必須) — server accepts a UUID only, not a name")
 	reachabilityCmd.Flags().StringVar(&reachEcosystem, "ecosystem", "go", "対象エコシステム / target ecosystem (M32: go のみサポート / only `go` is supported)")
 	reachabilityCmd.Flags().StringVar(&reachCVE, "cve", "", "特定の CVE に絞り込む / scope analysis to a single CVE ID")
 }

@@ -7,8 +7,9 @@
 // tree (Go internal-package rule), (2) it is a different module
 // (github.com/sbomhub/sbomhub), and (3) reachability must run against the
 // user's local source tree + go.mod + toolchain on the client. So the CLI
-// carries its own copy. Keep it byte-for-byte in sync with the backend
-// when the analyzer evolves.
+// carries its own copy: the type/function bodies are identical to the
+// backend's (only this header docstring differs). Keep the code in sync with
+// the backend when the analyzer evolves.
 //
 // Design reference: sbomhub-internal/planning/PRODUCT_REBOOT_PLAN.md §7.1
 // (処理ステップ 2: 言語別の静的解析で到達性を一次判定).
