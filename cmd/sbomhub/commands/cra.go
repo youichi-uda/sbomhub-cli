@@ -4,7 +4,9 @@ package commands
 // listing, and approval (M2 Wave M2-7 — sbomhub-cli issue #2).
 //
 // The M2 MVP exposes three subcommands; reject / edit / reanalyse are
-// stubbed out for M3 alongside the bundled `sbomhub evidence-pack`:
+// stubbed out for a later milestone. The bundled compliance download is
+// now shipped as its own top-level command, `sbomhub evidence-pack`
+// (M31 Wave C — F407, see cmd/sbomhub/commands/evidence_pack.go):
 //
 //	sbomhub cra draft \
 //	    --project <id> \
@@ -650,4 +652,3 @@ func orDash(s string) string {
 	}
 	return s
 }
-
