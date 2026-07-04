@@ -1,5 +1,8 @@
 # SBOMHub CLI - Linux build and test
-FROM golang:1.22-alpine AS builder
+# M32: builder bumped 1.22 -> 1.25-alpine to satisfy go.mod `go 1.25.0`
+# (raised by the vendored reachability analyzer's golang.org/x/tools v0.47.0
+# minimum, which requires go >= 1.25). Matches Dockerfile.bench + CI go 1.25.
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 
