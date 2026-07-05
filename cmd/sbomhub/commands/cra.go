@@ -133,6 +133,13 @@ var (
 	// approve
 	craApproveReportID string
 	craApproveNote     string
+
+	// submit
+	craSubmitReportID        string
+	craSubmitAuthority       string
+	craSubmitSubmittedAt     string
+	craSubmitReferenceNumber string
+	craSubmitNotes           string
 )
 
 // ---------------------------------------------------------------------------
@@ -220,18 +227,58 @@ audit log (action=cra_report_decided) も同 tx で書き込まれます。
 	RunE: runCraApprove,
 }
 
+var craSubmitCmd = &cobra.Command{
+	Use:   "submit",
+	Short: "承認済 CRA 報告書を当局へ提出した事実を記録 / Record that an approved CRA report was submitted to an authority",
+	Long: `承認済 (decision=approved) の CRA 報告書について、 操作員が実際に
+当局 (authority) へ提出したという事実を記録します (CRA Art.14 提出記録)。
+内部では POST /api/v1/projects/:id/cra-reports/:report_id/submissions を
+呼び、 サーバは 1 トランザクションで cra_submissions 行を追加 + report の
+state を submitted へ遷移 + audit log (action=cra_submission_recorded) を
+書き込みます。
+
+これは「AI がドラフトし、 人間が承認する」の次の一手です。 自動送信は
+一切行いません — このコマンドは操作員が「提出した」と表明した事実を
+記録するだけです。 承認済でない報告書は提出できません (409)。
+
+--submitted-at を省略した場合、 サーバが受信時刻 (NOW()) を提出日時として
+記録します。 1 つの report に対して複数回 submit できます (24h 早期警告 →
+72h 詳細通知 → 最終報告 の append-only な提出タイムライン)。
+
+使用例:
+  sbomhub cra submit --project <uuid> --report-id <uuid> \
+      --authority "JPCERT/CC" \
+      --submitted-at 2026-09-11T09:00:00Z \
+      --reference-number "JP-2026-001" \
+      --notes "72h detailed notification"
+
+Exit codes:
+  0  正常終了 / success
+  3  恒久エラー / permanent (400/403/404/409 — fix input, approve the report first)
+  4  一時エラー / transient (429/5xx — retry recommended)`,
+	RunE: runCraSubmit,
+}
+
 func init() {
 	rootCmd.AddCommand(craCmd)
 	craCmd.AddCommand(craDraftCmd)
 	craCmd.AddCommand(craListCmd)
 	craCmd.AddCommand(craApproveCmd)
+	craCmd.AddCommand(craSubmitCmd)
 
 	// shared --project flag — duplicated on each subcommand rather than a
 	// persistent flag on craCmd because cobra persistent flags inherit
 	// upward, which would pollute the rootCmd help output.
-	craDraftCmd.Flags().StringVarP(&craProject, "project", "p", "", "対象プロジェクト ID (UUID) または名前 / project ID (UUID) or name")
-	craListCmd.Flags().StringVarP(&craProject, "project", "p", "", "対象プロジェクト ID (UUID) または名前 / project ID (UUID) or name")
-	craApproveCmd.Flags().StringVarP(&craProject, "project", "p", "", "対象プロジェクト ID (UUID) または名前 / project ID (UUID) or name")
+	//
+	// Help text is UUID-only: the server resolves the :id path segment
+	// strictly as a project UUID (handler.loadReportScoped / project
+	// lookups do uuid.Parse), there is NO name-resolution path, so the
+	// prior "(UUID) or name" wording over-advertised a feature that does
+	// not exist. (triage.go's --project help still says "or name"; that
+	// file is out of this wave's scope — deferred to an M34+ hygiene bundle.)
+	craDraftCmd.Flags().StringVarP(&craProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
+	craListCmd.Flags().StringVarP(&craProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
+	craApproveCmd.Flags().StringVarP(&craProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
 
 	// draft
 	craDraftCmd.Flags().StringVar(&craDraftCVE, "cve", "", "対象 CVE ID (CVE-YYYY-NNNNN) / target CVE ID")
@@ -260,6 +307,14 @@ func init() {
 	// approve
 	craApproveCmd.Flags().StringVar(&craApproveReportID, "report-id", "", "対象 CRA 報告書 ID (UUID) / target CRA report ID")
 	craApproveCmd.Flags().StringVar(&craApproveNote, "note", "", "承認理由メモ (audit log に保存) / decision note (persisted to audit log)")
+
+	// submit
+	craSubmitCmd.Flags().StringVarP(&craProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
+	craSubmitCmd.Flags().StringVar(&craSubmitReportID, "report-id", "", "対象 CRA 報告書 ID (UUID)、 承認済であること / target CRA report ID (must be approved)")
+	craSubmitCmd.Flags().StringVar(&craSubmitAuthority, "authority", "", "提出先の当局 (必須) / authority the report was submitted to (required, e.g. \"JPCERT/CC\")")
+	craSubmitCmd.Flags().StringVar(&craSubmitSubmittedAt, "submitted-at", "", "提出日時 ISO-8601/RFC3339 (省略時はサーバが NOW() を記録) / submission timestamp (server uses NOW() if omitted)")
+	craSubmitCmd.Flags().StringVar(&craSubmitReferenceNumber, "reference-number", "", "当局の受付/参照番号 (任意) / authority reference or receipt number (optional)")
+	craSubmitCmd.Flags().StringVar(&craSubmitNotes, "notes", "", "備考 (任意、 提出タイムラインに保存) / free-text notes (optional)")
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +618,63 @@ func runCraApprove(cmd *cobra.Command, args []string) error {
 	}
 	if craApproveNote != "" {
 		fmt.Fprintf(w, "  Note      : %s\n", craApproveNote)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// cra submit
+// ---------------------------------------------------------------------------
+
+func runCraSubmit(cmd *cobra.Command, args []string) error {
+	out := GetOutputConfig()
+	if strings.TrimSpace(craProject) == "" {
+		return fmt.Errorf("--project は必須です / --project is required")
+	}
+	if strings.TrimSpace(craSubmitReportID) == "" {
+		return fmt.Errorf("--report-id は必須です / --report-id is required")
+	}
+	if strings.TrimSpace(craSubmitAuthority) == "" {
+		return fmt.Errorf("--authority は必須です / --authority is required (e.g. --authority \"JPCERT/CC\")")
+	}
+	client, err := loadCraClient()
+	if err != nil {
+		return err
+	}
+	ctx := cmd.Context()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// Thin POST to the frozen M33 contract. --submitted-at is passed
+	// through verbatim (empty → omitted from the body → server records
+	// NOW()); no client-side parsing so an operator can supply any
+	// RFC3339 offset the server accepts. Non-approved reports come back
+	// 409 → exit 3 (permanent: the operator must `cra approve` first).
+	sub, err := client.RecordSubmission(ctx, craProject, craSubmitReportID, api.CRASubmissionRequest{
+		Authority:       craSubmitAuthority,
+		SubmittedAt:     craSubmitSubmittedAt,
+		ReferenceNumber: craSubmitReferenceNumber,
+		Notes:           craSubmitNotes,
+	})
+	if err != nil {
+		return craFailureToExitError("cra submit", err)
+	}
+
+	if out.IsJSON() {
+		return out.PrintJSON(sub)
+	}
+
+	w := out.humanWriter()
+	fmt.Fprintf(w, "CRA report %s の当局提出を記録しました\n", sub.CRAReportID)
+	fmt.Fprintf(w, "  Submission ID : %s\n", sub.ID)
+	fmt.Fprintf(w, "  Authority     : %s\n", sub.Authority)
+	fmt.Fprintf(w, "  Submitted at  : %s\n", sub.SubmittedAt)
+	if sub.ReferenceNumber != "" {
+		fmt.Fprintf(w, "  Reference     : %s\n", sub.ReferenceNumber)
+	}
+	if sub.Notes != "" {
+		fmt.Fprintf(w, "  Notes         : %s\n", sub.Notes)
 	}
 	return nil
 }

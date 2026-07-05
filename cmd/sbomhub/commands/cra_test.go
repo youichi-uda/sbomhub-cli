@@ -41,14 +41,17 @@ type craFakeServer struct {
 	listResp     func(call int, q map[string][]string) (status int, headers map[string]string, payload interface{})
 	getResp      func(call int, reportID string) (status int, payload interface{})
 	decisionResp func(call int, reportID string, body []byte) (status int, payload interface{})
+	submitResp   func(call int, reportID string, body []byte) (status int, payload interface{})
 
-	vulnListHits  int32
-	runHits       int32
-	listHits      int32
-	getHits       int32
-	decisionHits  int32
-	seenDecisions []capturedCRADecision
-	mu            sync.Mutex
+	vulnListHits    int32
+	runHits         int32
+	listHits        int32
+	getHits         int32
+	decisionHits    int32
+	submitHits      int32
+	seenDecisions   []capturedCRADecision
+	seenSubmissions []capturedCRASubmission
+	mu              sync.Mutex
 }
 
 type capturedCRADecision struct {
@@ -56,6 +59,15 @@ type capturedCRADecision struct {
 	Decision        string
 	DecisionNote    string
 	EditedDraftText *string
+}
+
+type capturedCRASubmission struct {
+	ReportID        string
+	Authority       string
+	SubmittedAt     string
+	ReferenceNumber string
+	Notes           string
+	RawBody         string
 }
 
 func newCraFakeServer(t *testing.T, vulns []api.VulnerabilityRecord) *craFakeServer {
@@ -153,6 +165,56 @@ func (tf *craFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 			status, payload = tf.decisionResp(int(n), reportID, body)
 		} else {
 			payload = api.CRAReport{ID: reportID, Decision: dec.Decision}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(payload)
+
+	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/submissions"):
+		n := atomic.AddInt32(&tf.submitHits, 1)
+		body, _ := io.ReadAll(r.Body)
+		var sub api.CRASubmissionRequest
+		_ = json.Unmarshal(body, &sub)
+		// path: /api/v1/projects/<pid>/cra-reports/<rid>/submissions
+		parts := strings.Split(r.URL.Path, "/")
+		reportID := ""
+		for i, p := range parts {
+			if p == "cra-reports" && i+1 < len(parts) {
+				reportID = parts[i+1]
+				break
+			}
+		}
+		tf.mu.Lock()
+		tf.seenSubmissions = append(tf.seenSubmissions, capturedCRASubmission{
+			ReportID:        reportID,
+			Authority:       sub.Authority,
+			SubmittedAt:     sub.SubmittedAt,
+			ReferenceNumber: sub.ReferenceNumber,
+			Notes:           sub.Notes,
+			RawBody:         string(body),
+		})
+		tf.mu.Unlock()
+		status := http.StatusCreated
+		var payload interface{}
+		if tf.submitResp != nil {
+			status, payload = tf.submitResp(int(n), reportID, body)
+		} else {
+			// Mirror the frozen 201 contract shape. When --submitted-at
+			// is omitted the server defaults to NOW(); the fake stands in
+			// a fixed timestamp so the CLI has something to echo back.
+			submittedAt := sub.SubmittedAt
+			if submittedAt == "" {
+				submittedAt = "2026-09-11T00:00:00Z"
+			}
+			payload = api.CRASubmission{
+				ID:              "sub-" + reportID,
+				CRAReportID:     reportID,
+				Authority:       sub.Authority,
+				SubmittedAt:     submittedAt,
+				ReferenceNumber: sub.ReferenceNumber,
+				Notes:           sub.Notes,
+				CreatedAt:       "2026-09-11T00:00:01Z",
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
@@ -683,6 +745,161 @@ func TestCraApprove_MissingReportID(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// cra submit (M33 Wave D — F421)
+// ---------------------------------------------------------------------------
+
+// TestCraSubmit_HappyPath — the submit body must byte-match the frozen
+// M33 contract for the supplied flags, the POST must land once, and the
+// stdout confirmation surfaces report id + authority + submitted_at.
+func TestCraSubmit_HappyPath(t *testing.T) {
+	tf := newCraFakeServer(t, nil)
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, stdout, _ := runSubmitAndCapture(t, client, submitArgs{
+		project:         "00000000-0000-0000-0000-000000000aaa",
+		reportID:        fakeCraReportID(1),
+		authority:       "JPCERT/CC",
+		submittedAt:     "2026-09-11T09:00:00Z",
+		referenceNumber: "JP-2026-001",
+		notes:           "72h detailed notification",
+	})
+	if res.err != nil {
+		t.Fatalf("submit err: %v", res.err)
+	}
+	if atomic.LoadInt32(&tf.submitHits) != 1 {
+		t.Errorf("submitHits = %d, want 1", tf.submitHits)
+	}
+	if len(tf.seenSubmissions) != 1 {
+		t.Fatalf("seenSubmissions len = %d, want 1", len(tf.seenSubmissions))
+	}
+	s := tf.seenSubmissions[0]
+	if s.ReportID != fakeCraReportID(1) {
+		t.Errorf("reportID = %q, want %q", s.ReportID, fakeCraReportID(1))
+	}
+	// Byte-exact match against the frozen contract body. Go marshals
+	// struct fields in declaration order: authority, submitted_at,
+	// reference_number, notes.
+	wantBody := `{"authority":"JPCERT/CC","submitted_at":"2026-09-11T09:00:00Z","reference_number":"JP-2026-001","notes":"72h detailed notification"}`
+	if s.RawBody != wantBody {
+		t.Errorf("body = %s\n want %s", s.RawBody, wantBody)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, fakeCraReportID(1)) {
+		t.Errorf("stdout missing report id: %s", out)
+	}
+	if !strings.Contains(out, "JPCERT/CC") {
+		t.Errorf("stdout missing authority: %s", out)
+	}
+	if !strings.Contains(out, "2026-09-11T09:00:00Z") {
+		t.Errorf("stdout missing submitted_at: %s", out)
+	}
+	if !strings.Contains(out, "記録しました") {
+		t.Errorf("stdout missing confirmation: %s", out)
+	}
+}
+
+// TestCraSubmit_OmitSubmittedAt_BodyOmitsField — with --submitted-at
+// (and the other optional flags) unset, the JSON body must contain ONLY
+// authority so the server applies its NOW() default (omitempty contract).
+func TestCraSubmit_OmitSubmittedAt_BodyOmitsField(t *testing.T) {
+	tf := newCraFakeServer(t, nil)
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, _, _ := runSubmitAndCapture(t, client, submitArgs{
+		project:   "p",
+		reportID:  fakeCraReportID(1),
+		authority: "ENISA",
+	})
+	if res.err != nil {
+		t.Fatalf("submit err: %v", res.err)
+	}
+	if len(tf.seenSubmissions) != 1 {
+		t.Fatalf("seenSubmissions len = %d, want 1", len(tf.seenSubmissions))
+	}
+	s := tf.seenSubmissions[0]
+	if s.RawBody != `{"authority":"ENISA"}` {
+		t.Errorf("body = %s, want {\"authority\":\"ENISA\"}", s.RawBody)
+	}
+	for _, k := range []string{"submitted_at", "reference_number", "notes"} {
+		if strings.Contains(s.RawBody, k) {
+			t.Errorf("omitted flag must drop %q from body: %s", k, s.RawBody)
+		}
+	}
+}
+
+// TestCraSubmit_MissingAuthority — flag validation fires BEFORE any API
+// call (empty --authority is an operator input error, no round-trip).
+func TestCraSubmit_MissingAuthority(t *testing.T) {
+	tf := newCraFakeServer(t, nil)
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, _, _ := runSubmitAndCapture(t, client, submitArgs{
+		project:  "p",
+		reportID: fakeCraReportID(1),
+	})
+	if res.err == nil {
+		t.Fatal("expected error for missing --authority")
+	}
+	if atomic.LoadInt32(&tf.submitHits) != 0 {
+		t.Errorf("validation must short-circuit BEFORE API call, submitHits = %d", tf.submitHits)
+	}
+}
+
+// TestCraSubmit_MissingReportID — flag validation for --report-id.
+func TestCraSubmit_MissingReportID(t *testing.T) {
+	tf := newCraFakeServer(t, nil)
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, _, _ := runSubmitAndCapture(t, client, submitArgs{
+		project:   "p",
+		authority: "JPCERT/CC",
+	})
+	if res.err == nil {
+		t.Fatal("expected error for missing --report-id")
+	}
+	if atomic.LoadInt32(&tf.submitHits) != 0 {
+		t.Errorf("validation must short-circuit BEFORE API call, submitHits = %d", tf.submitHits)
+	}
+}
+
+// TestCraSubmit_ExitCodeClassification — the contract's failure codes
+// must route through the shared exit-code scheme: 400/403/404/409 are
+// permanent (exit 3, operator must fix input / approve first), 429/5xx
+// are transient (exit 4, retry).
+func TestCraSubmit_ExitCodeClassification(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		body     map[string]string
+		wantCode int
+	}{
+		{"400 authority empty → 3", http.StatusBadRequest, map[string]string{"error": "authority is required"}, 3},
+		{"403 no write → 3", http.StatusForbidden, map[string]string{"error": "write permission required"}, 3},
+		{"404 not found → 3", http.StatusNotFound, map[string]string{"error": "cra report not found"}, 3},
+		{"409 not approved → 3", http.StatusConflict, map[string]string{"error": "only approved reports can be recorded as submitted"}, 3},
+		{"429 rate limited → 4", http.StatusTooManyRequests, map[string]string{"error": "rate limited"}, 4},
+		{"500 internal → 4", http.StatusInternalServerError, map[string]string{"error": "boom"}, 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tf := newCraFakeServer(t, nil)
+			tf.submitResp = func(call int, reportID string, body []byte) (int, interface{}) {
+				return tc.status, tc.body
+			}
+			client := api.NewClient(tf.server.URL, "test-key")
+			res, _, _ := runSubmitAndCapture(t, client, submitArgs{
+				project:   "p",
+				reportID:  fakeCraReportID(1),
+				authority: "JPCERT/CC",
+			})
+			exitErr, ok := res.err.(*craExitError)
+			if !ok {
+				t.Fatalf("err = %v (%T), want *craExitError", res.err, res.err)
+			}
+			if exitErr.ExitCode() != tc.wantCode {
+				t.Errorf("ExitCode = %d, want %d", exitErr.ExitCode(), tc.wantCode)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
 // validateReportType / validateLang
 // ---------------------------------------------------------------------------
 
@@ -798,6 +1015,15 @@ type approveArgs struct {
 	project  string
 	reportID string
 	note     string
+}
+
+type submitArgs struct {
+	project         string
+	reportID        string
+	authority       string
+	submittedAt     string
+	referenceNumber string
+	notes           string
 }
 
 type capturedResult struct {
@@ -923,6 +1149,39 @@ func runApproveAndCapture(t *testing.T, client *api.Client, args approveArgs) (c
 	}
 	fmt.Fprintf(out.Writer, "CRA report %s を承認しました\n", fresh.ID)
 	fmt.Fprintf(out.Writer, "  Decision: %s\n", fresh.Decision)
+	return capturedResult{err: nil}, &stdout, &stderr
+}
+
+// runSubmitAndCapture replays runCraSubmit's body against injected args
+// + a buffered OutputConfig, mirroring the runCraSubmit flow step-by-step
+// so a refactor of the command surfaces here. Keeps the same validate →
+// client call → render structure the production RunE uses.
+func runSubmitAndCapture(t *testing.T, client *api.Client, args submitArgs) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
+	if strings.TrimSpace(args.project) == "" {
+		return capturedResult{err: fmt.Errorf("--project は必須です / --project is required")}, &stdout, &stderr
+	}
+	if strings.TrimSpace(args.reportID) == "" {
+		return capturedResult{err: fmt.Errorf("--report-id は必須です / --report-id is required")}, &stdout, &stderr
+	}
+	if strings.TrimSpace(args.authority) == "" {
+		return capturedResult{err: fmt.Errorf("--authority は必須です / --authority is required")}, &stdout, &stderr
+	}
+	ctx := context.Background()
+	sub, err := client.RecordSubmission(ctx, args.project, args.reportID, api.CRASubmissionRequest{
+		Authority:       args.authority,
+		SubmittedAt:     args.submittedAt,
+		ReferenceNumber: args.referenceNumber,
+		Notes:           args.notes,
+	})
+	if err != nil {
+		return capturedResult{err: craFailureToExitError("cra submit", err)}, &stdout, &stderr
+	}
+	fmt.Fprintf(out.Writer, "CRA report %s の当局提出を記録しました\n", sub.CRAReportID)
+	fmt.Fprintf(out.Writer, "  Authority     : %s\n", sub.Authority)
+	fmt.Fprintf(out.Writer, "  Submitted at  : %s\n", sub.SubmittedAt)
 	return capturedResult{err: nil}, &stdout, &stderr
 }
 

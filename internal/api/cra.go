@@ -8,6 +8,7 @@ package api
 //	GET    /api/v1/projects/:id/cra-reports/:report_id
 //	PUT    /api/v1/projects/:id/cra-reports/:report_id/decision
 //	POST   /api/v1/projects/:id/cra-reports/:report_id/reanalyse
+//	POST   /api/v1/projects/:id/cra-reports/:report_id/submissions  (M33 Wave D — F421)
 //
 // The CLI's `sbomhub cra` subcommand uses these to draft, list, view,
 // and decide on CRA (Cyber Resilience Act) compliance reports drafted
@@ -183,6 +184,46 @@ type CRADecisionRequest struct {
 	Decision        string  `json:"decision"`
 	DecisionNote    string  `json:"decision_note,omitempty"`
 	EditedDraftText *string `json:"edited_draft_text,omitempty"`
+}
+
+// CRASubmissionRequest is the body of
+// POST /cra-reports/:report_id/submissions (M33 Wave D — F421).
+//
+// Authority is REQUIRED and must be non-empty — the server 400s an empty
+// value. The three optional fields use `,omitempty` so an unset flag is
+// dropped from the JSON entirely; in particular an omitted SubmittedAt
+// lets the server default submitted_at to NOW() (the column is NOT NULL)
+// rather than receiving an empty string it would have to reject or
+// mis-store.
+//
+// This DTO records a HUMAN-attested fact ("an operator submitted this
+// approved report to <authority>"). There is deliberately no auto-submit
+// — the server only accepts submission records for reports whose
+// decision == "approved" (409 otherwise), preserving the product's
+// "AI drafts, humans approve, humans submit" principle.
+type CRASubmissionRequest struct {
+	Authority       string `json:"authority"`
+	SubmittedAt     string `json:"submitted_at,omitempty"`
+	ReferenceNumber string `json:"reference_number,omitempty"`
+	Notes           string `json:"notes,omitempty"`
+}
+
+// CRASubmission mirrors the 201 response of RecordSubmission (and each
+// row in a future GET .../submissions timeline). JSON tags match the
+// server-side cra_submissions row verbatim so the CLI decodes the
+// handler response without a parallel DTO.
+//
+// ReferenceNumber / Notes / CreatedAt carry `,omitempty` on the decode
+// side purely for symmetry with the other CRA DTOs — the field is
+// populated whenever the server sends it and left zero when absent.
+type CRASubmission struct {
+	ID              string `json:"id"`
+	CRAReportID     string `json:"cra_report_id"`
+	Authority       string `json:"authority"`
+	SubmittedAt     string `json:"submitted_at"`
+	ReferenceNumber string `json:"reference_number,omitempty"`
+	Notes           string `json:"notes,omitempty"`
+	CreatedAt       string `json:"created_at,omitempty"`
 }
 
 // ----------------------------------------------------------------------------
@@ -583,6 +624,57 @@ func (c *Client) DecideReport(ctx context.Context, projectID, reportID string, d
 	var out CRAReport
 	if err := json.Unmarshal(respBody, &out); err != nil {
 		return nil, fmt.Errorf("cra-decision レスポンス解析エラー: %w", err)
+	}
+	return &out, nil
+}
+
+// ----------------------------------------------------------------------------
+// RecordSubmission — POST /api/v1/projects/:id/cra-reports/:report_id/submissions
+// ----------------------------------------------------------------------------
+
+// RecordSubmission records a human-attested authority submission for an
+// approved CRA report (M33 Wave D — F421, CRA Art.14 提出記録). It is a
+// thin POST mirroring DecideReport: marshal the body, set Bearer auth,
+// accept 201 (200 tolerated for forward-compat), and route every non-2xx
+// through decodeCRAError so the CLI's exit-code classification
+// (craFailureToExitError) covers submit failures without a second branch.
+//
+// The server performs the whole side-effect in one tenant transaction:
+// INSERT cra_submissions + cra_reports.state → 'submitted' + audit log
+// (cra_submission_recorded). It enforces the product's core principle —
+// only reports whose decision == "approved" may be recorded as submitted,
+// so a non-approved report surfaces as 409 (IsPermanent → exit 3). There
+// is deliberately NO auto-submit: this call only records that a human
+// asserts they submitted the report to the named authority.
+func (c *Client) RecordSubmission(ctx context.Context, projectID, reportID string, req CRASubmissionRequest) (*CRASubmission, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/cra-reports/%s/submissions", c.baseURL, projectID, reportID)
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("cra-submission リクエストのシリアライズに失敗: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("cra-submission リクエスト送信エラー: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return nil, decodeCRAError(http.MethodPost, endpoint, resp.StatusCode, respBody)
+	}
+
+	var out CRASubmission
+	if err := json.Unmarshal(respBody, &out); err != nil {
+		return nil, fmt.Errorf("cra-submission レスポンス解析エラー: %w", err)
 	}
 	return &out, nil
 }

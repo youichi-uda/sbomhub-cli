@@ -622,6 +622,162 @@ func TestDecideReport_EditedBodyShape(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// RecordSubmission (M33 Wave D — F421)
+// ----------------------------------------------------------------------------
+
+// TestRecordSubmission_HappyPath verifies the POST hits the frozen
+// contract path, sends the required + optional fields, and decodes the
+// 201 CRASubmission response into every field.
+func TestRecordSubmission_HappyPath(t *testing.T) {
+	const projectID = "00000000-0000-0000-0000-000000000aaa"
+	const reportID = "00000000-0000-0000-0000-000000000ddd"
+
+	var seenBody []byte
+	var seenMethod, seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		seenBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":               "00000000-0000-0000-0000-000000000fff",
+			"cra_report_id":    reportID,
+			"authority":        "JPCERT/CC",
+			"submitted_at":     "2026-09-11T09:00:00Z",
+			"reference_number": "JP-2026-001",
+			"notes":            "72h detailed notification",
+			"created_at":       "2026-09-11T09:00:01Z",
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "test-key")
+	sub, err := client.RecordSubmission(context.Background(), projectID, reportID, CRASubmissionRequest{
+		Authority:       "JPCERT/CC",
+		SubmittedAt:     "2026-09-11T09:00:00Z",
+		ReferenceNumber: "JP-2026-001",
+		Notes:           "72h detailed notification",
+	})
+	if err != nil {
+		t.Fatalf("RecordSubmission error: %v", err)
+	}
+	if seenMethod != http.MethodPost {
+		t.Errorf("method = %s, want POST", seenMethod)
+	}
+	wantPath := "/api/v1/projects/" + projectID + "/cra-reports/" + reportID + "/submissions"
+	if seenPath != wantPath {
+		t.Errorf("path = %s, want %s", seenPath, wantPath)
+	}
+	// Body must byte-match the frozen contract (fields marshal in struct
+	// declaration order: authority, submitted_at, reference_number, notes).
+	wantBody := `{"authority":"JPCERT/CC","submitted_at":"2026-09-11T09:00:00Z","reference_number":"JP-2026-001","notes":"72h detailed notification"}`
+	if string(seenBody) != wantBody {
+		t.Errorf("body = %s\n want %s", string(seenBody), wantBody)
+	}
+	if sub.ID != "00000000-0000-0000-0000-000000000fff" {
+		t.Errorf("ID = %q, want ...fff", sub.ID)
+	}
+	if sub.CRAReportID != reportID {
+		t.Errorf("CRAReportID = %q, want %q", sub.CRAReportID, reportID)
+	}
+	if sub.Authority != "JPCERT/CC" {
+		t.Errorf("Authority = %q, want JPCERT/CC", sub.Authority)
+	}
+	if sub.SubmittedAt != "2026-09-11T09:00:00Z" {
+		t.Errorf("SubmittedAt = %q, want 2026-09-11T09:00:00Z", sub.SubmittedAt)
+	}
+	if sub.ReferenceNumber != "JP-2026-001" {
+		t.Errorf("ReferenceNumber = %q, want JP-2026-001", sub.ReferenceNumber)
+	}
+	if sub.Notes != "72h detailed notification" {
+		t.Errorf("Notes = %q", sub.Notes)
+	}
+	if sub.CreatedAt != "2026-09-11T09:00:01Z" {
+		t.Errorf("CreatedAt = %q", sub.CreatedAt)
+	}
+}
+
+// TestRecordSubmission_OmitOptionalFields verifies the omitempty
+// contract: an unset submitted_at (and reference_number / notes) must be
+// dropped from the body entirely so the server applies its NOW() default
+// on the NOT-NULL submitted_at column.
+func TestRecordSubmission_OmitOptionalFields(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":            "s1",
+			"cra_report_id": "r1",
+			"authority":     "ENISA",
+			"submitted_at":  "2026-09-11T00:00:00Z",
+		})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "k")
+	sub, err := client.RecordSubmission(context.Background(), "p", "r1", CRASubmissionRequest{
+		Authority: "ENISA",
+	})
+	if err != nil {
+		t.Fatalf("RecordSubmission error: %v", err)
+	}
+	if string(seenBody) != `{"authority":"ENISA"}` {
+		t.Errorf("body = %s, want {\"authority\":\"ENISA\"} (omitempty must drop optional fields)", string(seenBody))
+	}
+	for _, k := range []string{"submitted_at", "reference_number", "notes"} {
+		if strings.Contains(string(seenBody), k) {
+			t.Errorf("omitted field %q must not appear in body: %s", k, string(seenBody))
+		}
+	}
+	// Server-defaulted submitted_at round-trips into the DTO.
+	if sub.SubmittedAt != "2026-09-11T00:00:00Z" {
+		t.Errorf("SubmittedAt = %q, want server default", sub.SubmittedAt)
+	}
+}
+
+// TestRecordSubmission_ErrorDecode verifies the contract's error status
+// codes route through decodeCRAError with the right permanent/transient
+// classification (400 authority empty, 403 no write, 404 not found, 409
+// report not approved → permanent; 429/5xx → transient).
+func TestRecordSubmission_ErrorDecode(t *testing.T) {
+	cases := []struct {
+		name          string
+		status        int
+		wantPermanent bool
+		wantTransient bool
+	}{
+		{"400 authority empty", http.StatusBadRequest, true, false},
+		{"403 no write", http.StatusForbidden, true, false},
+		{"404 not found", http.StatusNotFound, true, false},
+		{"409 not approved", http.StatusConflict, true, false},
+		{"429 rate limit", http.StatusTooManyRequests, false, true},
+		{"500 internal", http.StatusInternalServerError, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"error":"x"}`))
+			}))
+			defer server.Close()
+			client := NewClient(server.URL, "k")
+			_, err := client.RecordSubmission(context.Background(), "p", "r", CRASubmissionRequest{Authority: "a"})
+			var ce *CRAError
+			if !errors.As(err, &ce) {
+				t.Fatalf("err = %v (%T), want *CRAError", err, err)
+			}
+			if got := ce.IsPermanent(); got != tc.wantPermanent {
+				t.Errorf("IsPermanent() = %v, want %v", got, tc.wantPermanent)
+			}
+			if got := ce.IsTransient(); got != tc.wantTransient {
+				t.Errorf("IsTransient() = %v, want %v", got, tc.wantTransient)
+			}
+		})
+	}
+}
+
+// ----------------------------------------------------------------------------
 // ReanalyseReport
 // ----------------------------------------------------------------------------
 
