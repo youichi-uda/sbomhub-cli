@@ -523,7 +523,9 @@ func TestCraDraft_InvalidReportType_Validation(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestCraList_HappyPath_F28 — single page, X-Total-Count present.
-// CLI must surface total in the summary line.
+// CLI must surface total in the summary line. Also asserts the M34
+// Wave D (F426) deadline= column: r1 carries deadline_status=overdue,
+// r2 carries deadline_status=on_time from the frozen enrich contract.
 func TestCraList_HappyPath_F28(t *testing.T) {
 	tf := newCraFakeServer(t, nil)
 	tf.listResp = func(call int, q map[string][]string) (int, map[string]string, interface{}) {
@@ -531,8 +533,10 @@ func TestCraList_HappyPath_F28(t *testing.T) {
 			map[string]string{"X-Total-Count": "2"},
 			map[string]interface{}{
 				"reports": []map[string]interface{}{
-					{"id": "r1", "cve_id": "CVE-2024-1", "report_type": "early_warning", "lang": "ja", "state": "draft", "decision": "pending"},
-					{"id": "r2", "cve_id": "CVE-2024-2", "report_type": "final_report", "lang": "en", "state": "approved", "decision": "approved"},
+					{"id": "r1", "cve_id": "CVE-2024-1", "report_type": "early_warning", "lang": "ja", "state": "draft", "decision": "pending",
+						"deadline_status": "overdue", "deadline_at": "2026-09-11T09:00:00Z"},
+					{"id": "r2", "cve_id": "CVE-2024-2", "report_type": "detailed_notification", "lang": "en", "state": "submitted", "decision": "approved",
+						"deadline_status": "on_time", "deadline_at": "2026-09-14T09:00:00Z", "submitted_at": "2026-09-13T09:00:00Z"},
 				},
 			}
 	}
@@ -547,6 +551,39 @@ func TestCraList_HappyPath_F28(t *testing.T) {
 	}
 	if !strings.Contains(out, "合計: 2") {
 		t.Errorf("F28: stdout missing total count: %s", out)
+	}
+	// F426: the deadline status computed on read by the server must land
+	// in the per-report summary line.
+	if !strings.Contains(out, "deadline=overdue") {
+		t.Errorf("F426: stdout missing deadline=overdue for r1: %s", out)
+	}
+	if !strings.Contains(out, "deadline=on_time") {
+		t.Errorf("F426: stdout missing deadline=on_time for r2: %s", out)
+	}
+}
+
+// TestCraList_DeadlineAbsent_F426 — a report WITHOUT deadline_status
+// (older server, or a not-yet-enriched row) must render deadline=- so
+// the column stays aligned and the operator sees "no status" explicitly
+// rather than a silent blank.
+func TestCraList_DeadlineAbsent_F426(t *testing.T) {
+	tf := newCraFakeServer(t, nil)
+	tf.listResp = func(call int, q map[string][]string) (int, map[string]string, interface{}) {
+		return http.StatusOK,
+			map[string]string{"X-Total-Count": "1"},
+			map[string]interface{}{
+				"reports": []map[string]interface{}{
+					{"id": "r1", "cve_id": "CVE-2024-1", "report_type": "final_report", "lang": "ja", "state": "draft", "decision": "pending"},
+				},
+			}
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, stdout, _ := runListAndCapture(t, client, listArgs{project: "p"})
+	if res.err != nil {
+		t.Fatalf("list err: %v", res.err)
+	}
+	if !strings.Contains(stdout.String(), "deadline=-") {
+		t.Errorf("F426: absent deadline_status must render deadline=-, got %s", stdout.String())
 	}
 }
 
@@ -1122,8 +1159,8 @@ func runListAndCapture(t *testing.T, client *api.Client, args listArgs) (capture
 		if decision == "" {
 			decision = "pending"
 		}
-		fmt.Fprintf(w, "  %s  %s  %s  %s  state=%s  decision=%s\n",
-			r.ID, r.CVEID, r.ReportType, r.Lang, orDash(r.State), decision)
+		fmt.Fprintf(w, "  %s  %s  %s  %s  state=%s  decision=%s  deadline=%s\n",
+			r.ID, r.CVEID, r.ReportType, r.Lang, orDash(r.State), decision, orDash(r.DeadlineStatus))
 	}
 	fmt.Fprintf(w, "\n表示: %d / 合計: %d\n", len(rendered), total)
 	return capturedResult{err: nil}, &stdout, &stderr

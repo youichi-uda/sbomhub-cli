@@ -132,6 +132,27 @@ type CRAReport struct {
 
 	CreatedAt string `json:"created_at,omitempty"`
 	UpdatedAt string `json:"updated_at,omitempty"`
+
+	// CRA Art.14 deadline status (M34 Wave D — F426). These fields are
+	// COMPUTED on read by the server (service/cra ComputeDeadline) and are
+	// NOT persisted — the derived state is recomputed on every list/get so
+	// it never goes stale (migration 053 stale-derived-column rationale).
+	//
+	// DeadlineStatus is one of the five wire values:
+	//   "not_applicable" — final_report OR awareness_time not captured
+	//   "pending"        — not yet submitted and now < deadline
+	//   "overdue"        — not yet submitted and now >= deadline
+	//   "on_time"        — submitted at/before the deadline
+	//   "late"           — submitted after the deadline
+	//
+	// DeadlineAt is awareness_time + {24h early_warning | 72h detailed_
+	// notification}; null for not_applicable. SubmittedAt is the report's
+	// EARLIEST cra_submissions.submitted_at (MIN); null when unsubmitted.
+	// Both timestamps are surfaced as *string (nil ≡ null ≡ absent) to
+	// match the existing DTO convention (M2 pointer contract).
+	DeadlineStatus string  `json:"deadline_status,omitempty"`
+	DeadlineAt     *string `json:"deadline_at,omitempty"`
+	SubmittedAt    *string `json:"submitted_at,omitempty"`
 }
 
 // CRARunReportResult is the wire shape returned by POST /cra-reports/run

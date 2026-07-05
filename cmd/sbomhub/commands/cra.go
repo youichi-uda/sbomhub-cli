@@ -561,8 +561,13 @@ func runCraList(cmd *cobra.Command, args []string) error {
 		if decision == "" {
 			decision = "pending"
 		}
-		fmt.Fprintf(w, "  %s  %-22s  %-12s  %-3s  state=%-9s  decision=%s\n",
-			r.ID, r.CVEID, r.ReportType, r.Lang, orDash(r.State), decision)
+		// deadline=<status> surfaces the CRA Art.14 on-time clock (M34
+		// Wave D — F426). Server computes it on read; "-" when the field
+		// is absent (older server) or empty (not_applicable is emitted
+		// verbatim so the operator sees final_report / no-awareness rows
+		// explicitly rather than as a blank).
+		fmt.Fprintf(w, "  %s  %-22s  %-12s  %-3s  state=%-9s  decision=%-8s  deadline=%-14s\n",
+			r.ID, r.CVEID, r.ReportType, r.Lang, orDash(r.State), decision, orDash(r.DeadlineStatus))
 		if r.UpdatedAt != "" {
 			fmt.Fprintf(w, "      updated: %s\n", r.UpdatedAt)
 		}
