@@ -140,7 +140,7 @@ Exit codes:
 func init() {
 	rootCmd.AddCommand(triageCmd)
 
-	triageCmd.Flags().StringVarP(&triageProject, "project", "p", "", "対象プロジェクト ID (UUID) または名前 / project ID (UUID) or name")
+	triageCmd.Flags().StringVarP(&triageProject, "project", "p", "", "対象プロジェクト ID (UUID) / project ID (UUID)")
 	triageCmd.Flags().StringVar(&triageEcosystem, "ecosystem", "go", "対象エコシステム / target ecosystem (M1: go のみ正式サポート / only `go` is fully supported in M1)")
 	triageCmd.Flags().BoolVar(&triageNonInteractive, "non-interactive", false, "prompt を skip し全 draft を under_investigation で保存 (CI 用) / skip prompts; save every draft as under_investigation (CI mode)")
 	triageCmd.Flags().Float64Var(&triageConfidenceThreshold, "confidence-threshold", 0.7, "AI confidence の最小しきい値 / minimum AI confidence threshold (server-side SBOMHUB_AI_CONFIDENCE_THRESHOLD が真の source of truth / the server-side env var is the source of truth)")

@@ -101,7 +101,6 @@ var (
 	metiOverrideStatus           string
 	metiOverrideNote             string
 	metiOverrideImprovementAct   string
-	metiOverrideImprovementSet   bool // true when --improvement-action was passed on the CLI
 
 	// clear-override (M3 Codex review #F36)
 	metiClearOverrideCriterion string
