@@ -14,7 +14,12 @@ package commands
 //   5. (M43, issue #168) targets' vuln_funcs are forwarded to the
 //      analyzer's VulnerableSymbols — unioned across duplicate
 //      (component, cve) rows, nil when absent/blank (graceful degrade
-//      against pre-M43 servers).
+//      against pre-M43 servers),
+//   6. (M43 Phase D review) malformed vuln_funcs shapes — anything the
+//      vendored analyzer's parseSymbolSelectors would reject with an
+//      error — are dropped CLI-side so one bad selector cannot downgrade
+//      the whole work item to the degraded import_only + analyzer_error
+//      path; legitimate symbols in the same list survive.
 
 import (
 	"bytes"
@@ -449,6 +454,125 @@ func TestReachability_VulnFuncs_ForwardedAndUnioned(t *testing.T) {
 	}
 	if len(envelope.Results) != 3 {
 		t.Fatalf("results len = %d, want 3", len(envelope.Results))
+	}
+}
+
+// TestReachability_VulnFuncs_MalformedShapesDropped — M43 Phase D review:
+// a targets response mixing malformed selectors (bare name, 4 dot-parts,
+// non-identifier characters, interior space, blank) with legitimate ones
+// must forward ONLY the legitimate shapes to the analyzer's
+// VulnerableSymbols (first-seen order). Without the CLI-side shape filter
+// the malformed entries reach the vendored analyzer verbatim and its
+// parseSymbolSelectors fails the WHOLE symbol walk — losing the
+// legitimate symbols alongside the bad one.
+//
+// Uses the recording analyzer (SkipPackagesLoad — offline-safe) because
+// the surviving legitimate selectors would otherwise trigger a real
+// packages.Load.
+func TestReachability_VulnFuncs_MalformedShapesDropped(t *testing.T) {
+	rf := newReachFakeServer(t, nil)
+	rf.rawTargets = []byte(`{"targets":[
+		{"cve_id":"CVE-2024-0001","component_id":"c1","purl":"pkg:golang/example.test/vulnpkg@v1.0.0","ecosystem":"go","vuln_funcs":["Foo","yaml.Unmarshal","a.b.c.d","Pkg.Type.Method","Bar.baz()","_pkg.F1","pkg name.Func","","パッケージ.解析"]}
+	]}`)
+	client := api.NewClient(rf.server.URL, "test-key")
+	rec := newRecordingAnalyzer()
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "go",
+		path:      reachFixturePath,
+		analyzer:  rec,
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	in, ok := rec.inputByCVE("CVE-2024-0001")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-0001")
+	}
+	// Legitimate shapes only: Pkg.Func, Pkg.Type.Method, underscore-led
+	// identifier, unicode-letter identifiers. Malformed shapes (bare name,
+	// 4 dot-parts, "()" suffix, interior space, blank) must be gone.
+	wantSyms := []string{"yaml.Unmarshal", "Pkg.Type.Method", "_pkg.F1", "パッケージ.解析"}
+	if !reflect.DeepEqual(in.VulnerableSymbols, wantSyms) {
+		t.Errorf("VulnerableSymbols = %#v, want %#v (malformed shapes dropped, legit survive)", in.VulnerableSymbols, wantSyms)
+	}
+
+	if rf.uploadHits != 1 {
+		t.Fatalf("uploadHits = %d, want 1", rf.uploadHits)
+	}
+}
+
+// TestReachability_VulnFuncs_AllMalformed_NoAnalyzerError — M43 Phase D
+// review, driven through the REAL analyzer (SkipPackagesLoad=false): when
+// every published vuln_func is malformed, the CLI must drop them all
+// (collapsing to nil = stage 1 only) instead of forwarding them into the
+// analyzer, where parseSymbolSelectors would fail the symbol walk and
+// downgrade the verdict to the degraded import_only path (confidence
+// 0.50 + "symbol AST walk failed: invalid symbol selector ..."
+// analyzer_error evidence).
+//
+// Offline-safe in both states: pre-fix the analyzer errors in
+// parseSymbolSelectors BEFORE packages.Load; post-fix the nil symbol list
+// stops the analyzer at stage 1, so packages.Load never runs.
+func TestReachability_VulnFuncs_AllMalformed_NoAnalyzerError(t *testing.T) {
+	rf := newReachFakeServer(t, nil)
+	rf.rawTargets = []byte(`{"targets":[
+		{"cve_id":"CVE-2024-0001","component_id":"c1","purl":"pkg:golang/example.test/vulnpkg@v1.0.0","ecosystem":"go","vuln_funcs":["Foo","a.b.c.d","Bar.baz()","pkg name.Func",""]}
+	]}`)
+	client := api.NewClient(rf.server.URL, "test-key")
+	// Real analyzer with the symbol walk ENABLED — this is the path the
+	// finding is about.
+	rec := &recordingAnalyzer{real: reachability.GoAnalyzer{}}
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "go",
+		path:      reachFixturePath,
+		analyzer:  rec,
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	// All-malformed must collapse to nil (stage 1 only), exactly like the
+	// blank-only / absent vuln_funcs cases.
+	in, ok := rec.inputByCVE("CVE-2024-0001")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-0001")
+	}
+	if in.VulnerableSymbols != nil {
+		t.Errorf("VulnerableSymbols = %#v, want nil (all-malformed vuln_funcs dropped)", in.VulnerableSymbols)
+	}
+
+	var envelope struct {
+		Results []api.ReachabilityUploadResult `json:"results"`
+	}
+	if err := json.Unmarshal(rf.lastPostBody, &envelope); err != nil {
+		t.Fatalf("decode POST body: %v", err)
+	}
+	if len(envelope.Results) != 1 {
+		t.Fatalf("results len = %d, want 1", len(envelope.Results))
+	}
+	verdict := envelope.Results[0]
+	if verdict.Status != string(reachability.StatusImportOnly) {
+		t.Errorf("status = %q, want import_only", verdict.Status)
+	}
+	// 0.60 = clean import_only; 0.50 is the degraded symbol-walk-failed
+	// path the malformed selectors would trigger without the filter.
+	if verdict.Confidence != 0.60 {
+		t.Errorf("confidence = %v, want 0.60 (clean import_only, not the 0.50 degraded walk-failed path)", verdict.Confidence)
+	}
+	evidence := string(verdict.Evidence)
+	if strings.Contains(evidence, "invalid symbol selector") || strings.Contains(evidence, "symbol AST walk failed") {
+		t.Errorf("evidence carries a symbol-walk failure — malformed selectors reached the analyzer: %s", evidence)
 	}
 }
 

@@ -22,8 +22,11 @@ package commands
 // GRANULARITY (M43, issue #168): the targets endpoint publishes the
 // server-normalized vulnerable symbols per (cve, component) row as
 // `vuln_funcs` ("Pkg.Func" / "Pkg.Type.Method"). When present they are
-// forwarded verbatim into the analyzer's VulnerableSymbols, enabling
-// stage 2 (AST symbol walk) and symbol-level `reachable` verdicts. When
+// forwarded verbatim into the analyzer's VulnerableSymbols — modulo a
+// defense-in-depth shape filter (isWellFormedSymbolSelector) that drops
+// malformed entries so one bad selector cannot fail the whole symbol
+// walk — enabling stage 2 (AST symbol walk) and symbol-level `reachable`
+// verdicts. When
 // absent or empty — pre-M43 server, or an advisory with no symbol data —
 // the analyzer stops at stage 1 and the coarsest verdict a matched module
 // can reach stays `import_only` (graceful degrade, the M32 behavior).
@@ -42,6 +45,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
@@ -190,15 +194,18 @@ type reachWorkItem struct {
 }
 
 // mergeVulnFuncs appends the server-published vuln_funcs in add onto dst,
-// dropping blank entries and exact duplicates while preserving first-seen
-// order. The surviving symbol strings are forwarded verbatim — the server
-// owns normalization ("Pkg.Func" / "Pkg.Type.Method", frozen M43
-// contract) and the CLI does not re-sanitize. Returns nil when nothing
-// survives, so the result can be handed straight to
+// dropping blank entries, malformed shapes (see
+// isWellFormedSymbolSelector), and exact duplicates while preserving
+// first-seen order. The surviving symbol strings are forwarded verbatim —
+// the server owns normalization ("Pkg.Func" / "Pkg.Type.Method", frozen
+// M43 contract) and the CLI never rewrites a value; it only drops shapes
+// the analyzer would reject outright. Returns nil when nothing survives,
+// so the result can be handed straight to
 // ReachabilityInput.VulnerableSymbols (len==0 → stage 1 only).
 func mergeVulnFuncs(dst, add []string) []string {
 	for _, s := range add {
-		if strings.TrimSpace(s) == "" {
+		trimmed := strings.TrimSpace(s)
+		if trimmed == "" || !isWellFormedSymbolSelector(trimmed) {
 			continue
 		}
 		dup := false
@@ -213,6 +220,56 @@ func mergeVulnFuncs(dst, add []string) []string {
 		}
 	}
 	return dst
+}
+
+// isWellFormedSymbolSelector reports whether a (TrimSpace'd, non-empty)
+// vuln_func has the "Pkg.Func" / "Pkg.Type.Method" shape: 2..3
+// dot-separated parts, each part shaped like a Go identifier (first rune
+// a unicode letter or '_', remaining runes letters, digits, or '_').
+//
+// Defense-in-depth (M43 Phase D review). The server normalizer remains
+// the single source of truth for symbol normalization (frozen M43
+// contract) — this filter never rewrites a value, it only drops shapes
+// that would be fatal to the analyzer. It mirrors the acceptance set of
+// the vendored analyzer's parseSymbolSelectors
+// (internal/reachability/go_analyzer.go), which returns an error when any
+// single selector is malformed — downgrading the WHOLE work item to
+// import_only + analyzer_error and losing every legitimate symbol
+// alongside the bad one (server drift / non-conforming server). The
+// identifier-shape requirement is a conservative subset of what
+// parseSymbolSelectors tolerates: a part that is not identifier-shaped
+// (e.g. "baz()") can never match an *ast.Ident name in the symbol walk,
+// so dropping it loses no reachability signal.
+func isWellFormedSymbolSelector(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 || len(parts) > 3 {
+		return false
+	}
+	for _, p := range parts {
+		if !isGoIdentifierShaped(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// isGoIdentifierShaped reports whether s looks like a Go identifier:
+// non-empty, first rune a unicode letter or '_', remaining runes unicode
+// letters, unicode digits, or '_'.
+func isGoIdentifierShaped(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if r == '_' || unicode.IsLetter(r) {
+			continue
+		}
+		if i > 0 && unicode.IsDigit(r) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // runReachabilityAnalysis is the testable core. It fetches the project's
