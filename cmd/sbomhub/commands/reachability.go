@@ -19,12 +19,14 @@ package commands
 //     the vendored two-stage analyzer against <path>,
 //  4. POST the verdicts to /api/v1/projects/:id/reachability.
 //
-// GRANULARITY (M32 minimal path): no vulnerable SYMBOLS are supplied to
-// the analyzer, so stage 2 (AST symbol grep) is skipped and the coarsest
-// verdict a matched module can reach is `import_only` (never symbol-level
-// `reachable`). not_present / import_only / unknown are all reachable.
-// Symbol-level reachability is deferred (needs the advisory parser to
-// publish vulnerable symbol names — future milestone).
+// GRANULARITY (M43, issue #168): the targets endpoint publishes the
+// server-normalized vulnerable symbols per (cve, component) row as
+// `vuln_funcs` ("Pkg.Func" / "Pkg.Type.Method"). When present they are
+// forwarded verbatim into the analyzer's VulnerableSymbols, enabling
+// stage 2 (AST symbol walk) and symbol-level `reachable` verdicts. When
+// absent or empty — pre-M43 server, or an advisory with no symbol data —
+// the analyzer stops at stage 1 and the coarsest verdict a matched module
+// can reach stays `import_only` (graceful degrade, the M32 behavior).
 //
 // A target whose purl is empty (component has no package URL) cannot yield
 // a module coordinate; the command skips it and reports the count on
@@ -78,11 +80,13 @@ source never leaves your machine.
   4. 判定を POST /api/v1/projects/:id/reachability でアップロード
      Upload the verdicts
 
-粒度 / Granularity (M32):
-  vulnerable symbol 未指定のため、 module がマッチしても最大 import_only
-  までです (symbol レベル reachable は将来のマイルストーン)。
-  Without vulnerable symbols, a matched module reaches at most
-  import_only — symbol-level reachable is deferred.`,
+粒度 / Granularity (M43):
+  サーバーがターゲットに vuln_funcs (脆弱シンボル) を公開している場合は
+  symbol レベルの reachable まで判定します。 vuln_funcs が無い場合は
+  従来どおり最大 import_only です (旧サーバーでも動作)。
+  Targets carrying vuln_funcs are analyzed to symbol-level reachable;
+  without symbols a matched module still reaches at most import_only
+  (graceful degrade against older servers).`,
 	Args: cobra.ExactArgs(1),
 	RunE: runReachability,
 }
@@ -174,12 +178,41 @@ type reachOpts struct {
 	stderr    io.Writer
 }
 
-// reachWorkItem is one (component, cve, module) triple to analyze.
+// reachWorkItem is one (component, cve, module) triple to analyze, plus
+// the union of the server-published vulnerable symbols (vuln_funcs) from
+// every target row that deduplicated onto it.
 type reachWorkItem struct {
 	componentID string
 	cveID       string
 	module      string
 	ecosystem   string
+	symbols     []string // nil when the server published no vuln_funcs
+}
+
+// mergeVulnFuncs appends the server-published vuln_funcs in add onto dst,
+// dropping blank entries and exact duplicates while preserving first-seen
+// order. The surviving symbol strings are forwarded verbatim — the server
+// owns normalization ("Pkg.Func" / "Pkg.Type.Method", frozen M43
+// contract) and the CLI does not re-sanitize. Returns nil when nothing
+// survives, so the result can be handed straight to
+// ReachabilityInput.VulnerableSymbols (len==0 → stage 1 only).
+func mergeVulnFuncs(dst, add []string) []string {
+	for _, s := range add {
+		if strings.TrimSpace(s) == "" {
+			continue
+		}
+		dup := false
+		for _, have := range dst {
+			if have == s {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dst = append(dst, s)
+		}
+	}
+	return dst
 }
 
 // runReachabilityAnalysis is the testable core. It fetches the project's
@@ -214,8 +247,8 @@ func runReachabilityAnalysis(ctx context.Context, client *api.Client, opts reach
 	// coordinate (empty / non-golang purl).
 	var (
 		items           []reachWorkItem
-		seen            = map[string]struct{}{}
-		droppedNoModule int // target had no derivable Go module (empty/non-go purl)
+		itemIndex       = map[string]int{} // dedupe key → index into items
+		droppedNoModule int                // target had no derivable Go module (empty/non-go purl)
 	)
 	for _, tgt := range targets {
 		if tgt.ComponentID == "" {
@@ -229,19 +262,24 @@ func runReachabilityAnalysis(ctx context.Context, client *api.Client, opts reach
 			continue
 		}
 		key := tgt.ComponentID + "\x00" + tgt.CVEID
-		if _, dup := seen[key]; dup {
+		if idx, dup := itemIndex[key]; dup {
+			// The same (component, cve) can appear on several target rows;
+			// union their vuln_funcs (order-preserving dedupe) so stage 2
+			// sees every published symbol.
+			items[idx].symbols = mergeVulnFuncs(items[idx].symbols, tgt.VulnFuncs)
 			continue
 		}
-		seen[key] = struct{}{}
 		ecosystem := tgt.Ecosystem
 		if ecosystem == "" {
 			ecosystem = "go"
 		}
+		itemIndex[key] = len(items)
 		items = append(items, reachWorkItem{
 			componentID: tgt.ComponentID,
 			cveID:       tgt.CVEID,
 			module:      module,
 			ecosystem:   ecosystem,
+			symbols:     mergeVulnFuncs(nil, tgt.VulnFuncs),
 		})
 	}
 
@@ -264,8 +302,11 @@ func runReachabilityAnalysis(ctx context.Context, client *api.Client, opts reach
 			AdvisoryID:        it.cveID,
 			Ecosystem:         "go",
 			VulnerableModules: []string{it.module},
-			// No symbols in the M32 minimal path → import_only granularity.
-			VulnerableSymbols: nil,
+			// M43: server-published vuln_funcs (unioned across duplicate
+			// target rows) drive stage 2 (symbol walk). nil/empty — old
+			// server or no symbol data — keeps the analyzer at stage 1 =
+			// import_only granularity (pre-M43 behavior).
+			VulnerableSymbols: it.symbols,
 		})
 		if err != nil {
 			// The analyzer only errors on nil / cancelled context or an

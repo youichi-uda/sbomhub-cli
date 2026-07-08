@@ -10,7 +10,11 @@ package commands
 //   2. a non-2xx upload surfaces as an error (no partial-success claim),
 //   3. a target with an empty purl is skipped (no derivable module) and
 //      reported on stderr,
-//   4. --cve narrows the analyzed set.
+//   4. --cve narrows the analyzed set,
+//   5. (M43, issue #168) targets' vuln_funcs are forwarded to the
+//      analyzer's VulnerableSymbols — unioned across duplicate
+//      (component, cve) rows, nil when absent/blank (graceful degrade
+//      against pre-M43 servers).
 
 import (
 	"bytes"
@@ -20,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -39,7 +44,8 @@ type reachFakeServer struct {
 	t          *testing.T
 	server     *httptest.Server
 	targets    []api.ReachabilityTarget
-	uploadCode int // status returned by POST /reachability (default 201)
+	rawTargets []byte // when non-nil, served verbatim as the targets GET body (field-presence control)
+	uploadCode int    // status returned by POST /reachability (default 201)
 
 	mu             sync.Mutex
 	targetsGetHits int
@@ -65,9 +71,14 @@ func (rf *reachFakeServer) handle(w http.ResponseWriter, r *http.Request) {
 		rf.mu.Lock()
 		rf.targetsGetHits++
 		rf.lastTargetsQ = r.URL.Query().Get("ecosystem")
+		raw := rf.rawTargets
 		rf.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		if raw != nil {
+			_, _ = w.Write(raw)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"targets": rf.targets})
 
 	case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reachability"):
@@ -325,6 +336,119 @@ func TestReachability_CVEScope(t *testing.T) {
 	}
 	if envelope.Results[0].CVEID != "CVE-2024-0001" {
 		t.Errorf("scoped CVE = %q, want CVE-2024-0001", envelope.Results[0].CVEID)
+	}
+}
+
+// recordingAnalyzer wraps the REAL vendored analyzer (packages.Load
+// disabled — offline-safe, stage 1 only) and records every
+// ReachabilityInput it receives, so tests can assert exactly what the
+// command forwarded (M43: targets' vuln_funcs → VulnerableSymbols)
+// without mocking verdicts or the upload path.
+type recordingAnalyzer struct {
+	mu     sync.Mutex
+	inputs []reachability.ReachabilityInput
+	real   reachability.GoAnalyzer
+}
+
+func newRecordingAnalyzer() *recordingAnalyzer {
+	return &recordingAnalyzer{real: reachability.GoAnalyzer{SkipPackagesLoad: true}}
+}
+
+func (ra *recordingAnalyzer) Analyze(ctx context.Context, projectPath string, input reachability.ReachabilityInput) (*reachability.ReachabilityResult, error) {
+	ra.mu.Lock()
+	ra.inputs = append(ra.inputs, input)
+	ra.mu.Unlock()
+	return ra.real.Analyze(ctx, projectPath, input)
+}
+
+func (ra *recordingAnalyzer) inputByCVE(cve string) (reachability.ReachabilityInput, bool) {
+	ra.mu.Lock()
+	defer ra.mu.Unlock()
+	for _, in := range ra.inputs {
+		if in.AdvisoryID == cve {
+			return in, true
+		}
+	}
+	return reachability.ReachabilityInput{}, false
+}
+
+// TestReachability_VulnFuncs_ForwardedAndUnioned — M43 (issue #168):
+//
+//   - a target's vuln_funcs reach the analyzer input verbatim,
+//   - duplicate (component, cve) rows union their vuln_funcs with
+//     order-preserving dedupe,
+//   - blank-only lists collapse to nil,
+//   - a row without the vuln_funcs field (exactly what a pre-M43 server
+//     sends — hence the raw JSON body) yields nil VulnerableSymbols, i.e.
+//     the analyzer stays at stage 1 / import_only (graceful degrade).
+func TestReachability_VulnFuncs_ForwardedAndUnioned(t *testing.T) {
+	rf := newReachFakeServer(t, nil)
+	rf.rawTargets = []byte(`{"targets":[
+		{"cve_id":"CVE-2024-0001","component_id":"c1","purl":"pkg:golang/example.test/vulnpkg@v1.0.0","ecosystem":"go","vuln_funcs":["vulnpkg.Parse","vulnpkg.Decoder.Decode"]},
+		{"cve_id":"CVE-2024-0001","component_id":"c1","purl":"pkg:golang/example.test/vulnpkg@v1.0.0","ecosystem":"go","vuln_funcs":["vulnpkg.Parse","vulnpkg.Render"]},
+		{"cve_id":"CVE-2024-0002","component_id":"c2","purl":"pkg:golang/example.test/vulnpkg@v1.0.0","ecosystem":"go","vuln_funcs":[""," "]},
+		{"cve_id":"CVE-2024-0003","component_id":"c3","purl":"pkg:golang/example.test/vulnpkg@v1.0.0","ecosystem":"go"}
+	]}`)
+	client := api.NewClient(rf.server.URL, "test-key")
+	rec := newRecordingAnalyzer()
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "go",
+		path:      reachFixturePath,
+		analyzer:  rec,
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	if got := len(rec.inputs); got != 3 {
+		t.Fatalf("analyzer invocations = %d, want 3 (duplicate (component,cve) rows must merge)", got)
+	}
+
+	// Union across the two CVE-2024-0001 rows, first-seen order, deduped.
+	in1, ok := rec.inputByCVE("CVE-2024-0001")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-0001")
+	}
+	wantSyms := []string{"vulnpkg.Parse", "vulnpkg.Decoder.Decode", "vulnpkg.Render"}
+	if !reflect.DeepEqual(in1.VulnerableSymbols, wantSyms) {
+		t.Errorf("VulnerableSymbols = %#v, want %#v (union, order-preserving dedupe)", in1.VulnerableSymbols, wantSyms)
+	}
+
+	// Blank-only vuln_funcs collapse to nil (analyzer stays at stage 1).
+	in2, ok := rec.inputByCVE("CVE-2024-0002")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-0002")
+	}
+	if in2.VulnerableSymbols != nil {
+		t.Errorf("VulnerableSymbols = %#v, want nil for blank-only vuln_funcs", in2.VulnerableSymbols)
+	}
+
+	// Field absent (pre-M43 server) → nil → import_only granularity.
+	in3, ok := rec.inputByCVE("CVE-2024-0003")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-0003")
+	}
+	if in3.VulnerableSymbols != nil {
+		t.Errorf("VulnerableSymbols = %#v, want nil when vuln_funcs is absent (old server)", in3.VulnerableSymbols)
+	}
+
+	// The upload path is unchanged: one POST carrying all three verdicts.
+	if rf.uploadHits != 1 {
+		t.Fatalf("uploadHits = %d, want 1", rf.uploadHits)
+	}
+	var envelope struct {
+		Results []api.ReachabilityUploadResult `json:"results"`
+	}
+	if err := json.Unmarshal(rf.lastPostBody, &envelope); err != nil {
+		t.Fatalf("decode POST body: %v", err)
+	}
+	if len(envelope.Results) != 3 {
+		t.Fatalf("results len = %d, want 3", len(envelope.Results))
 	}
 }
 

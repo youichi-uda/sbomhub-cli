@@ -161,13 +161,23 @@ func (c *Client) UploadReachability(ctx context.Context, projectID string, resul
 // target (no module coordinate can be derived) and reports it. Ecosystem is
 // the server-derived token (pkg:golang→"go", pkg:npm→"npm", …); it is
 // forwarded verbatim onto the uploaded verdict.
+//
+// VulnFuncs (M43, issue #168) is the server-normalized vulnerable symbol
+// list for this (cve, component) pair — one "Pkg.Func" or
+// "Pkg.Type.Method" entry per element. The CLI forwards it verbatim into
+// the analyzer's VulnerableSymbols input (the server owns normalization;
+// no client-side re-sanitizing beyond dropping blank entries). Old
+// servers omit the field entirely → nil → the analyzer runs stage 1 only
+// (import_only granularity), preserving the pre-M43 behavior (graceful
+// degrade).
 type ReachabilityTarget struct {
-	CVEID            string `json:"cve_id"`
-	ComponentID      string `json:"component_id"`
-	Purl             string `json:"purl"`
-	ComponentName    string `json:"component_name"`
-	ComponentVersion string `json:"component_version"`
-	Ecosystem        string `json:"ecosystem"`
+	CVEID            string   `json:"cve_id"`
+	ComponentID      string   `json:"component_id"`
+	Purl             string   `json:"purl"`
+	ComponentName    string   `json:"component_name"`
+	ComponentVersion string   `json:"component_version"`
+	Ecosystem        string   `json:"ecosystem"`
+	VulnFuncs        []string `json:"vuln_funcs"`
 }
 
 // GetReachabilityTargets returns the (cve, component) pairs the project's
