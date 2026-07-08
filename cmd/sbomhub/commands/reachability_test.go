@@ -19,13 +19,20 @@ package commands
 //      vendored analyzer's parseSymbolSelectors would reject with an
 //      error — are dropped CLI-side so one bad selector cannot downgrade
 //      the whole work item to the degraded import_only + analyzer_error
-//      path; legitimate symbols in the same list survive.
+//      path; legitimate symbols in the same list survive,
+//   7. (M43 Phase D round 2 review) the per-work-item symbol union is
+//      capped at maxVulnFuncsPerItem (= server maxVulnFuncsPerCVE = 200):
+//      elements past the cap are dropped first-wins, exactly 200 is
+//      untouched, and the cap holds across the union of duplicate
+//      (component, cve) rows — so a drift/hostile server publishing
+//      thousands of well-formed selectors cannot bloat the AST walk.
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -573,6 +580,119 @@ func TestReachability_VulnFuncs_AllMalformed_NoAnalyzerError(t *testing.T) {
 	evidence := string(verdict.Evidence)
 	if strings.Contains(evidence, "invalid symbol selector") || strings.Contains(evidence, "symbol AST walk failed") {
 		t.Errorf("evidence carries a symbol-walk failure — malformed selectors reached the analyzer: %s", evidence)
+	}
+}
+
+// TestReachability_VulnFuncs_CappedPerWorkItem — M43 Phase D round 2
+// review: the CLI must mirror the server's serving-edge cap
+// (maxVulnFuncsPerCVE = 200) on the per-work-item symbol union, so a
+// drifted / hostile / non-conforming server publishing thousands of
+// well-formed selectors cannot inflate the analyzer's AST symbol walk or
+// the merge itself. Three work items pin the semantics:
+//
+//   - 300 well-formed selectors on one row → exactly the first 200 reach
+//     the analyzer (order preserved, first wins, tail dropped),
+//   - exactly 200 on one row → untouched (boundary),
+//   - duplicate (component, cve) rows unioning 150 + 100 (with one
+//     cross-row duplicate that must not consume cap budget) → the union
+//     is capped at 200: all 150 from the first row + the first 50 new
+//     symbols from the second.
+//
+// Uses the recording analyzer (SkipPackagesLoad — offline-safe) so the
+// forwarded VulnerableSymbols can be asserted verbatim.
+func TestReachability_VulnFuncs_CappedPerWorkItem(t *testing.T) {
+	mkSyms := func(prefix string, n int) []string {
+		syms := make([]string, n)
+		for i := range syms {
+			syms[i] = fmt.Sprintf("vulnpkg.%s%03d", prefix, i)
+		}
+		return syms
+	}
+
+	over := mkSyms("Over", 300)   // > cap: tail must be dropped
+	exact := mkSyms("Exact", 200) // == cap: must be untouched
+	unionA := mkSyms("UnionA", 150)
+	// Second row for the same (component, cve): leads with a duplicate of
+	// the first row's first symbol (must dedupe, not consume cap budget),
+	// then 100 fresh symbols of which only the first 50 fit under the cap.
+	unionB := append([]string{unionA[0]}, mkSyms("UnionB", 100)...)
+
+	const purl = "pkg:golang/example.test/vulnpkg@v1.0.0"
+	targets := []api.ReachabilityTarget{
+		{CVEID: "CVE-2024-0001", ComponentID: "c1", Purl: purl, Ecosystem: "go", VulnFuncs: over},
+		{CVEID: "CVE-2024-0002", ComponentID: "c2", Purl: purl, Ecosystem: "go", VulnFuncs: exact},
+		{CVEID: "CVE-2024-0003", ComponentID: "c3", Purl: purl, Ecosystem: "go", VulnFuncs: unionA},
+		{CVEID: "CVE-2024-0003", ComponentID: "c3", Purl: purl, Ecosystem: "go", VulnFuncs: unionB},
+	}
+	rf := newReachFakeServer(t, targets)
+	client := api.NewClient(rf.server.URL, "test-key")
+	rec := newRecordingAnalyzer()
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "go",
+		path:      reachFixturePath,
+		analyzer:  rec,
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	if got := len(rec.inputs); got != 3 {
+		t.Fatalf("analyzer invocations = %d, want 3", got)
+	}
+
+	// Over cap: exactly the first 200, in published order (first wins).
+	in1, ok := rec.inputByCVE("CVE-2024-0001")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-0001")
+	}
+	if got := len(in1.VulnerableSymbols); got != maxVulnFuncsPerItem {
+		t.Errorf("over-cap VulnerableSymbols len = %d, want %d (cap)", got, maxVulnFuncsPerItem)
+	}
+	if !reflect.DeepEqual(in1.VulnerableSymbols, over[:200]) {
+		t.Errorf("over-cap VulnerableSymbols != first 200 published symbols (order-preserving, first wins)")
+	}
+
+	// Boundary: exactly 200 survives untouched.
+	in2, ok := rec.inputByCVE("CVE-2024-0002")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-0002")
+	}
+	if !reflect.DeepEqual(in2.VulnerableSymbols, exact) {
+		t.Errorf("exactly-at-cap VulnerableSymbols mutated: len = %d, want all 200 untouched", len(in2.VulnerableSymbols))
+	}
+
+	// Union across duplicate rows: cap applies to the merged total. The
+	// cross-row duplicate is deduped without consuming cap budget, so the
+	// first 50 fresh UnionB symbols still fit.
+	in3, ok := rec.inputByCVE("CVE-2024-0003")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-0003")
+	}
+	wantUnion := append(append([]string{}, unionA...), mkSyms("UnionB", 100)[:50]...)
+	if got := len(in3.VulnerableSymbols); got != maxVulnFuncsPerItem {
+		t.Errorf("unioned VulnerableSymbols len = %d, want %d (cap across merged rows)", got, maxVulnFuncsPerItem)
+	}
+	if !reflect.DeepEqual(in3.VulnerableSymbols, wantUnion) {
+		t.Errorf("unioned VulnerableSymbols != first row's 150 + first 50 fresh symbols of second row")
+	}
+
+	// Upload path unchanged: one POST carrying all three verdicts.
+	if rf.uploadHits != 1 {
+		t.Fatalf("uploadHits = %d, want 1", rf.uploadHits)
+	}
+	var envelope struct {
+		Results []api.ReachabilityUploadResult `json:"results"`
+	}
+	if err := json.Unmarshal(rf.lastPostBody, &envelope); err != nil {
+		t.Fatalf("decode POST body: %v", err)
+	}
+	if len(envelope.Results) != 3 {
+		t.Fatalf("results len = %d, want 3", len(envelope.Results))
 	}
 }
 

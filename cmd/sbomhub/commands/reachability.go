@@ -25,8 +25,10 @@ package commands
 // forwarded verbatim into the analyzer's VulnerableSymbols — modulo a
 // defense-in-depth shape filter (isWellFormedSymbolSelector) that drops
 // malformed entries so one bad selector cannot fail the whole symbol
-// walk — enabling stage 2 (AST symbol walk) and symbol-level `reachable`
-// verdicts. When
+// walk, and a per-work-item cap (maxVulnFuncsPerItem, mirroring the
+// server's serving-edge cap) so a non-conforming server cannot inflate
+// the walk — enabling stage 2 (AST symbol walk) and symbol-level
+// `reachable` verdicts. When
 // absent or empty — pre-M43 server, or an advisory with no symbol data —
 // the analyzer stops at stage 1 and the coarsest verdict a matched module
 // can reach stays `import_only` (graceful degrade, the M32 behavior).
@@ -193,17 +195,36 @@ type reachWorkItem struct {
 	symbols     []string // nil when the server published no vuln_funcs
 }
 
+// maxVulnFuncsPerItem caps the union of server-published vuln_funcs a
+// single work item forwards to the analyzer (M43 Phase D round 2 review).
+// Mirrors the server's serving-edge cap — maxVulnFuncsPerCVE = 200 in
+// sbomhub apps/api/internal/handler/reachability.go, keep the two values
+// in sync. A conforming server never exceeds it, so this only bites
+// against a drifted / hostile / non-conforming server shipping thousands
+// of well-formed selectors, which would otherwise inflate the AST symbol
+// walk and the merge itself. Elements past the cap are dropped,
+// preserving first-seen order (first wins).
+const maxVulnFuncsPerItem = 200
+
 // mergeVulnFuncs appends the server-published vuln_funcs in add onto dst,
 // dropping blank entries, malformed shapes (see
 // isWellFormedSymbolSelector), and exact duplicates while preserving
-// first-seen order. The surviving symbol strings are forwarded verbatim —
-// the server owns normalization ("Pkg.Func" / "Pkg.Type.Method", frozen
-// M43 contract) and the CLI never rewrites a value; it only drops shapes
-// the analyzer would reject outright. Returns nil when nothing survives,
-// so the result can be handed straight to
-// ReachabilityInput.VulnerableSymbols (len==0 → stage 1 only).
+// first-seen order, and capping the surviving union at
+// maxVulnFuncsPerItem (elements past the cap are dropped, first wins —
+// duplicates and malformed entries never consume cap budget). The
+// surviving symbol strings are forwarded verbatim — the server owns
+// normalization ("Pkg.Func" / "Pkg.Type.Method", frozen M43 contract) and
+// the CLI never rewrites a value; it only drops shapes the analyzer would
+// reject outright. The linear-scan dedupe is O(n²) in the survivor count,
+// which the cap bounds at n ≤ maxVulnFuncsPerItem (= 200) — fine as is,
+// no map needed. Returns nil when nothing survives, so the result can be
+// handed straight to ReachabilityInput.VulnerableSymbols (len==0 → stage
+// 1 only).
 func mergeVulnFuncs(dst, add []string) []string {
 	for _, s := range add {
+		if len(dst) >= maxVulnFuncsPerItem {
+			break
+		}
 		trimmed := strings.TrimSpace(s)
 		if trimmed == "" || !isWellFormedSymbolSelector(trimmed) {
 			continue
