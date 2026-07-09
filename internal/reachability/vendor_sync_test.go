@@ -3,8 +3,8 @@ package reachability
 // Divergence guard for the VENDORED analyzer sources (M43 Wave 4, F468,
 // issue #170).
 //
-// types.go and go_analyzer.go in this package are faithful copies of the
-// backend module's sbomhub/apps/api/internal/service/reachability/. The
+// types.go, go_analyzer.go and npm_analyzer.go in this package are faithful
+// copies of the backend module's sbomhub/apps/api/internal/service/reachability/. The
 // sync contract (see the header docstring in types.go) is: apart from the
 // header comment block, the file bodies are byte-identical. This test
 // enforces that contract so an edit applied to only one copy fails loudly
@@ -12,9 +12,10 @@ package reachability
 //
 // Scope notes:
 //
-//   - Only types.go and go_analyzer.go are compared. The _test.go files and
-//     testdata/ fixtures are intentionally divergent (the CLI uses stdlib
-//     testing, the backend uses its own suite) and are NOT covered.
+//   - Only the files listed in vendoredFiles (types.go, go_analyzer.go,
+//     npm_analyzer.go) are compared. The _test.go files and testdata/
+//     fixtures are intentionally divergent (the CLI uses stdlib testing,
+//     the backend uses its own suite) and are NOT covered.
 //   - "Header" is defined as: everything before the `package ` clause, plus
 //     any contiguous run of blank / line-comment (`//`) lines immediately
 //     after the package clause. That is exactly where the two copies are
@@ -38,7 +39,7 @@ import (
 
 // vendoredFiles lists the files under the sync contract. Keep in sync with
 // the vendoring note in types.go if more analyzer files are ever copied.
-var vendoredFiles = []string{"types.go", "go_analyzer.go"}
+var vendoredFiles = []string{"types.go", "go_analyzer.go", "npm_analyzer.go"}
 
 // stripVendorHeader returns the comparable body of a vendored source file:
 // the `package ` clause line plus everything from the first non-blank,
