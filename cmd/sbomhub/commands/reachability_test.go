@@ -696,6 +696,27 @@ func TestReachability_VulnFuncs_CappedPerWorkItem(t *testing.T) {
 	}
 }
 
+// TestMergeVulnFuncs_WhitespaceVariantDedupes pins the M43 Phase D R9
+// finding 3 fix: mergeVulnFuncs validates the TrimSpace'd selector but used
+// to append/dedupe the RAW string, so whitespace variants of the same
+// selector (" yaml.Unmarshal " vs "yaml.Unmarshal") slipped past dedupe,
+// consumed cap budget, and reached the analyzer un-trimmed. Both append and
+// dedupe must operate on the trimmed form.
+func TestMergeVulnFuncs_WhitespaceVariantDedupes(t *testing.T) {
+	got := mergeVulnFuncs(nil, []string{"yaml.Unmarshal", " yaml.Unmarshal "})
+	if len(got) != 1 || got[0] != "yaml.Unmarshal" {
+		t.Fatalf("mergeVulnFuncs = %#v, want exactly [yaml.Unmarshal] (whitespace variant must dedupe)", got)
+	}
+	// Across calls too (duplicate (component, cve) rows merge into the same
+	// dst): an untrimmed re-publication of an already-merged selector
+	// dedupes, and fresh selectors are stored trimmed.
+	got = mergeVulnFuncs(got, []string{"\tyaml.Unmarshal\n", "  yaml.Decoder.Decode  "})
+	want := []string{"yaml.Unmarshal", "yaml.Decoder.Decode"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mergeVulnFuncs = %#v, want %#v (trimmed append + trimmed dedupe)", got, want)
+	}
+}
+
 func keysOf(m map[string]json.RawMessage) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {

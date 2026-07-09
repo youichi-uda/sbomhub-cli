@@ -22,6 +22,17 @@ func TestGoModuleFromPurl(t *testing.T) {
 		{"non-golang-type", "pkg:npm/lodash@4.17.21", "", false},
 		{"empty", "", "", false},
 		{"garbage", "not-a-purl", "", false},
+		// M43 Phase D R9: rows mirrored from the server-side derivation
+		// table (apps/api/internal/handler/reachability_targets_test.go
+		// TestGoModuleFromPurl) — the two implementations must stay in
+		// lockstep or scoped vuln_funcs delivery silently degrades.
+		{"stdlib", "pkg:golang/stdlib@go1.22.4", "stdlib", true},
+		{"percent-encoded", "pkg:golang/github.com%2Fa%2Fb@v1.0.0", "github.com/a/b", true},
+		{"whitespace", "  pkg:golang/github.com/a/b@v1  ", "github.com/a/b", true},
+		{"type-case", "pkg:GOLANG/github.com/foo/bar@v1", "github.com/foo/bar", true},
+		{"bare-type-case", "Golang/x", "x", true},
+		{"path-case-preserved", "pkg:golang/github.com/Foo/Bar", "github.com/Foo/Bar", true},
+		{"scheme-exact", "PKG:golang/github.com/a/b", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

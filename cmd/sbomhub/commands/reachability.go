@@ -212,10 +212,14 @@ const maxVulnFuncsPerItem = 200
 // first-seen order, and capping the surviving union at
 // maxVulnFuncsPerItem (elements past the cap are dropped, first wins —
 // duplicates and malformed entries never consume cap budget). The
-// surviving symbol strings are forwarded verbatim — the server owns
-// normalization ("Pkg.Func" / "Pkg.Type.Method", frozen M43 contract) and
-// the CLI never rewrites a value; it only drops shapes the analyzer would
-// reject outright. The linear-scan dedupe is O(n²) in the survivor count,
+// surviving symbol strings are forwarded in their TrimSpace'd form and
+// otherwise verbatim — the server owns normalization ("Pkg.Func" /
+// "Pkg.Type.Method", frozen M43 contract) and the CLI never rewrites a
+// selector's content; it only drops shapes the analyzer would reject
+// outright. Append and dedupe both operate on the trimmed form so
+// whitespace variants of one selector cannot slip past dedupe and consume
+// cap budget (M43 Phase D R9 finding 3).
+// The linear-scan dedupe is O(n²) in the survivor count,
 // which the cap bounds at n ≤ maxVulnFuncsPerItem (= 200) — fine as is,
 // no map needed. Returns nil when nothing survives, so the result can be
 // handed straight to ReachabilityInput.VulnerableSymbols (len==0 → stage
@@ -231,13 +235,13 @@ func mergeVulnFuncs(dst, add []string) []string {
 		}
 		dup := false
 		for _, have := range dst {
-			if have == s {
+			if have == trimmed {
 				dup = true
 				break
 			}
 		}
 		if !dup {
-			dst = append(dst, s)
+			dst = append(dst, trimmed)
 		}
 	}
 	return dst

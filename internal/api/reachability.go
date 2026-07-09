@@ -245,16 +245,20 @@ func goModuleFromPurl(purl string) (string, bool) {
 	if s == "" {
 		return "", false
 	}
-	const prefix = "pkg:golang/"
-	// Some producers omit the pkg: scheme; tolerate a bare "golang/" too.
-	switch {
-	case strings.HasPrefix(s, prefix):
-		s = strings.TrimPrefix(s, prefix)
-	case strings.HasPrefix(s, "golang/"):
-		s = strings.TrimPrefix(s, "golang/")
-	default:
+	// The purl type is case-insensitive per the purl spec; the server-side
+	// derivation (sbomhub apps/api/internal/handler/reachability.go
+	// goModuleFromPurl, M43 Phase D R9) matches it with EqualFold — the
+	// two implementations MUST stay in lockstep or scoped vuln_funcs
+	// delivery and CLI module derivation diverge. The "pkg:" scheme stays
+	// exact-case (mirroring the server), the module path body keeps its
+	// case, and a bare "golang/..." form (producers omitting the scheme)
+	// is still tolerated.
+	rest := strings.TrimPrefix(s, "pkg:")
+	i := strings.IndexByte(rest, '/')
+	if i < 0 || !strings.EqualFold(rest[:i], "golang") {
 		return "", false
 	}
+	s = rest[i+1:]
 	// Strip version (@), qualifiers (?) and subpath (#) — the module path
 	// is everything before the first of these.
 	if i := strings.IndexAny(s, "@?#"); i >= 0 {
