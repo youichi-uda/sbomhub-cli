@@ -25,7 +25,16 @@ package commands
 //      elements past the cap are dropped first-wins, exactly 200 is
 //      untouched, and the cap holds across the union of duplicate
 //      (component, cve) rows — so a drift/hostile server publishing
-//      thousands of well-formed selectors cannot bloat the AST walk.
+//      thousands of well-formed selectors cannot bloat the AST walk,
+//   8. (M44 Wave 4, F472) npm targets — plain and "@scope/name" purls —
+//      dispatch to the NpmAnalyzer (go rows keep the GoAnalyzer, rows in
+//      ecosystems with no analyzer are skipped + counted), the default
+//      --ecosystem=all fetches unfiltered while explicit go/npm forwards
+//      the server-side filter, the vuln_funcs shape filter dispatches on
+//      the row's ecosystem (npm bare exports / "$" survive; lockstep with
+//      the server's isNpmVulnFuncSelector), and a symbol-carrying npm
+//      target reaches a symbol-level `reachable` verdict end-to-end
+//      through the REAL NpmAnalyzer on a real fixture tree.
 
 import (
 	"bytes"
@@ -36,6 +45,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -144,7 +155,7 @@ func TestReachability_HappyPath_UploadsFrozenContract(t *testing.T) {
 		projectID: reachTestProject,
 		ecosystem: "go",
 		path:      reachFixturePath,
-		analyzer:  &reachability.GoAnalyzer{},
+		analyzers: map[string]reachAnalyzer{"go": &reachability.GoAnalyzer{}},
 		stdout:    &stdout,
 		stderr:    &stderr,
 	})
@@ -256,7 +267,7 @@ func TestReachability_UploadError_Surfaces(t *testing.T) {
 		projectID: reachTestProject,
 		ecosystem: "go",
 		path:      reachFixturePath,
-		analyzer:  &reachability.GoAnalyzer{},
+		analyzers: map[string]reachAnalyzer{"go": &reachability.GoAnalyzer{}},
 		stdout:    &stdout,
 		stderr:    &stderr,
 	})
@@ -291,7 +302,7 @@ func TestReachability_EmptyPurl_Skipped(t *testing.T) {
 		projectID: reachTestProject,
 		ecosystem: "go",
 		path:      reachFixturePath,
-		analyzer:  &reachability.GoAnalyzer{},
+		analyzers: map[string]reachAnalyzer{"go": &reachability.GoAnalyzer{}},
 		stdout:    &stdout,
 		stderr:    &stderr,
 	})
@@ -330,7 +341,7 @@ func TestReachability_CVEScope(t *testing.T) {
 		ecosystem: "go",
 		cve:       "CVE-2024-0001",
 		path:      reachFixturePath,
-		analyzer:  &reachability.GoAnalyzer{},
+		analyzers: map[string]reachAnalyzer{"go": &reachability.GoAnalyzer{}},
 		stdout:    &stdout,
 		stderr:    &stderr,
 	})
@@ -351,19 +362,24 @@ func TestReachability_CVEScope(t *testing.T) {
 	}
 }
 
-// recordingAnalyzer wraps the REAL vendored analyzer (packages.Load
-// disabled — offline-safe, stage 1 only) and records every
-// ReachabilityInput it receives, so tests can assert exactly what the
-// command forwarded (M43: targets' vuln_funcs → VulnerableSymbols)
-// without mocking verdicts or the upload path.
+// recordingAnalyzer wraps a REAL vendored analyzer (source/AST stages
+// disabled in the default constructors — offline-safe, dependency-graph
+// stage only) and records every ReachabilityInput it receives, so tests
+// can assert exactly what the command forwarded (M43: targets' vuln_funcs
+// → VulnerableSymbols; M44: per-ecosystem dispatch) without mocking
+// verdicts or the upload path.
 type recordingAnalyzer struct {
 	mu     sync.Mutex
 	inputs []reachability.ReachabilityInput
-	real   reachability.GoAnalyzer
+	real   reachAnalyzer
 }
 
 func newRecordingAnalyzer() *recordingAnalyzer {
-	return &recordingAnalyzer{real: reachability.GoAnalyzer{SkipPackagesLoad: true}}
+	return &recordingAnalyzer{real: &reachability.GoAnalyzer{SkipPackagesLoad: true}}
+}
+
+func newRecordingNpmAnalyzer() *recordingAnalyzer {
+	return &recordingAnalyzer{real: &reachability.NpmAnalyzer{SkipSourceScan: true}}
 }
 
 func (ra *recordingAnalyzer) Analyze(ctx context.Context, projectPath string, input reachability.ReachabilityInput) (*reachability.ReachabilityResult, error) {
@@ -409,7 +425,7 @@ func TestReachability_VulnFuncs_ForwardedAndUnioned(t *testing.T) {
 		projectID: reachTestProject,
 		ecosystem: "go",
 		path:      reachFixturePath,
-		analyzer:  rec,
+		analyzers: map[string]reachAnalyzer{"go": rec},
 		stdout:    &stdout,
 		stderr:    &stderr,
 	})
@@ -489,7 +505,7 @@ func TestReachability_VulnFuncs_MalformedShapesDropped(t *testing.T) {
 		projectID: reachTestProject,
 		ecosystem: "go",
 		path:      reachFixturePath,
-		analyzer:  rec,
+		analyzers: map[string]reachAnalyzer{"go": rec},
 		stdout:    &stdout,
 		stderr:    &stderr,
 	})
@@ -534,14 +550,14 @@ func TestReachability_VulnFuncs_AllMalformed_NoAnalyzerError(t *testing.T) {
 	client := api.NewClient(rf.server.URL, "test-key")
 	// Real analyzer with the symbol walk ENABLED — this is the path the
 	// finding is about.
-	rec := &recordingAnalyzer{real: reachability.GoAnalyzer{}}
+	rec := &recordingAnalyzer{real: &reachability.GoAnalyzer{}}
 
 	var stdout, stderr bytes.Buffer
 	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
 		projectID: reachTestProject,
 		ecosystem: "go",
 		path:      reachFixturePath,
-		analyzer:  rec,
+		analyzers: map[string]reachAnalyzer{"go": rec},
 		stdout:    &stdout,
 		stderr:    &stderr,
 	})
@@ -633,7 +649,7 @@ func TestReachability_VulnFuncs_CappedPerWorkItem(t *testing.T) {
 		projectID: reachTestProject,
 		ecosystem: "go",
 		path:      reachFixturePath,
-		analyzer:  rec,
+		analyzers: map[string]reachAnalyzer{"go": rec},
 		stdout:    &stdout,
 		stderr:    &stderr,
 	})
@@ -703,17 +719,490 @@ func TestReachability_VulnFuncs_CappedPerWorkItem(t *testing.T) {
 // consumed cap budget, and reached the analyzer un-trimmed. Both append and
 // dedupe must operate on the trimmed form.
 func TestMergeVulnFuncs_WhitespaceVariantDedupes(t *testing.T) {
-	got := mergeVulnFuncs(nil, []string{"yaml.Unmarshal", " yaml.Unmarshal "})
+	got := mergeVulnFuncs(nil, []string{"yaml.Unmarshal", " yaml.Unmarshal "}, "go")
 	if len(got) != 1 || got[0] != "yaml.Unmarshal" {
 		t.Fatalf("mergeVulnFuncs = %#v, want exactly [yaml.Unmarshal] (whitespace variant must dedupe)", got)
 	}
 	// Across calls too (duplicate (component, cve) rows merge into the same
 	// dst): an untrimmed re-publication of an already-merged selector
 	// dedupes, and fresh selectors are stored trimmed.
-	got = mergeVulnFuncs(got, []string{"\tyaml.Unmarshal\n", "  yaml.Decoder.Decode  "})
+	got = mergeVulnFuncs(got, []string{"\tyaml.Unmarshal\n", "  yaml.Decoder.Decode  "}, "go")
 	want := []string{"yaml.Unmarshal", "yaml.Decoder.Decode"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mergeVulnFuncs = %#v, want %#v (trimmed append + trimmed dedupe)", got, want)
+	}
+}
+
+// writeNpmFixture writes a minimal npm project to a temp dir (the vendored
+// analyzer testdata under internal/reachability is reference-only for this
+// package): package.json + package-lock.json (v3) declaring evil-pkg and
+// @acme/scoped-lib, plus sources that import both — a CJS receiver binding
+// with an `evil.pwn(...)` member call, and an ESM named import of
+// `deepMerge` — so symbol-carrying targets can reach `reachable` and
+// symbol-less ones stop at `import_only`. withGoMod additionally writes
+// the reach_fixture go.mod (requiring example.test/vulnpkg) so one root
+// serves a mixed go+npm run.
+func writeNpmFixture(t *testing.T, withGoMod bool) string {
+	t.Helper()
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+	write("package.json", `{
+  "name": "reach-npm-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "evil-pkg": "^1.0.0",
+    "@acme/scoped-lib": "^1.2.0"
+  }
+}
+`)
+	write("package-lock.json", `{
+  "name": "reach-npm-fixture",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "reach-npm-fixture",
+      "version": "1.0.0",
+      "dependencies": {
+        "evil-pkg": "^1.0.0",
+        "@acme/scoped-lib": "^1.2.0"
+      }
+    },
+    "node_modules/evil-pkg": {
+      "version": "1.0.3",
+      "resolved": "https://registry.example.test/evil-pkg/-/evil-pkg-1.0.3.tgz"
+    },
+    "node_modules/@acme/scoped-lib": {
+      "version": "1.2.3",
+      "resolved": "https://registry.example.test/@acme/scoped-lib/-/scoped-lib-1.2.3.tgz"
+    }
+  }
+}
+`)
+	write("src/app.js", `'use strict';
+const evil = require('evil-pkg');
+module.exports = function run(a, b) {
+  return evil.pwn(a, b);
+};
+`)
+	write("src/scoped.mjs", `import { deepMerge } from '@acme/scoped-lib';
+export const combine = (a, b) => deepMerge(a, b);
+`)
+	if withGoMod {
+		write("go.mod", "module example.test/reachfixture\n\ngo 1.22\n\nrequire example.test/vulnpkg v1.0.0\n")
+		write("main.go", "package main\n\nfunc main() {}\n")
+	}
+	return dir
+}
+
+// TestReachability_NpmTargets_NotDropped — M44 Wave 4 (F472), red 1 in the
+// red→green record: with the pre-F472 code an npm target (plain AND scoped
+// purl) fell into droppedNoModule (no derivable Go module), so nothing was
+// analyzed or uploaded. Now both derive an npm package coordinate, reach
+// the REAL NpmAnalyzer, and upload verdicts. Also pins that an explicit
+// --ecosystem=npm forwards the server-side ?ecosystem= filter.
+func TestReachability_NpmTargets_NotDropped(t *testing.T) {
+	targets := []api.ReachabilityTarget{
+		{CVEID: "CVE-2024-1001", ComponentID: "n1", Purl: "pkg:npm/evil-pkg@1.0.0", Ecosystem: "npm"},
+		{CVEID: "CVE-2024-1002", ComponentID: "n2", Purl: "pkg:npm/%40acme%2Fscoped-lib@1.2.3", Ecosystem: "npm"},
+	}
+	rf := newReachFakeServer(t, targets)
+	client := api.NewClient(rf.server.URL, "test-key")
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "npm",
+		path:      writeNpmFixture(t, false),
+		analyzers: map[string]reachAnalyzer{"npm": &reachability.NpmAnalyzer{}},
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+	if rf.lastTargetsQ != "npm" {
+		t.Errorf("targets ?ecosystem = %q, want npm (explicit flag forwards the filter)", rf.lastTargetsQ)
+	}
+	if rf.uploadHits != 1 {
+		t.Fatalf("uploadHits = %d, want 1 (npm targets must be analyzed, not dropped; stderr=%s)", rf.uploadHits, stderr.String())
+	}
+	var envelope struct {
+		Results []api.ReachabilityUploadResult `json:"results"`
+	}
+	if err := json.Unmarshal(rf.lastPostBody, &envelope); err != nil {
+		t.Fatalf("decode POST body: %v", err)
+	}
+	if len(envelope.Results) != 2 {
+		t.Fatalf("results len = %d, want 2 (plain + scoped npm targets)", len(envelope.Results))
+	}
+	for _, r := range envelope.Results {
+		if r.AnalyzerVersion != "npm_analyzer/v1" {
+			t.Errorf("analyzer_version = %q, want npm_analyzer/v1 (npm target must reach the npm analyzer)", r.AnalyzerVersion)
+		}
+		if r.Ecosystem != "npm" {
+			t.Errorf("ecosystem = %q, want npm (verbatim forward)", r.Ecosystem)
+		}
+		// No symbols published → the analyzer stops at the import stage.
+		if r.Status != string(reachability.StatusImportOnly) {
+			t.Errorf("cve %s status = %q, want import_only (both packages are in the dependency graph)", r.CVEID, r.Status)
+		}
+	}
+}
+
+// TestReachability_MixedEcosystems_Dispatch — M44 Wave 4 (F472): the
+// default --ecosystem=all fetches the targets UNFILTERED (no ?ecosystem=,
+// the M32 wire behavior) and dispatches per row — go rows to the
+// GoAnalyzer, npm rows to the NpmAnalyzer, rows in ecosystems with no
+// analyzer skipped and counted on stderr. One POST carries every verdict.
+func TestReachability_MixedEcosystems_Dispatch(t *testing.T) {
+	targets := []api.ReachabilityTarget{
+		{CVEID: "CVE-2024-0001", ComponentID: "g1", Purl: "pkg:golang/example.test/vulnpkg@v1.0.0", Ecosystem: "go"},
+		{CVEID: "CVE-2024-0002", ComponentID: "g2", Purl: "pkg:golang/example.test/absent@v2.0.0", Ecosystem: "go"},
+		{CVEID: "CVE-2024-1001", ComponentID: "n1", Purl: "pkg:npm/evil-pkg@1.0.0", Ecosystem: "npm"},
+		{CVEID: "CVE-2024-1002", ComponentID: "n2", Purl: "pkg:npm/%40acme%2Fscoped-lib@1.2.3", Ecosystem: "npm"},
+		{CVEID: "CVE-2024-2001", ComponentID: "m1", Purl: "pkg:maven/org.acme/thing@1.0.0", Ecosystem: "maven"},
+	}
+	rf := newReachFakeServer(t, targets)
+	client := api.NewClient(rf.server.URL, "test-key")
+	goRec := newRecordingAnalyzer()
+	npmRec := newRecordingNpmAnalyzer()
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "all",
+		path:      writeNpmFixture(t, true),
+		analyzers: map[string]reachAnalyzer{"go": goRec, "npm": npmRec},
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	// --ecosystem=all must fetch WITHOUT the server-side filter.
+	if rf.lastTargetsQ != "" {
+		t.Errorf("targets ?ecosystem = %q, want \"\" (unfiltered fetch under --ecosystem=all)", rf.lastTargetsQ)
+	}
+
+	// go rows → GoAnalyzer, with the Go module coordinate and ecosystem.
+	if got := len(goRec.inputs); got != 2 {
+		t.Fatalf("GoAnalyzer invocations = %d, want 2", got)
+	}
+	for cve, wantModule := range map[string]string{
+		"CVE-2024-0001": "example.test/vulnpkg",
+		"CVE-2024-0002": "example.test/absent",
+	} {
+		in, ok := goRec.inputByCVE(cve)
+		if !ok {
+			t.Fatalf("no GoAnalyzer input recorded for %s", cve)
+		}
+		if in.Ecosystem != "go" || !reflect.DeepEqual(in.VulnerableModules, []string{wantModule}) {
+			t.Errorf("%s GoAnalyzer input = (eco=%q, modules=%v), want (go, [%s])", cve, in.Ecosystem, in.VulnerableModules, wantModule)
+		}
+	}
+
+	// npm rows → NpmAnalyzer, with the npm package name ("@scope/name"
+	// decoded from the purl) and ecosystem npm.
+	if got := len(npmRec.inputs); got != 2 {
+		t.Fatalf("NpmAnalyzer invocations = %d, want 2", got)
+	}
+	for cve, wantPkg := range map[string]string{
+		"CVE-2024-1001": "evil-pkg",
+		"CVE-2024-1002": "@acme/scoped-lib",
+	} {
+		in, ok := npmRec.inputByCVE(cve)
+		if !ok {
+			t.Fatalf("no NpmAnalyzer input recorded for %s", cve)
+		}
+		if in.Ecosystem != "npm" || !reflect.DeepEqual(in.VulnerableModules, []string{wantPkg}) {
+			t.Errorf("%s NpmAnalyzer input = (eco=%q, modules=%v), want (npm, [%s])", cve, in.Ecosystem, in.VulnerableModules, wantPkg)
+		}
+	}
+
+	// The maven row has no analyzer: skipped + counted, distinct from the
+	// no-module skip.
+	if !strings.Contains(stderr.String(), "skipped 1 targets in unsupported ecosystems") {
+		t.Errorf("stderr should report the unsupported-ecosystem skip: %s", stderr.String())
+	}
+
+	// One POST with all four verdicts; ecosystem forwarded per row.
+	if rf.uploadHits != 1 {
+		t.Fatalf("uploadHits = %d, want 1", rf.uploadHits)
+	}
+	var envelope struct {
+		Results []api.ReachabilityUploadResult `json:"results"`
+	}
+	if err := json.Unmarshal(rf.lastPostBody, &envelope); err != nil {
+		t.Fatalf("decode POST body: %v", err)
+	}
+	if len(envelope.Results) != 4 {
+		t.Fatalf("results len = %d, want 4 (2 go + 2 npm; maven skipped)", len(envelope.Results))
+	}
+	wantRows := map[string]struct{ eco, version, status string }{
+		"CVE-2024-0001": {"go", "go_analyzer/v1", string(reachability.StatusImportOnly)},
+		"CVE-2024-0002": {"go", "go_analyzer/v1", string(reachability.StatusNotPresent)},
+		"CVE-2024-1001": {"npm", "npm_analyzer/v1", string(reachability.StatusImportOnly)},
+		"CVE-2024-1002": {"npm", "npm_analyzer/v1", string(reachability.StatusImportOnly)},
+	}
+	for _, r := range envelope.Results {
+		want, ok := wantRows[r.CVEID]
+		if !ok {
+			t.Errorf("unexpected uploaded CVE %q", r.CVEID)
+			continue
+		}
+		if r.Ecosystem != want.eco || r.AnalyzerVersion != want.version || r.Status != want.status {
+			t.Errorf("cve %s uploaded (eco=%q, analyzer=%q, status=%q), want (%q, %q, %q)",
+				r.CVEID, r.Ecosystem, r.AnalyzerVersion, r.Status, want.eco, want.version, want.status)
+		}
+	}
+}
+
+// TestReachability_NpmVulnFuncs_BareSelectorsForwarded — M44 Wave 4
+// (F472), red 2 in the red→green record: an npm row's server-normalized
+// vuln_funcs use the npm shape — most often a BARE export name
+// ("defaultsDeep"), and "$" is a legal JS identifier rune — which the
+// Go-only shape filter dropped 100% of the time (pre-fix run: only
+// "_.merge" survived). The filter now dispatches on the work item's
+// ecosystem: the npm row keeps its npm-form selectors (while npm-malformed
+// junk still drops), and a go row in the same run keeps the Go rule — a
+// bare export never reaches the Go analyzer (mirrors the server's per-row
+// normalisation, TestReachabilityHandler_GetTargets_UnscopedUnionEcosystemNormalized).
+func TestReachability_NpmVulnFuncs_BareSelectorsForwarded(t *testing.T) {
+	oversized := strings.Repeat("a", maxNpmVulnFuncBytes+1)
+	targets := []api.ReachabilityTarget{
+		{CVEID: "CVE-2024-1001", ComponentID: "n1", Purl: "pkg:npm/evil-pkg@1.0.0", Ecosystem: "npm",
+			VulnFuncs: []string{"defaultsDeep", "$.ajax", "_.merge", "a.b.c.d", "1pkg.foo", "lib/lodash.js", "", "prototype pollution", oversized}},
+		{CVEID: "CVE-2024-0001", ComponentID: "g1", Purl: "pkg:golang/example.test/vulnpkg@v1.0.0", Ecosystem: "go",
+			VulnFuncs: []string{"defaultsDeep", "yaml.Unmarshal"}},
+	}
+	rf := newReachFakeServer(t, targets)
+	client := api.NewClient(rf.server.URL, "test-key")
+	goRec := newRecordingAnalyzer()
+	npmRec := newRecordingNpmAnalyzer()
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "all",
+		path:      writeNpmFixture(t, true),
+		analyzers: map[string]reachAnalyzer{"go": goRec, "npm": npmRec},
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+
+	npmIn, ok := npmRec.inputByCVE("CVE-2024-1001")
+	if !ok {
+		t.Fatal("no NpmAnalyzer input recorded for CVE-2024-1001 (npm target dropped?)")
+	}
+	wantNpm := []string{"defaultsDeep", "$.ajax", "_.merge"}
+	if !reflect.DeepEqual(npmIn.VulnerableSymbols, wantNpm) {
+		t.Errorf("npm VulnerableSymbols = %#v, want %#v (bare/dollar selectors survive, npm-malformed junk drops)", npmIn.VulnerableSymbols, wantNpm)
+	}
+
+	goIn, ok := goRec.inputByCVE("CVE-2024-0001")
+	if !ok {
+		t.Fatal("no GoAnalyzer input recorded for CVE-2024-0001")
+	}
+	wantGo := []string{"yaml.Unmarshal"}
+	if !reflect.DeepEqual(goIn.VulnerableSymbols, wantGo) {
+		t.Errorf("go VulnerableSymbols = %#v, want %#v (a bare npm export must NOT pass the Go rule)", goIn.VulnerableSymbols, wantGo)
+	}
+}
+
+// TestMergeVulnFuncs_NpmSelectorShapes pins the npm shape-acceptance rule
+// of the vuln_funcs filter (M44 Wave 4 / F472). LOCKSTEP: the accept/drop
+// verdicts mirror the acceptance subset of the server-side
+// TestNormalizeVulnFuncsNpm table
+// (sbomhub apps/api/internal/handler/reachability_targets_test.go, M44
+// Wave 3 / F471 — isNpmVulnFuncSelector). Two deliberate pipeline
+// differences from that table, both pre-existing CLI policy shared with
+// the Go arm: the CLI DROPS a trailing-"()" variant instead of stripping
+// it (the CLI never rewrites selector content; a conforming server never
+// ships "()"), and blank entries are dropped before the shape check.
+func TestMergeVulnFuncs_NpmSelectorShapes(t *testing.T) {
+	atCap := strings.Repeat("a", maxNpmVulnFuncBytes)
+	overCap := strings.Repeat("a", maxNpmVulnFuncBytes+1)
+	cases := []struct {
+		name string
+		in   string
+		keep bool
+	}{
+		{"bare export kept", "defaultsDeep", true},
+		{"underscore receiver kept", "_.merge", true},
+		{"dollar receiver kept", "$.ajax", true},
+		{"bare dollar kept", "$", true},
+		{"node module selector kept", "child_process.exec", true},
+		{"three parts kept", "a.b.c", true},
+		// Form-valid but semantically generic: FORM-ONLY check, the
+		// analyzer's binding-aware matching owns precision (server note).
+		{"generic property access kept (form-only)", "headers.location", true},
+		// Unicode letters are legal identifier runes in both grammars.
+		{"unicode selector kept", "パッケージ.解析", true},
+		// A Go-shaped selector is a valid JS shape too — harmless, the
+		// analyzer only matches symbols the package actually binds.
+		{"go-shaped selector kept", "Pkg.Type.Method", true},
+		{"exactly cap bytes kept", atCap, true},
+
+		{"trailing parens dropped (CLI never rewrites)", "defaultsDeep()", false},
+		{"url dropped", "https://evil", false},
+		{"path dropped", "lib/lodash.js", false},
+		{"bare version dropped", "1.2.3", false},
+		{"digit-led part dropped", "1pkg.foo", false},
+		{"four parts dropped", "a.b.c.d", false},
+		{"embedded space dropped", "prototype pollution", false},
+		{"leading empty part dropped", ".foo", false},
+		{"trailing empty part dropped", "foo.", false},
+		{"over cap bytes dropped", overCap, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeVulnFuncs(nil, []string{tc.in}, "npm")
+			if tc.keep {
+				if !reflect.DeepEqual(got, []string{tc.in}) {
+					t.Errorf("mergeVulnFuncs(nil, [%q], npm) = %#v, want [%q]", tc.in, got, tc.in)
+				}
+			} else if got != nil {
+				t.Errorf("mergeVulnFuncs(nil, [%q], npm) = %#v, want nil (shape must drop)", tc.in, got)
+			}
+		})
+	}
+}
+
+// TestReachability_NpmReachable_EndToEnd — M44 Wave 4 (F472): the full
+// path with a fake server and the REAL NpmAnalyzer (source scan ENABLED)
+// against a real npm fixture tree. Symbol-carrying npm targets reach
+// symbol-level `reachable` verdicts — via a receiver-binding member call
+// (`evil.pwn(...)`) for the plain package and a named ESM import binding
+// (`import { deepMerge }`) for the scoped one — and the verdicts land on
+// the frozen POST contract.
+func TestReachability_NpmReachable_EndToEnd(t *testing.T) {
+	targets := []api.ReachabilityTarget{
+		{CVEID: "CVE-2024-1001", ComponentID: "n1", Purl: "pkg:npm/evil-pkg@1.0.0", Ecosystem: "npm",
+			VulnFuncs: []string{"pwn"}},
+		{CVEID: "CVE-2024-1002", ComponentID: "n2", Purl: "pkg:npm/%40acme%2Fscoped-lib@1.2.3", Ecosystem: "npm",
+			VulnFuncs: []string{"deepMerge"}},
+	}
+	rf := newReachFakeServer(t, targets)
+	client := api.NewClient(rf.server.URL, "test-key")
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "npm",
+		path:      writeNpmFixture(t, false),
+		analyzers: map[string]reachAnalyzer{"npm": &reachability.NpmAnalyzer{}},
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+	if rf.uploadHits != 1 {
+		t.Fatalf("uploadHits = %d, want 1", rf.uploadHits)
+	}
+	var envelope struct {
+		Results []api.ReachabilityUploadResult `json:"results"`
+	}
+	if err := json.Unmarshal(rf.lastPostBody, &envelope); err != nil {
+		t.Fatalf("decode POST body: %v", err)
+	}
+	if len(envelope.Results) != 2 {
+		t.Fatalf("results len = %d, want 2", len(envelope.Results))
+	}
+	for _, r := range envelope.Results {
+		if r.Status != string(reachability.StatusReachable) {
+			t.Errorf("cve %s status = %q, want reachable", r.CVEID, r.Status)
+		}
+		if r.Confidence != 0.70 {
+			t.Errorf("cve %s confidence = %v, want 0.70 (single symbol hit)", r.CVEID, r.Confidence)
+		}
+		if r.AnalyzerVersion != "npm_analyzer/v1" {
+			t.Errorf("cve %s analyzer_version = %q, want npm_analyzer/v1", r.CVEID, r.AnalyzerVersion)
+		}
+		if r.Ecosystem != "npm" {
+			t.Errorf("cve %s ecosystem = %q, want npm", r.CVEID, r.Ecosystem)
+		}
+		if r.AnalyzedAt.IsZero() {
+			t.Errorf("cve %s analyzed_at is zero", r.CVEID)
+		}
+		if len(r.Evidence) == 0 {
+			t.Errorf("cve %s reachable verdict should carry evidence", r.CVEID)
+		}
+	}
+	// The symbol evidence names the matched selector.
+	byCVE := map[string]api.ReachabilityUploadResult{}
+	for _, r := range envelope.Results {
+		byCVE[r.CVEID] = r
+	}
+	if !strings.Contains(string(byCVE["CVE-2024-1001"].Evidence), "pwn") {
+		t.Errorf("CVE-2024-1001 evidence should reference symbol pwn: %s", byCVE["CVE-2024-1001"].Evidence)
+	}
+	if !strings.Contains(string(byCVE["CVE-2024-1002"].Evidence), "deepMerge") {
+		t.Errorf("CVE-2024-1002 evidence should reference symbol deepMerge: %s", byCVE["CVE-2024-1002"].Evidence)
+	}
+}
+
+// TestReachability_NpmVulnFuncsAbsent_ImportOnly — old-server / no-symbol
+// compat (the npm arm of the M43 graceful degrade): an npm target row
+// WITHOUT the vuln_funcs field (exactly what a server without symbol data
+// sends — hence the raw JSON body) forwards nil VulnerableSymbols, the
+// REAL NpmAnalyzer (source scan enabled) stops at the import stage, and
+// the verdict is the clean import_only 0.60 — not reachable, not the
+// degraded 0.50 path.
+func TestReachability_NpmVulnFuncsAbsent_ImportOnly(t *testing.T) {
+	rf := newReachFakeServer(t, nil)
+	rf.rawTargets = []byte(`{"targets":[
+		{"cve_id":"CVE-2024-1001","component_id":"n1","purl":"pkg:npm/evil-pkg@1.0.0","ecosystem":"npm"}
+	]}`)
+	client := api.NewClient(rf.server.URL, "test-key")
+	rec := &recordingAnalyzer{real: &reachability.NpmAnalyzer{}}
+
+	var stdout, stderr bytes.Buffer
+	err := runReachabilityAnalysis(context.Background(), client, reachOpts{
+		projectID: reachTestProject,
+		ecosystem: "npm",
+		path:      writeNpmFixture(t, false),
+		analyzers: map[string]reachAnalyzer{"npm": rec},
+		stdout:    &stdout,
+		stderr:    &stderr,
+	})
+	if err != nil {
+		t.Fatalf("runReachabilityAnalysis error: %v (stderr=%s)", err, stderr.String())
+	}
+	in, ok := rec.inputByCVE("CVE-2024-1001")
+	if !ok {
+		t.Fatal("no analyzer input recorded for CVE-2024-1001")
+	}
+	if in.VulnerableSymbols != nil {
+		t.Errorf("VulnerableSymbols = %#v, want nil when vuln_funcs is absent", in.VulnerableSymbols)
+	}
+	var envelope struct {
+		Results []api.ReachabilityUploadResult `json:"results"`
+	}
+	if err := json.Unmarshal(rf.lastPostBody, &envelope); err != nil {
+		t.Fatalf("decode POST body: %v", err)
+	}
+	if len(envelope.Results) != 1 {
+		t.Fatalf("results len = %d, want 1", len(envelope.Results))
+	}
+	if got := envelope.Results[0]; got.Status != string(reachability.StatusImportOnly) || got.Confidence != 0.60 {
+		t.Errorf("verdict = (%q, %v), want (import_only, 0.60) — symbol-less npm target must degrade gracefully", got.Status, got.Confidence)
 	}
 }
 

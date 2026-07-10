@@ -47,6 +47,58 @@ func TestGoModuleFromPurl(t *testing.T) {
 	}
 }
 
+// TestNpmPackageFromPurl pins the CLI-side purl → npm package name
+// derivation (M44 Wave 4 / F472). LOCKSTEP: this table is a replica of the
+// server-side TestNpmPackageFromPurl
+// (sbomhub apps/api/internal/handler/reachability_targets_test.go, M44
+// Wave 3 / F471) — the server scopes each target row's vuln_funcs to the
+// package its derivation yields, and the CLI matches the same purl against
+// the local dependency graph, so the two implementations must stay in
+// lockstep or scoped vuln_funcs delivery silently degrades.
+func TestNpmPackageFromPurl(t *testing.T) {
+	cases := []struct {
+		purl string
+		want string
+		ok   bool
+	}{
+		{"pkg:npm/lodash@4.17.21", "lodash", true},
+		// Scoped packages in every producer variant: fully encoded,
+		// Syft-style (only the "@" encoded), and literal "@".
+		{"pkg:npm/%40scope%2Fname@1.0.0", "@scope/name", true},
+		{"pkg:npm/%40scope/name@1.0.0", "@scope/name", true},
+		{"pkg:npm/@scope/name@1.0.0", "@scope/name", true},
+		{"pkg:npm/@scope/name", "@scope/name", true},
+		// Version absent / qualifiers / subpath cut points.
+		{"pkg:npm/lodash", "lodash", true},
+		{"pkg:npm/lodash?arch=amd64", "lodash", true},
+		{"pkg:npm/lodash#sub/dir", "lodash", true},
+		// Scheme-less producer tolerance (mirrors goModuleFromPurl).
+		{"npm/lodash@1.0.0", "lodash", true},
+		// The purl type is case-insensitive; the name keeps its case.
+		{"pkg:NPM/lodash@4.17.21", "lodash", true},
+		{"pkg:npm/jQuery@1.7.2", "jQuery", true},
+		// Surrounding whitespace tolerated.
+		{"  pkg:npm/lodash@4.17.21  ", "lodash", true},
+		// The "pkg:" scheme stays exact-case (EcosystemFromPurl rejects
+		// "PKG:" too, so such a row never reaches the scoped path).
+		{"PKG:npm/lodash@4.17.21", "", false},
+		// Not derivable: non-npm / malformed / empty — the caller skips
+		// the target (no package coordinate).
+		{"pkg:golang/github.com/a/b@v1.0.0", "", false},
+		{"pkg:npm/", "", false},
+		{"pkg:npm/@1.0.0", "", false},
+		{"lodash@4.17.21", "", false},
+		{"", "", false},
+		{"   ", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := npmPackageFromPurl(tc.purl)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("npmPackageFromPurl(%q) = (%q, %v), want (%q, %v)", tc.purl, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 // TestReachabilityTarget_VulnFuncsDecode pins the frozen M43 contract
 // (issue #168): the targets response field is named exactly "vuln_funcs"
 // and its entries decode verbatim into VulnFuncs.
@@ -116,23 +168,46 @@ func TestReachabilityTarget_VulnFuncsMissing_GracefulNil(t *testing.T) {
 	}
 }
 
+// TestReachabilityTarget_ModulePath pins the ecosystem dispatch (M44 Wave 4
+// / F472): "go" — and "", the pre-ecosystem default every M32-era row and
+// purl-less row carries — derive via goModuleFromPurl; "npm" derives via
+// npmPackageFromPurl; any other ecosystem yields ("", false) because no
+// analyzer consumes it yet.
 func TestReachabilityTarget_ModulePath(t *testing.T) {
-	// A pkg:golang purl yields the module path.
-	tgt := ReachabilityTarget{Purl: "pkg:golang/example.test/vulnpkg@v1.0.0"}
-	m, ok := tgt.ModulePath()
-	if m != "example.test/vulnpkg" || !ok {
-		t.Errorf("ModulePath = (%q, %v), want (example.test/vulnpkg, true)", m, ok)
-	}
+	cases := []struct {
+		name       string
+		tgt        ReachabilityTarget
+		wantModule string
+		wantOK     bool
+	}{
+		// Go rows (pre-M44 behavior, unchanged).
+		{"go-purl-no-ecosystem", ReachabilityTarget{Purl: "pkg:golang/example.test/vulnpkg@v1.0.0"}, "example.test/vulnpkg", true},
+		{"go-purl-go-ecosystem", ReachabilityTarget{Purl: "pkg:golang/example.test/vulnpkg@v1.0.0", Ecosystem: "go"}, "example.test/vulnpkg", true},
+		{"empty-purl", ReachabilityTarget{Purl: "", ComponentName: "foo"}, "", false},
+		// An npm purl WITHOUT the npm ecosystem token stays underivable —
+		// exactly the M32 behavior (ecosystem "" defaults to the Go arm).
+		{"npm-purl-no-ecosystem", ReachabilityTarget{Purl: "pkg:npm/lodash@4.17.21"}, "", false},
 
-	// Empty purl → no module (caller skips the target).
-	tgt = ReachabilityTarget{Purl: "", ComponentName: "foo"}
-	if m, ok := tgt.ModulePath(); ok || m != "" {
-		t.Errorf("ModulePath = (%q, %v), want (\"\", false) for empty purl", m, ok)
-	}
+		// npm rows (M44 Wave 4 / F472).
+		{"npm-plain", ReachabilityTarget{Purl: "pkg:npm/lodash@4.17.21", Ecosystem: "npm"}, "lodash", true},
+		{"npm-scoped-fully-encoded", ReachabilityTarget{Purl: "pkg:npm/%40scope%2Fname@1.0.0", Ecosystem: "npm"}, "@scope/name", true},
+		{"npm-scoped-syft-encoding", ReachabilityTarget{Purl: "pkg:npm/%40scope/name@1.0.0", Ecosystem: "npm"}, "@scope/name", true},
+		{"npm-scoped-literal-at", ReachabilityTarget{Purl: "pkg:npm/@scope/name@1.0.0", Ecosystem: "npm"}, "@scope/name", true},
+		{"npm-ecosystem-case-fold", ReachabilityTarget{Purl: "pkg:npm/lodash@4.17.21", Ecosystem: "NPM"}, "lodash", true},
+		{"npm-empty-purl", ReachabilityTarget{Purl: "", Ecosystem: "npm"}, "", false},
+		// Cross-wired rows (a conforming server never produces them).
+		{"npm-ecosystem-go-purl", ReachabilityTarget{Purl: "pkg:golang/example.test/vulnpkg@v1.0.0", Ecosystem: "npm"}, "", false},
+		{"go-ecosystem-npm-purl", ReachabilityTarget{Purl: "pkg:npm/lodash@4.17.21", Ecosystem: "go"}, "", false},
 
-	// Non-golang purl → no module.
-	tgt = ReachabilityTarget{Purl: "pkg:npm/lodash@4.17.21"}
-	if m, ok := tgt.ModulePath(); ok || m != "" {
-		t.Errorf("ModulePath = (%q, %v), want (\"\", false) for non-go purl", m, ok)
+		// Unsupported ecosystems: no analyzer, no coordinate.
+		{"maven", ReachabilityTarget{Purl: "pkg:maven/org.acme/thing@1.0.0", Ecosystem: "maven"}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, ok := tc.tgt.ModulePath()
+			if m != tc.wantModule || ok != tc.wantOK {
+				t.Errorf("ModulePath() = (%q, %v), want (%q, %v)", m, ok, tc.wantModule, tc.wantOK)
+			}
+		})
 	}
 }

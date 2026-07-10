@@ -183,8 +183,10 @@ type ReachabilityTarget struct {
 // GetReachabilityTargets returns the (cve, component) pairs the project's
 // SBOMs expose for reachability analysis. ecosystem, when non-empty, is
 // forwarded as ?ecosystem= so the server filters by derived ecosystem
-// (pass "go" — the analyzer is Go-only this milestone). Returns an empty
-// slice (not nil) when there are none. 404 (unknown project) / 403
+// ("go" or "npm" — M44); pass "" to fetch every ecosystem in one call
+// (the M32 no-filter behavior — the parameter has been an optional filter
+// since the endpoint was introduced) and dispatch client-side. Returns an
+// empty slice (not nil) when there are none. 404 (unknown project) / 403
 // (read-only key) surface as *ReachabilityError.
 func (c *Client) GetReachabilityTargets(ctx context.Context, projectID, ecosystem string) ([]ReachabilityTarget, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/projects/%s/reachability/targets", c.baseURL, projectID)
@@ -221,13 +223,33 @@ func (c *Client) GetReachabilityTargets(ctx context.Context, projectID, ecosyste
 	return out.Targets, nil
 }
 
-// ModulePath returns the Go module coordinate for this target's affected
-// component, derived from its purl (pkg:golang/<module>@<version> →
-// <module>), plus ok=true on success. Returns ("", false) when the target
-// has no purl or a non-golang purl — the caller skips such a target since
-// no module can be matched against the local go.mod.
+// ModulePath returns the package coordinate the analyzer should match for
+// this target's affected component, derived from its purl and dispatched
+// on the server-derived Ecosystem token (M44 Wave 4 / F472):
+//
+//   - "go" — and "", the token every purl-less row carries (kept on the Go
+//     arm so the pre-M44 behavior is bit-identical) — derives a Go module
+//     path (pkg:golang/<module>@<version> → <module>),
+//   - "npm" derives an npm package name (pkg:npm/<name>@<version> →
+//     <name>, "@scope/name" preserved); the token matches case-insensitively
+//     as defense-in-depth, though the server always lowercases it
+//     (repository.EcosystemFromPurl),
+//   - anything else returns ("", false) — no analyzer consumes it yet, so
+//     the caller skips the target and reports the count.
+//
+// ("", false) also comes back when the purl is empty or does not parse
+// under the ecosystem's derivation (including a cross-wired row whose purl
+// type contradicts its ecosystem token, which a conforming server never
+// produces).
 func (t ReachabilityTarget) ModulePath() (module string, ok bool) {
-	return goModuleFromPurl(t.Purl)
+	switch {
+	case t.Ecosystem == "" || strings.EqualFold(t.Ecosystem, "go"):
+		return goModuleFromPurl(t.Purl)
+	case strings.EqualFold(t.Ecosystem, "npm"):
+		return npmPackageFromPurl(t.Purl)
+	default:
+		return "", false
+	}
 }
 
 // goModuleFromPurl extracts the Go module path from a Package URL of the
@@ -270,6 +292,69 @@ func goModuleFromPurl(purl string) (string, bool) {
 	// purl path segments are percent-encoded; decode conservatively.
 	if decoded, err := url.PathUnescape(s); err == nil {
 		s = decoded
+	}
+	return s, true
+}
+
+// npmPackageFromPurl extracts the npm package name from a Package URL of
+// the form pkg:npm/<name>@<version> (M44 Wave 4 / F472), e.g.
+//
+//	pkg:npm/lodash@4.17.21              -> lodash
+//	pkg:npm/%40scope%2Fname@1.0.0       -> @scope/name
+//	pkg:npm/%40scope/name@1.0.0         -> @scope/name  (Syft encodes only the "@")
+//	pkg:npm/@scope/name@1.0.0           -> @scope/name  (literal-@ producer tolerance)
+//
+// MUST stay derivation-compatible with the server's npmPackageFromPurl
+// (sbomhub apps/api/internal/handler/reachability.go, M44 Wave 3 / F471):
+// the server scopes each target row's vuln_funcs to the package this
+// derivation yields, so a divergence would attach symbols to a package the
+// CLI resolves differently — silently emptying the per-target symbol scan.
+// Shared parsing premises (same as the goModuleFromPurl pair): the "pkg:"
+// scheme stays exact-case, the purl type segment "npm" matches
+// case-insensitively (purl spec), the decoded package name keeps its case
+// (npm names are matched verbatim / case-insensitively downstream).
+//
+// Returns ("", false) for empty input or a non-npm purl — the caller skips
+// such a target since no package can be matched against the local
+// dependency graph.
+func npmPackageFromPurl(purl string) (string, bool) {
+	s := strings.TrimSpace(purl)
+	if s == "" {
+		return "", false
+	}
+	rest := strings.TrimPrefix(s, "pkg:")
+	i := strings.IndexByte(rest, '/')
+	if i < 0 || !strings.EqualFold(rest[:i], "npm") {
+		return "", false
+	}
+	s = rest[i+1:]
+	// Strip qualifiers (?) and subpath (#) first, then the version. The
+	// version delimiter is the first '@' — except that a literal leading
+	// scope marker ("@scope/name@1.0.0", non-spec but common) must not be
+	// mistaken for it, so the search starts after position 0.
+	if i := strings.IndexAny(s, "?#"); i >= 0 {
+		s = s[:i]
+	}
+	verFrom := 0
+	if strings.HasPrefix(s, "@") {
+		verFrom = 1
+	}
+	if i := strings.IndexByte(s[verFrom:], '@'); i >= 0 {
+		s = s[:verFrom+i]
+	}
+	if s == "" {
+		return "", false
+	}
+	// purl path segments are percent-encoded; decode conservatively (this
+	// is what turns %40scope%2Fname into @scope/name).
+	if decoded, err := url.PathUnescape(s); err == nil {
+		s = decoded
+	}
+	// A scoped name must carry both the scope and the package part —
+	// "@scope/name". A lone "@..." without "/" is a malformed purl
+	// ("pkg:npm/@1.0.0"): no package can be resolved from it.
+	if strings.HasPrefix(s, "@") && !strings.Contains(s, "/") {
+		return "", false
 	}
 	return s, true
 }
