@@ -29,6 +29,8 @@ package reachability
 //     divergence guard.
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -171,5 +173,105 @@ func TestVendoredAnalyzerInSyncWithBackend(t *testing.T) {
 					name, line, cliPath, cl, backendPath, bl)
 			}
 		})
+	}
+}
+
+// --- SHA-256 pin check (C4a) -------------------------------------------
+//
+// Unlike TestVendoredAnalyzerInSyncWithBackend, the pin check needs no
+// sibling repo: it recomputes the normalised-body SHA-256 of the vendored
+// files in THIS package and compares against vendored.sha256. It therefore
+// also runs in the CLI's solo CI, giving tamper-evidence against "edited a
+// vendored file body without updating the pin". See vendored.sha256's header
+// for exactly what the pin does and does NOT prove about cross-repo equality.
+
+// vendoredBodyHash returns the hex SHA-256 of a vendored source file's
+// normalised body (stripVendorHeader), matching how vendored.sha256 is
+// generated.
+func vendoredBodyHash(src string) (string, error) {
+	body, err := stripVendorHeader(src)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(body))
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// parsePinFile parses vendored.sha256 into filename -> expected hex hash.
+// Blank lines and '#'-prefixed comment lines are ignored.
+func parsePinFile(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, line := range strings.Split(raw, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("malformed pin line %q: want '<sha256>  <filename>'", line)
+		}
+		out[fields[1]] = fields[0]
+	}
+	return out, nil
+}
+
+// TestVendoredAnalyzerMatchesPin fails if any vendored source file's
+// normalised-body SHA-256 has drifted from the pinned value in
+// vendored.sha256 — i.e. someone edited a vendored file without updating the
+// pin (or vice versa).
+func TestVendoredAnalyzerMatchesPin(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed; cannot locate the vendored sources")
+	}
+	dir := filepath.Dir(thisFile)
+
+	pinRaw, err := os.ReadFile(filepath.Join(dir, "vendored.sha256"))
+	if err != nil {
+		t.Fatalf("read pin file: %v", err)
+	}
+	pinned, err := parsePinFile(string(pinRaw))
+	if err != nil {
+		t.Fatalf("parse pin file: %v", err)
+	}
+
+	for _, name := range vendoredFiles {
+		want, present := pinned[name]
+		if !present {
+			t.Errorf("vendored.sha256 has no pin entry for %s", name)
+			continue
+		}
+		src, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Errorf("read %s: %v", name, err)
+			continue
+		}
+		got, err := vendoredBodyHash(string(src))
+		if err != nil {
+			t.Errorf("hash %s: %v", name, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("vendored %s normalised-body SHA-256 has drifted from the "+
+				"pin in vendored.sha256:\n  pinned: %s\n  actual: %s\n\n"+
+				"If you intentionally changed the analyzer: apply the SAME diff "+
+				"to BOTH repo copies, then update the '%s' line in vendored.sha256 "+
+				"in BOTH repos to the actual hash above. If you did NOT mean to "+
+				"change it, revert your edit.", name, want, got, name)
+		}
+	}
+
+	// A pin entry with no matching vendored file means the two lists drifted.
+	for name := range pinned {
+		found := false
+		for _, v := range vendoredFiles {
+			if v == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("vendored.sha256 pins unknown file %q not in vendoredFiles", name)
+		}
 	}
 }
