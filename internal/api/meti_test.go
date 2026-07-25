@@ -290,12 +290,12 @@ func TestGetAssessment_PermanentClientError(t *testing.T) {
 // 503 path would be caught here.
 func TestMetiError_Classification_F22(t *testing.T) {
 	cases := []struct {
-		name        string
-		code        int
-		message     string
-		wantPerm    bool
-		wantTrans   bool
-		wantProto   bool // ProtocolError flag (set by F23 helpers)
+		name      string
+		code      int
+		message   string
+		wantPerm  bool
+		wantTrans bool
+		wantProto bool // ProtocolError flag (set by F23 helpers)
 	}{
 		{"503 generic", 503, "Service Unavailable", false, true, false},
 		{"503 with byok-ish reason", 503, "BYOK key not configured", false, true, false},

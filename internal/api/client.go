@@ -175,7 +175,8 @@ func looksLikeUUID(s string) bool {
 				return false
 			}
 		default:
-			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+			if !isHex {
 				return false
 			}
 		}
@@ -509,7 +510,7 @@ type VulnerabilitySummary struct {
 //   - "completed": scan finished without errors; counts are authoritative
 //   - "failed":    scan errored; Error has details; counts may be partial
 //   - "unknown":   no tracker entry (server restart, very old sbom, …);
-//                  callers should keep polling until --wait-timeout
+//     callers should keep polling until --wait-timeout
 //
 // `sbomhub scan --fail-on <severity>` only enforces thresholds once
 // Status == "completed".

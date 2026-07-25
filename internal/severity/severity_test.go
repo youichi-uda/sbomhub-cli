@@ -4,18 +4,18 @@ import "testing"
 
 func TestParse(t *testing.T) {
 	cases := map[string]Level{
-		"":             LevelNone,
-		"   ":          LevelNone,
-		"unknown":      LevelNone,
-		"low":          LevelLow,
-		"LOW":          LevelLow,
-		"medium":       LevelMedium,
-		"high":         LevelHigh,
-		"HIGH":         LevelHigh,
-		"critical":     LevelCritical,
-		"Critical":     LevelCritical,
-		"kev":          LevelKEV,
-		"KEV":          LevelKEV,
+		"":         LevelNone,
+		"   ":      LevelNone,
+		"unknown":  LevelNone,
+		"low":      LevelLow,
+		"LOW":      LevelLow,
+		"medium":   LevelMedium,
+		"high":     LevelHigh,
+		"HIGH":     LevelHigh,
+		"critical": LevelCritical,
+		"Critical": LevelCritical,
+		"kev":      LevelKEV,
+		"KEV":      LevelKEV,
 	}
 	for in, want := range cases {
 		if got := Parse(in); got != want {

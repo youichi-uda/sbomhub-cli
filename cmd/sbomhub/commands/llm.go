@@ -890,7 +890,9 @@ func ensureCachedLLMBenchBinary(ctx context.Context, out *OutputConfig) (llmBenc
 		_ = os.RemoveAll(cacheDir)
 		return llmBenchCachedBinary{}, fmt.Errorf("llm-bench archive did not contain executable %s", llmBenchBinaryName(target.OS))
 	}
-	if err := os.WriteFile(checksumPath, []byte(wantChecksum+"\n"), 0o644); err != nil {
+	// 0600: the checksum marker is CLI-internal cache metadata that only
+	// this process ever reads back — no other consumer needs access.
+	if err := os.WriteFile(checksumPath, []byte(wantChecksum+"\n"), 0o600); err != nil {
 		return llmBenchCachedBinary{}, fmt.Errorf("llm-bench checksum marker write failed: %w", err)
 	}
 	return llmBenchCachedBinary{BinaryPath: binaryPath, WorkDir: cacheDir}, nil
@@ -1049,6 +1051,29 @@ func extractLLMBenchArchive(archiveBytes []byte, target llmBenchReleaseTarget, d
 	return extractLLMBenchTarGz(archiveBytes, destDir)
 }
 
+// llmBenchMaxExtractedBytes caps the total decompressed bytes written
+// while extracting an llm-bench release archive (decompression-bomb
+// guard, gosec G110). Real archives hold one tens-of-MB binary plus
+// small JSON fixtures; 2 GiB leaves generous headroom while keeping a
+// hostile archive from filling the disk.
+const llmBenchMaxExtractedBytes int64 = 2 << 30
+
+// copyExtractLimited copies src into dst while charging the bytes
+// against the shared per-archive budget tracked in *written. It fails
+// once the budget is exceeded instead of extracting unboundedly.
+func copyExtractLimited(dst io.Writer, src io.Reader, written *int64) error {
+	remaining := llmBenchMaxExtractedBytes - *written
+	if remaining < 0 {
+		remaining = 0
+	}
+	n, err := io.Copy(dst, io.LimitReader(src, remaining+1))
+	*written += n
+	if n > remaining {
+		return fmt.Errorf("llm-bench archive exceeds extraction limit (%d bytes)", llmBenchMaxExtractedBytes)
+	}
+	return err
+}
+
 func extractLLMBenchTarGz(archiveBytes []byte, destDir string) error {
 	gz, err := gzip.NewReader(bytes.NewReader(archiveBytes))
 	if err != nil {
@@ -1056,6 +1081,7 @@ func extractLLMBenchTarGz(archiveBytes []byte, destDir string) error {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	var written int64
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -1080,7 +1106,10 @@ func extractLLMBenchTarGz(archiveBytes []byte, destDir string) error {
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 				return err
 			}
-			mode := os.FileMode(header.Mode) & 0o777
+			// Mask in the int64 domain before converting: the result is
+			// always within 0..0o777, so the int64 -> FileMode (uint32)
+			// conversion cannot overflow (gosec G115).
+			mode := os.FileMode(header.Mode & 0o777)
 			if mode == 0 {
 				mode = 0o644
 			}
@@ -1088,7 +1117,7 @@ func extractLLMBenchTarGz(archiveBytes []byte, destDir string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(f, tr); err != nil {
+			if err := copyExtractLimited(f, tr, &written); err != nil {
 				_ = f.Close()
 				return err
 			}
@@ -1104,6 +1133,7 @@ func extractLLMBenchZip(archiveBytes []byte, destDir string) error {
 	if err != nil {
 		return fmt.Errorf("open zip: %w", err)
 	}
+	var written int64
 	for _, zf := range zr.File {
 		targetPath, err := safeArchivePath(destDir, zf.Name)
 		if err != nil {
@@ -1131,7 +1161,7 @@ func extractLLMBenchZip(archiveBytes []byte, destDir string) error {
 			_ = src.Close()
 			return err
 		}
-		if _, err := io.Copy(dst, src); err != nil {
+		if err := copyExtractLimited(dst, src, &written); err != nil {
 			_ = src.Close()
 			_ = dst.Close()
 			return err

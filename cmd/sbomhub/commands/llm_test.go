@@ -280,6 +280,27 @@ func TestLLMTest_NetworkError_Exit4(t *testing.T) {
 	}
 }
 
+// TestLLMTest_ProviderHintNotice — --provider is advisory only: it must
+// not change the health-check outcome, and the advisory notice must land
+// on stderr (never stdout, which carries the parseable result).
+func TestLLMTest_ProviderHintNotice(t *testing.T) {
+	tf := newLLMFakeServer(t)
+	tf.healthResp = func(r *http.Request) (int, interface{}, string) {
+		return http.StatusOK, map[string]string{"status": "ok", "mode": "byok"}, ""
+	}
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, stdout, stderr := runLLMTestAndCapture(t, client, tf.server.URL, llmTestArgs{provider: "openai"}, false)
+	if res.err != nil {
+		t.Fatalf("llm test with provider hint err: %v", res.err)
+	}
+	if !strings.Contains(stderr.String(), "--provider") {
+		t.Errorf("stderr = %q, want advisory --provider notice", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "--provider") {
+		t.Errorf("stdout = %q, advisory notice must stay on stderr", stdout.String())
+	}
+}
+
 // TestLLMHealthFailureToExitError_Classification_F21 — direct unit
 // test for the classifier so a refactor breaking the mapping is
 // caught without spinning up an httptest server per case.

@@ -383,7 +383,10 @@ func runScan(cmd *cobra.Command, args []string) error {
 
 	// ローカル保存
 	if scanOutput != "" {
-		if err := os.WriteFile(scanOutput, sbomData, 0644); err != nil {
+		// SBOM は下流ツール/チーム共有前提の非機密成果物なので、syft/trivy と
+		// 同じ 0644 慣行を維持する (umask で更に絞られる)。0600 に落とすと
+		// 別 uid の後続 CI step がファイルを読めなくなる。
+		if err := os.WriteFile(scanOutput, sbomData, 0644); err != nil { //nolint:gosec // G306: 上記コメント参照 (非機密の共有用成果物)
 			return fmt.Errorf("ファイルの保存に失敗しました: %w", err)
 		}
 		printSuccess("SBOMを保存しました: %s", scanOutput)

@@ -92,17 +92,17 @@ type ParsedDecision struct {
 // not currently surface them but they would round-trip cleanly into a
 // debug `--json` flag.
 type VEXDraft struct {
-	ID              string  `json:"id"`
-	ProjectID       string  `json:"project_id"`
-	ComponentID     string  `json:"component_id"`
-	VulnerabilityID string  `json:"vulnerability_id"`
-	CVEID           string  `json:"cve_id"`
-	State           string  `json:"state"`
-	Justification   string  `json:"justification"`
-	Detail          string  `json:"detail"`
+	ID              string   `json:"id"`
+	ProjectID       string   `json:"project_id"`
+	ComponentID     string   `json:"component_id"`
+	VulnerabilityID string   `json:"vulnerability_id"`
+	CVEID           string   `json:"cve_id"`
+	State           string   `json:"state"`
+	Justification   string   `json:"justification"`
+	Detail          string   `json:"detail"`
 	Confidence      *float64 `json:"confidence,omitempty"`
-	Provider        string  `json:"provider,omitempty"`
-	Model           string  `json:"model,omitempty"`
+	Provider        string   `json:"provider,omitempty"`
+	Model           string   `json:"model,omitempty"`
 	// Evidence here is the server-persisted JSONB array — same shape
 	// as ParsedDecision.Evidence but the field name in the DB row is
 	// `evidence` per repository.VEXDraft.

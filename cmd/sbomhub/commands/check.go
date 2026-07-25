@@ -51,7 +51,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	// ファイルかディレクトリかで処理を分岐
 	if info.IsDir() {
 		fmt.Printf("📦 スキャン中: %s\n", absPath)
-		
+
 		s, err := scanner.New("")
 		if err != nil {
 			return fmt.Errorf("スキャナーの初期化に失敗しました: %w", err)

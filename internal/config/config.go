@@ -80,7 +80,10 @@ func Save(cfg *Config, configDir string) error {
 
 	configPath := filepath.Join(configDir, "config.yaml")
 
-	data, err := yaml.Marshal(cfg)
+	// gosec G117 (secret-looking field の serialize): API key の永続化は
+	// `sbomhub login` の credential store としての Save の目的そのもの
+	// (~/.aws/credentials 等と同じ慣行)。dir 0700 + file 0600 で保護する。
+	data, err := yaml.Marshal(cfg) //nolint:gosec // G117: 上記コメント参照 (credential store が目的、0700/0600 で保護)
 	if err != nil {
 		return fmt.Errorf("設定のシリアライズに失敗しました: %w", err)
 	}

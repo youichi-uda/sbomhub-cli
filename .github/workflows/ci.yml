@@ -18,7 +18,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          # go.mod 追従 (backend の go-test.yml / golangci-lint.yml と同じ作法)。
+          # 旧 `go-version: '1.25'` ハードコードは go.mod bump で乖離するため廃止。
+          go-version-file: go.mod
 
       - name: Download dependencies
         run: go mod download
@@ -44,7 +46,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version-file: go.mod
 
       - name: Build
         run: go build -o sbomhub ./cmd/sbomhub
@@ -53,22 +55,38 @@ jobs:
         run: ./sbomhub version
         shell: bash
 
+  # M46 Track C-2: lint is a HARD GATE (continue-on-error removed).
+  #
+  # History: the job was continue-on-error with the note "golangci-lint
+  # doesn't support Go 1.25 yet". That note is obsolete for the v2 line —
+  # but still true for ALL official v1 binaries: the last v1 release
+  # (v1.64.8) is built with go1.24.1 and exits 3 on this repo's
+  # go.mod ("the Go language version (go1.24) used to build golangci-lint
+  # is lower than the targeted Go version (1.25)", measured 2026-07-25).
+  # So the gate runs golangci-lint v2 with the v2-format .golangci.yml.
+  #
+  # version is PINNED (not `latest`) for reproducibility: a floating
+  # `latest` can flip the gate red on unrelated PRs when a new golangci
+  # release adds/changes checks. Bump deliberately, together with any new
+  # findings it surfaces. v2.12.2 = latest stable at pin time and the
+  # exact binary the config was verified against (0 issues, 2026-07-25).
   lint:
     name: Lint
     runs-on: ubuntu-latest
-    continue-on-error: true  # golangci-lint doesn't support Go 1.25 yet
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version-file: go.mod
 
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        # action v9 line is required for golangci-lint v2 binaries
+        # (v6 predates the v2 CLI surface).
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.12.2
 
   # M4 Codex review #F66: production deployment release gate. Goes
   # alongside `test` / `build` / `lint` so the Dockerfile + Dockerfile.bench
@@ -564,7 +582,10 @@ jobs:
   docker-publish:
     name: Publish Docker images to GHCR
     runs-on: ubuntu-latest
-    needs: [test, build, docker-smoke]
+    # M46 Track C-2: lint joined the release gate once it became a hard
+    # gate (the old "excluded until golangci-lint supports Go 1.25"
+    # caveat is resolved by the pinned v2 toolchain in the lint job).
+    needs: [test, build, lint, docker-smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: read
@@ -618,15 +639,18 @@ jobs:
     runs-on: ubuntu-latest
     # M4 Codex review #F66: docker-smoke is a release gate so the
     # Dockerfile / Dockerfile.bench / bench wrapper exit-code contract
-    # is verified before any tag is published. lint stays excluded
-    # until golangci-lint supports Go 1.25.
+    # is verified before any tag is published.
+    #
+    # M46 Track C-2: lint added to the gate — it is now a hard gate on a
+    # pinned golangci-lint v2 (the old "excluded until golangci-lint
+    # supports Go 1.25" caveat no longer applies).
     #
     # M4 Codex review #F71: docker image publish (`docker-publish` job
     # above) runs in parallel with this job on the same gate — both
-    # need [test, build, docker-smoke] — so binary and Docker
+    # need [test, build, lint, docker-smoke] — so binary and Docker
     # distribution paths are independently recoverable on a failed
     # publish.
-    needs: [test, build, docker-smoke]
+    needs: [test, build, lint, docker-smoke]
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -639,7 +663,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25'
+          go-version-file: go.mod
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6

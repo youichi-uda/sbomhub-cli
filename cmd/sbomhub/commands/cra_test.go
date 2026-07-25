@@ -541,7 +541,7 @@ func TestCraList_HappyPath_F28(t *testing.T) {
 			}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runListAndCapture(t, client, listArgs{project: "p"})
+	res, stdout := runListAndCapture(t, client, listArgs{project: "p"})
 	if res.err != nil {
 		t.Fatalf("list err: %v", res.err)
 	}
@@ -578,7 +578,7 @@ func TestCraList_DeadlineAbsent_F426(t *testing.T) {
 			}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runListAndCapture(t, client, listArgs{project: "p"})
+	res, stdout := runListAndCapture(t, client, listArgs{project: "p"})
 	if res.err != nil {
 		t.Fatalf("list err: %v", res.err)
 	}
@@ -615,7 +615,7 @@ func TestCraList_Pagination_F26(t *testing.T) {
 			map[string]interface{}{"reports": rows}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runListAndCapture(t, client, listArgs{project: "p", limit: 5}) // limit just trims display
+	res, _ := runListAndCapture(t, client, listArgs{project: "p", limit: 5}) // limit just trims display
 	if res.err != nil {
 		t.Fatalf("list err: %v", res.err)
 	}
@@ -642,7 +642,7 @@ func TestCraList_FilterEncoding(t *testing.T) {
 			map[string]interface{}{"reports": []map[string]interface{}{}}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	_, _, _ = runListAndCapture(t, client, listArgs{
+	_, _ = runListAndCapture(t, client, listArgs{
 		project:    "p",
 		cveID:      "CVE-2024-1",
 		reportType: "early_warning",
@@ -673,7 +673,7 @@ func TestCraList_EmptyProject(t *testing.T) {
 			map[string]interface{}{"reports": []map[string]interface{}{}}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runListAndCapture(t, client, listArgs{project: "p"})
+	res, stdout := runListAndCapture(t, client, listArgs{project: "p"})
 	if res.err != nil {
 		t.Fatalf("list err: %v", res.err)
 	}
@@ -689,7 +689,7 @@ func TestCraList_PermanentExit3(t *testing.T) {
 		return http.StatusUnauthorized, nil, map[string]string{"error": "invalid api key"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runListAndCapture(t, client, listArgs{project: "p"})
+	res, _ := runListAndCapture(t, client, listArgs{project: "p"})
 	exitErr, ok := res.err.(*craExitError)
 	if !ok {
 		t.Fatalf("err = %v (%T), want *craExitError", res.err, res.err)
@@ -719,7 +719,7 @@ func TestCraApprove_HappyPath(t *testing.T) {
 		}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runApproveAndCapture(t, client, approveArgs{
+	res, stdout := runApproveAndCapture(t, client, approveArgs{
 		project:  "p",
 		reportID: fakeCraReportID(1),
 		note:     "looks good",
@@ -755,7 +755,7 @@ func TestCraApprove_ForbiddenPermanent(t *testing.T) {
 		return http.StatusForbidden, map[string]string{"error": "write permission required"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runApproveAndCapture(t, client, approveArgs{
+	res, _ := runApproveAndCapture(t, client, approveArgs{
 		project:  "p",
 		reportID: fakeCraReportID(1),
 	})
@@ -772,7 +772,7 @@ func TestCraApprove_ForbiddenPermanent(t *testing.T) {
 func TestCraApprove_MissingReportID(t *testing.T) {
 	tf := newCraFakeServer(t, nil)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runApproveAndCapture(t, client, approveArgs{project: "p"})
+	res, _ := runApproveAndCapture(t, client, approveArgs{project: "p"})
 	if res.err == nil {
 		t.Fatal("expected error for missing --report-id")
 	}
@@ -791,7 +791,7 @@ func TestCraApprove_MissingReportID(t *testing.T) {
 func TestCraSubmit_HappyPath(t *testing.T) {
 	tf := newCraFakeServer(t, nil)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runSubmitAndCapture(t, client, submitArgs{
+	res, stdout := runSubmitAndCapture(t, client, submitArgs{
 		project:         "00000000-0000-0000-0000-000000000aaa",
 		reportID:        fakeCraReportID(1),
 		authority:       "JPCERT/CC",
@@ -840,7 +840,7 @@ func TestCraSubmit_HappyPath(t *testing.T) {
 func TestCraSubmit_OmitSubmittedAt_BodyOmitsField(t *testing.T) {
 	tf := newCraFakeServer(t, nil)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runSubmitAndCapture(t, client, submitArgs{
+	res, _ := runSubmitAndCapture(t, client, submitArgs{
 		project:   "p",
 		reportID:  fakeCraReportID(1),
 		authority: "ENISA",
@@ -867,7 +867,7 @@ func TestCraSubmit_OmitSubmittedAt_BodyOmitsField(t *testing.T) {
 func TestCraSubmit_MissingAuthority(t *testing.T) {
 	tf := newCraFakeServer(t, nil)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runSubmitAndCapture(t, client, submitArgs{
+	res, _ := runSubmitAndCapture(t, client, submitArgs{
 		project:  "p",
 		reportID: fakeCraReportID(1),
 	})
@@ -883,7 +883,7 @@ func TestCraSubmit_MissingAuthority(t *testing.T) {
 func TestCraSubmit_MissingReportID(t *testing.T) {
 	tf := newCraFakeServer(t, nil)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runSubmitAndCapture(t, client, submitArgs{
+	res, _ := runSubmitAndCapture(t, client, submitArgs{
 		project:   "p",
 		authority: "JPCERT/CC",
 	})
@@ -920,7 +920,7 @@ func TestCraSubmit_ExitCodeClassification(t *testing.T) {
 				return tc.status, tc.body
 			}
 			client := api.NewClient(tf.server.URL, "test-key")
-			res, _, _ := runSubmitAndCapture(t, client, submitArgs{
+			res, _ := runSubmitAndCapture(t, client, submitArgs{
 				project:   "p",
 				reportID:  fakeCraReportID(1),
 				authority: "JPCERT/CC",
@@ -1123,12 +1123,12 @@ func runDraftAndCapture(t *testing.T, client *api.Client, args draftArgs) (captu
 	return capturedResult{err: renderErr}, &stdout, &stderr
 }
 
-func runListAndCapture(t *testing.T, client *api.Client, args listArgs) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+func runListAndCapture(t *testing.T, client *api.Client, args listArgs) (capturedResult, *bytes.Buffer) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
 	if strings.TrimSpace(args.project) == "" {
-		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout
 	}
 	ctx := context.Background()
 	reports, total, err := client.ListReports(ctx, args.project, api.CRAReportListFilter{
@@ -1139,7 +1139,7 @@ func runListAndCapture(t *testing.T, client *api.Client, args listArgs) (capture
 		Decision:   args.decision,
 	})
 	if err != nil {
-		return capturedResult{err: craFailureToExitError("cra list", err)}, &stdout, &stderr
+		return capturedResult{err: craFailureToExitError("cra list", err)}, &stdout
 	}
 	rendered := reports
 	if args.limit > 0 && len(rendered) > args.limit {
@@ -1150,7 +1150,7 @@ func runListAndCapture(t *testing.T, client *api.Client, args listArgs) (capture
 	if len(rendered) == 0 {
 		fmt.Fprintln(w, "CRA 報告書はありません。")
 		fmt.Fprintln(w, "No CRA reports.")
-		return capturedResult{err: nil}, &stdout, &stderr
+		return capturedResult{err: nil}, &stdout
 	}
 	fmt.Fprintln(w, "CRA Report 一覧")
 	fmt.Fprintln(w, "---------------")
@@ -1163,18 +1163,18 @@ func runListAndCapture(t *testing.T, client *api.Client, args listArgs) (capture
 			r.ID, r.CVEID, r.ReportType, r.Lang, orDash(r.State), decision, orDash(r.DeadlineStatus))
 	}
 	fmt.Fprintf(w, "\n表示: %d / 合計: %d\n", len(rendered), total)
-	return capturedResult{err: nil}, &stdout, &stderr
+	return capturedResult{err: nil}, &stdout
 }
 
-func runApproveAndCapture(t *testing.T, client *api.Client, args approveArgs) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+func runApproveAndCapture(t *testing.T, client *api.Client, args approveArgs) (capturedResult, *bytes.Buffer) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
 	if strings.TrimSpace(args.project) == "" {
-		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout
 	}
 	if strings.TrimSpace(args.reportID) == "" {
-		return capturedResult{err: fmt.Errorf("--report-id は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--report-id は必須")}, &stdout
 	}
 	ctx := context.Background()
 	fresh, err := client.DecideReport(ctx, args.project, args.reportID, api.CRADecisionRequest{
@@ -1182,29 +1182,29 @@ func runApproveAndCapture(t *testing.T, client *api.Client, args approveArgs) (c
 		DecisionNote: args.note,
 	})
 	if err != nil {
-		return capturedResult{err: craFailureToExitError("cra approve", err)}, &stdout, &stderr
+		return capturedResult{err: craFailureToExitError("cra approve", err)}, &stdout
 	}
 	fmt.Fprintf(out.Writer, "CRA report %s を承認しました\n", fresh.ID)
 	fmt.Fprintf(out.Writer, "  Decision: %s\n", fresh.Decision)
-	return capturedResult{err: nil}, &stdout, &stderr
+	return capturedResult{err: nil}, &stdout
 }
 
 // runSubmitAndCapture replays runCraSubmit's body against injected args
 // + a buffered OutputConfig, mirroring the runCraSubmit flow step-by-step
 // so a refactor of the command surfaces here. Keeps the same validate →
 // client call → render structure the production RunE uses.
-func runSubmitAndCapture(t *testing.T, client *api.Client, args submitArgs) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+func runSubmitAndCapture(t *testing.T, client *api.Client, args submitArgs) (capturedResult, *bytes.Buffer) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
 	if strings.TrimSpace(args.project) == "" {
-		return capturedResult{err: fmt.Errorf("--project は必須です / --project is required")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--project は必須です / --project is required")}, &stdout
 	}
 	if strings.TrimSpace(args.reportID) == "" {
-		return capturedResult{err: fmt.Errorf("--report-id は必須です / --report-id is required")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--report-id は必須です / --report-id is required")}, &stdout
 	}
 	if strings.TrimSpace(args.authority) == "" {
-		return capturedResult{err: fmt.Errorf("--authority は必須です / --authority is required")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--authority は必須です / --authority is required")}, &stdout
 	}
 	ctx := context.Background()
 	sub, err := client.RecordSubmission(ctx, args.project, args.reportID, api.CRASubmissionRequest{
@@ -1214,12 +1214,12 @@ func runSubmitAndCapture(t *testing.T, client *api.Client, args submitArgs) (cap
 		Notes:           args.notes,
 	})
 	if err != nil {
-		return capturedResult{err: craFailureToExitError("cra submit", err)}, &stdout, &stderr
+		return capturedResult{err: craFailureToExitError("cra submit", err)}, &stdout
 	}
 	fmt.Fprintf(out.Writer, "CRA report %s の当局提出を記録しました\n", sub.CRAReportID)
 	fmt.Fprintf(out.Writer, "  Authority     : %s\n", sub.Authority)
 	fmt.Fprintf(out.Writer, "  Submitted at  : %s\n", sub.SubmittedAt)
-	return capturedResult{err: nil}, &stdout, &stderr
+	return capturedResult{err: nil}, &stdout
 }
 
 // errAsCRA is a tiny errors.As shim that keeps the test scaffolding

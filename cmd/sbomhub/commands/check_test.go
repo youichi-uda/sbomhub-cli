@@ -26,9 +26,9 @@ func TestRunCheck_HonorsAPIURLFromEnv(t *testing.T) {
 	withCleanCredentialEnv(t)
 
 	var (
-		hit         bool
-		gotAuth     string
-		gotPath     string
+		hit     bool
+		gotAuth string
+		gotPath string
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hit = true

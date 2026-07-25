@@ -38,16 +38,16 @@ import (
 // behavior into the handler. We track per-endpoint hit counts so the
 // assertions can verify exactly how many round-trips occurred.
 type triageFakeServer struct {
-	t              *testing.T
-	server         *httptest.Server
-	vulns          []api.VulnerabilityRecord
-	runTriageResp  func(call int, body []byte) (status int, payload interface{})
-	decisionResp   func(call int, draftID string, body []byte) (status int, payload interface{})
-	vulnListHits   int32
-	triageRunHits  int32
-	decisionHits   int32
-	seenDecisions  []capturedDecision
-	mu             sync.Mutex
+	t             *testing.T
+	server        *httptest.Server
+	vulns         []api.VulnerabilityRecord
+	runTriageResp func(call int, body []byte) (status int, payload interface{})
+	decisionResp  func(call int, draftID string, body []byte) (status int, payload interface{})
+	vulnListHits  int32
+	triageRunHits int32
+	decisionHits  int32
+	seenDecisions []capturedDecision
+	mu            sync.Mutex
 }
 
 type capturedDecision struct {
@@ -162,9 +162,9 @@ func defaultRunResp(n int) map[string]interface{} {
 					"source":      "reachability",
 				},
 				{
-					"kind":     "advisory_excerpt",
+					"kind":        "advisory_excerpt",
 					"raw_snippet": "Affected: pkg/x.Vuln when called with attacker-controlled input",
-					"source":   "advisory_parser",
+					"source":      "advisory_parser",
 				},
 			},
 		},
@@ -173,7 +173,7 @@ func defaultRunResp(n int) map[string]interface{} {
 	}
 }
 
-func fakeCVE(n int) string  { return "CVE-2024-1000" + strings.Repeat("0", 0) + itoa(n) }
+func fakeCVE(n int) string { return "CVE-2024-1000" + strings.Repeat("0", 0) + itoa(n) }
 func fakeDraftID(n int) string {
 	return "11111111-1111-1111-1111-11111111000" + itoa(n)
 }

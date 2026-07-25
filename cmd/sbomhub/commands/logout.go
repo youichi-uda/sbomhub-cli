@@ -37,8 +37,11 @@ func runLogout(cmd *cobra.Command, args []string) error {
 	configPath := filepath.Join(configDir, "config.yaml")
 
 	if logoutAll {
-		// 設定ファイル全体を削除
-		if err := os.Remove(configPath); err != nil {
+		// 設定ファイル全体を削除。
+		// gosec G703 (env 由来 path の taint): HOME/USERPROFILE 配下の自前
+		// config 規約 path (login / config.Load と同一) を user 権限で消す
+		// だけで、権限境界を跨がない。CLI にとって自分の env は信頼済み入力。
+		if err := os.Remove(configPath); err != nil { //nolint:gosec // G703: 上記コメント参照 (自 env 由来の固定規約 path)
 			if os.IsNotExist(err) {
 				printInfo("設定ファイルが見つかりません: %s", configPath)
 				return nil

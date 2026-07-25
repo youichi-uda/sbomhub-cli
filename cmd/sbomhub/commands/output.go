@@ -9,10 +9,10 @@ import (
 
 // OutputConfig holds output configuration derived from global flags
 type OutputConfig struct {
-	Quiet   bool
-	Verbose bool
-	JSON    bool
-	Writer  io.Writer
+	Quiet     bool
+	Verbose   bool
+	JSON      bool
+	Writer    io.Writer
 	ErrWriter io.Writer
 }
 

@@ -30,12 +30,12 @@ func TestNewClient(t *testing.T) {
 
 // TestUploadSBOM exercises the new two-step upload contract introduced by
 // Trust Rescue 9.3.1 (#9):
-//   1. POST /api/v1/cli/projects with the project name → project ID (the
-//      `/cli/projects` endpoint still has get-or-create semantics and is
-//      kept for one release of overlap; it is NOT under the deprecation
-//      banner that /cli/upload carries).
-//   2. POST /api/v1/projects/{id}/sbom with the raw SBOM JSON body, gated
-//      by the unified MultiAuth Bearer auth on the server side.
+//  1. POST /api/v1/cli/projects with the project name → project ID (the
+//     `/cli/projects` endpoint still has get-or-create semantics and is
+//     kept for one release of overlap; it is NOT under the deprecation
+//     banner that /cli/upload carries).
+//  2. POST /api/v1/projects/{id}/sbom with the raw SBOM JSON body, gated
+//     by the unified MultiAuth Bearer auth on the server side.
 func TestUploadSBOM(t *testing.T) {
 	const projectID = "00000000-0000-0000-0000-000000000abc"
 	const sbomID = "00000000-0000-0000-0000-000000000def"
@@ -360,15 +360,15 @@ func TestUploadSBOMError(t *testing.T) {
 	const projectID = "00000000-0000-0000-0000-000000000abc"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/api/v1/cli/projects":
+		switch r.URL.Path {
+		case "/api/v1/cli/projects":
 			resp := CreateProjectResponse{
 				Project: &Project{ID: projectID, Name: "my-project"},
 				Created: false,
 			}
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(resp)
-		case r.URL.Path == "/api/v1/projects/"+projectID+"/sbom":
+		case "/api/v1/projects/" + projectID + "/sbom":
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error": "invalid api key"}`))
 		default:
@@ -745,9 +745,9 @@ func TestGetScanStatus_RateLimitedNoRetryAfter(t *testing.T) {
 //   - 401 Unauthorized: API key is wrong / missing
 //   - 403 Forbidden:    key valid but no access to this project / sbom
 //   - 404 Not Found:    older server without scan-status endpoint, or
-//                       the sbom ID was wrong (race against deletion)
+//     the sbom ID was wrong (race against deletion)
 //   - 400 Bad Request:  malformed path / sbom ID; same class of "this
-//                       will never succeed, stop retrying"
+//     will never succeed, stop retrying"
 func TestGetScanStatus_PermanentClientError(t *testing.T) {
 	cases := []struct {
 		name string

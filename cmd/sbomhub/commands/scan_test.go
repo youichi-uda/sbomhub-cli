@@ -1379,12 +1379,12 @@ func TestBuildScanJSONResult_Scenarios(t *testing.T) {
 		{
 			name: "critical detected + fail-on critical triggers exit 1",
 			in: scanFinalState{
-				componentCount: 100,
-				format:         "cyclonedx",
-				uploadResult:   &api.UploadResult{SBOMID: "s", ProjectID: "p"},
-				summary:        &api.VulnerabilitySummary{Critical: 3, High: 1, Total: 4},
-				waitForScan:    true,
-				failOnStr:      "critical",
+				componentCount:  100,
+				format:          "cyclonedx",
+				uploadResult:    &api.UploadResult{SBOMID: "s", ProjectID: "p"},
+				summary:         &api.VulnerabilitySummary{Critical: 3, High: 1, Total: 4},
+				waitForScan:     true,
+				failOnStr:       "critical",
 				failOnTriggered: true,
 				exitCode:        exitThresholdExceeded,
 			},

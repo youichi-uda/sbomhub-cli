@@ -34,13 +34,13 @@ import (
 // ---------------------------------------------------------------------------
 
 type metiFakeServer struct {
-	t                  *testing.T
-	server             *httptest.Server
-	listResp           func(call int, q map[string][]string) (status int, headers map[string]string, payload interface{})
-	refreshResp        func(call int, body []byte) (status int, payload interface{})
-	overrideResp       func(call int, criterion string, body []byte) (status int, payload interface{})
-	clearOverrideResp  func(call int, criterion string, body []byte) (status int, payload interface{})
-	improvementsResp   func(call int) (status int, headers map[string]string, payload interface{})
+	t                 *testing.T
+	server            *httptest.Server
+	listResp          func(call int, q map[string][]string) (status int, headers map[string]string, payload interface{})
+	refreshResp       func(call int, body []byte) (status int, payload interface{})
+	overrideResp      func(call int, criterion string, body []byte) (status int, payload interface{})
+	clearOverrideResp func(call int, criterion string, body []byte) (status int, payload interface{})
+	improvementsResp  func(call int) (status int, headers map[string]string, payload interface{})
 
 	listHits          int32
 	refreshHits       int32
@@ -247,7 +247,7 @@ func TestMetiList_HappyPath_F28(t *testing.T) {
 			}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p"})
+	res, stdout := runMetiListAndCapture(t, client, metiListArgs{project: "p"})
 	if res.err != nil {
 		t.Fatalf("list err: %v", res.err)
 	}
@@ -288,7 +288,7 @@ func TestMetiList_Pagination_F26(t *testing.T) {
 			map[string]interface{}{"assessments": rows}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p", limit: 5}) // limit just trims display
+	res, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p", limit: 5}) // limit just trims display
 	if res.err != nil {
 		t.Fatalf("list err: %v", res.err)
 	}
@@ -316,7 +316,7 @@ func TestMetiList_FilterEncoding(t *testing.T) {
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
 	hasOverride := true
-	_, _, _ = runMetiListAndCapture(t, client, metiListArgs{
+	_, _ = runMetiListAndCapture(t, client, metiListArgs{
 		project:     "p",
 		phase:       "env_setup",
 		status:      "achieved",
@@ -343,7 +343,7 @@ func TestMetiList_EmptyProject(t *testing.T) {
 			map[string]interface{}{"assessments": []map[string]interface{}{}}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p"})
+	res, stdout := runMetiListAndCapture(t, client, metiListArgs{project: "p"})
 	if res.err != nil {
 		t.Fatalf("list err: %v", res.err)
 	}
@@ -363,7 +363,7 @@ func TestMetiList_PermanentExit3(t *testing.T) {
 		return http.StatusUnauthorized, nil, map[string]string{"error": "invalid api key"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p"})
+	res, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p"})
 	exitErr, ok := res.err.(*metiExitError)
 	if !ok {
 		t.Fatalf("err = %v (%T), want *metiExitError", res.err, res.err)
@@ -381,7 +381,7 @@ func TestMetiList_TransientExit4_503Generic_F22(t *testing.T) {
 		return http.StatusServiceUnavailable, nil, map[string]string{"error": "Service Unavailable"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p"})
+	res, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p"})
 	exitErr, ok := res.err.(*metiExitError)
 	if !ok {
 		t.Fatalf("F22: err = %v (%T), want *metiExitError", res.err, res.err)
@@ -396,7 +396,7 @@ func TestMetiList_TransientExit4_503Generic_F22(t *testing.T) {
 func TestMetiList_InvalidPhase_Validation(t *testing.T) {
 	tf := newMetiFakeServer(t)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p", phase: "bogus"})
+	res, _ := runMetiListAndCapture(t, client, metiListArgs{project: "p", phase: "bogus"})
 	if res.err == nil {
 		t.Fatal("expected validation error for invalid --phase")
 	}
@@ -413,7 +413,7 @@ func TestMetiList_InvalidPhase_Validation(t *testing.T) {
 func TestMetiRefresh_HappyPath(t *testing.T) {
 	tf := newMetiFakeServer(t)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runMetiRefreshAndCapture(t, client, "p")
+	res, stdout := runMetiRefreshAndCapture(t, client, "p")
 	if res.err != nil {
 		t.Fatalf("refresh err: %v", res.err)
 	}
@@ -439,7 +439,7 @@ func TestMetiRefresh_ForbiddenPermanent(t *testing.T) {
 		return http.StatusForbidden, map[string]string{"error": "write permission required"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiRefreshAndCapture(t, client, "p")
+	res, _ := runMetiRefreshAndCapture(t, client, "p")
 	exitErr, ok := res.err.(*metiExitError)
 	if !ok {
 		t.Fatalf("err = %v (%T), want *metiExitError", res.err, res.err)
@@ -456,7 +456,7 @@ func TestMetiRefresh_TransientExit4_500(t *testing.T) {
 		return http.StatusInternalServerError, map[string]string{"error": "internal"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiRefreshAndCapture(t, client, "p")
+	res, _ := runMetiRefreshAndCapture(t, client, "p")
 	exitErr, ok := res.err.(*metiExitError)
 	if !ok {
 		t.Fatalf("err = %v (%T), want *metiExitError", res.err, res.err)
@@ -475,13 +475,28 @@ func TestMetiRefresh_ProtocolError_F23(t *testing.T) {
 		return http.StatusOK, map[string]interface{}{}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiRefreshAndCapture(t, client, "p")
+	res, _ := runMetiRefreshAndCapture(t, client, "p")
 	exitErr, ok := res.err.(*metiExitError)
 	if !ok {
 		t.Fatalf("F23: err = %v (%T), want *metiExitError", res.err, res.err)
 	}
 	if exitErr.ExitCode() != 4 {
 		t.Errorf("F23: ExitCode = %d, want 4 (protocol violation = transient)", exitErr.ExitCode())
+	}
+}
+
+// TestMetiRefresh_RequiresProject — empty --project must fail fast with
+// the validation error and never reach the refresh endpoint (mirrors
+// runMetiRefresh's validate-before-call ordering).
+func TestMetiRefresh_RequiresProject(t *testing.T) {
+	tf := newMetiFakeServer(t)
+	client := api.NewClient(tf.server.URL, "test-key")
+	res, _ := runMetiRefreshAndCapture(t, client, "")
+	if res.err == nil || !strings.Contains(res.err.Error(), "--project") {
+		t.Fatalf("expected --project validation error, got %v", res.err)
+	}
+	if got := atomic.LoadInt32(&tf.refreshHits); got != 0 {
+		t.Errorf("refreshHits = %d, want 0 (validation must fail before any API call)", got)
 	}
 }
 
@@ -493,11 +508,11 @@ func TestMetiRefresh_ProtocolError_F23(t *testing.T) {
 func TestMetiOverride_HappyPath(t *testing.T) {
 	tf := newMetiFakeServer(t)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runMetiOverrideAndCapture(t, client, metiOverrideArgs{
-		project:    "p",
-		criterion:  "env_setup.policy_documented",
-		status:     "achieved",
-		note:       "verified by Tanaka 2026-09-10",
+	res, stdout := runMetiOverrideAndCapture(t, client, metiOverrideArgs{
+		project:   "p",
+		criterion: "env_setup.policy_documented",
+		status:    "achieved",
+		note:      "verified by Tanaka 2026-09-10",
 	})
 	if res.err != nil {
 		t.Fatalf("override err: %v", res.err)
@@ -534,7 +549,7 @@ func TestMetiOverride_HappyPath(t *testing.T) {
 func TestMetiOverride_ImprovementAction_PointerSemantics(t *testing.T) {
 	tf := newMetiFakeServer(t)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiOverrideAndCapture(t, client, metiOverrideArgs{
+	res, _ := runMetiOverrideAndCapture(t, client, metiOverrideArgs{
 		project:           "p",
 		criterion:         "c1",
 		status:            "achieved",
@@ -565,7 +580,7 @@ func TestMetiOverride_409Permanent_F31(t *testing.T) {
 		}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiOverrideAndCapture(t, client, metiOverrideArgs{
+	res, _ := runMetiOverrideAndCapture(t, client, metiOverrideArgs{
 		project:   "p",
 		criterion: "c1",
 		status:    "achieved",
@@ -586,7 +601,7 @@ func TestMetiOverride_ForbiddenPermanent(t *testing.T) {
 		return http.StatusForbidden, map[string]string{"error": "write permission required"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiOverrideAndCapture(t, client, metiOverrideArgs{
+	res, _ := runMetiOverrideAndCapture(t, client, metiOverrideArgs{
 		project:   "p",
 		criterion: "c1",
 		status:    "achieved",
@@ -606,14 +621,14 @@ func TestMetiOverride_MissingFlags(t *testing.T) {
 	tf := newMetiFakeServer(t)
 	client := api.NewClient(tf.server.URL, "test-key")
 	cases := []metiOverrideArgs{
-		{project: "p"},                                              // no criterion / status
-		{project: "p", criterion: "c1"},                             // no status
-		{project: "p", criterion: "c1", status: "bogus"},            // bad status
-		{project: "p", criterion: "", status: "achieved"},           // empty criterion
+		{project: "p"},                                    // no criterion / status
+		{project: "p", criterion: "c1"},                   // no status
+		{project: "p", criterion: "c1", status: "bogus"},  // bad status
+		{project: "p", criterion: "", status: "achieved"}, // empty criterion
 	}
 	for i, args := range cases {
 		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
-			res, _, _ := runMetiOverrideAndCapture(t, client, args)
+			res, _ := runMetiOverrideAndCapture(t, client, args)
 			if res.err == nil {
 				t.Fatalf("expected error for args %+v", args)
 			}
@@ -742,22 +757,22 @@ func strPtr(s string) *string { return &s }
 // package globals between cases. The wrapper deliberately mirrors
 // runMetiList step-by-step so a refactor that splits runMetiList will
 // surface here.
-func runMetiListAndCapture(t *testing.T, client *api.Client, args metiListArgs) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+func runMetiListAndCapture(t *testing.T, client *api.Client, args metiListArgs) (capturedResult, *bytes.Buffer) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
 
 	if strings.TrimSpace(args.project) == "" {
-		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout
 	}
 	if args.phase != "" {
 		if err := validateMetiPhase(args.phase); err != nil {
-			return capturedResult{err: err}, &stdout, &stderr
+			return capturedResult{err: err}, &stdout
 		}
 	}
 	if args.status != "" {
 		if err := validateMetiStatus(args.status); err != nil {
-			return capturedResult{err: err}, &stdout, &stderr
+			return capturedResult{err: err}, &stdout
 		}
 	}
 
@@ -769,7 +784,7 @@ func runMetiListAndCapture(t *testing.T, client *api.Client, args metiListArgs) 
 	}
 	rows, total, err := client.GetAssessment(ctx, args.project, filter)
 	if err != nil {
-		return capturedResult{err: metiFailureToExitError("meti list", err)}, &stdout, &stderr
+		return capturedResult{err: metiFailureToExitError("meti list", err)}, &stdout
 	}
 	rendered := rows
 	if args.limit > 0 && len(rendered) > args.limit {
@@ -780,7 +795,7 @@ func runMetiListAndCapture(t *testing.T, client *api.Client, args metiListArgs) 
 	if len(rendered) == 0 {
 		fmt.Fprintln(w, "METI 自己評価行はありません。")
 		fmt.Fprintln(w, "  → `sbomhub meti refresh --project <id>` で evaluator を実行してください")
-		return capturedResult{err: nil}, &stdout, &stderr
+		return capturedResult{err: nil}, &stdout
 	}
 	fmt.Fprintln(w, "METI 自己評価 一覧")
 	fmt.Fprintln(w, "-------------------")
@@ -795,21 +810,21 @@ func runMetiListAndCapture(t *testing.T, client *api.Client, args metiListArgs) 
 			r.CriterionID, orDash(r.CriterionPhase), orDash(r.Status), effective, overrideMark)
 	}
 	fmt.Fprintf(w, "\n表示: %d / 合計: %d\n", len(rendered), total)
-	return capturedResult{err: nil}, &stdout, &stderr
+	return capturedResult{err: nil}, &stdout
 }
 
 // runMetiRefreshAndCapture mirrors runMetiRefresh step-by-step.
-func runMetiRefreshAndCapture(t *testing.T, client *api.Client, project string) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+func runMetiRefreshAndCapture(t *testing.T, client *api.Client, project string) (capturedResult, *bytes.Buffer) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
 	if strings.TrimSpace(project) == "" {
-		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout
 	}
 	ctx := context.Background()
 	res, err := client.RefreshAssessment(ctx, project)
 	if err != nil {
-		return capturedResult{err: metiFailureToExitError("meti refresh", err)}, &stdout, &stderr
+		return capturedResult{err: metiFailureToExitError("meti refresh", err)}, &stdout
 	}
 	fmt.Fprintf(out.Writer, "METI evaluator を再実行しました\n")
 	fmt.Fprintf(out.Writer, "  Refreshed: %d\n", res.Refreshed)
@@ -829,25 +844,25 @@ func runMetiRefreshAndCapture(t *testing.T, client *api.Client, project string) 
 			fmt.Fprintf(out.Writer, "  %s: %d\n", s, c)
 		}
 	}
-	return capturedResult{err: nil}, &stdout, &stderr
+	return capturedResult{err: nil}, &stdout
 }
 
 // runMetiOverrideAndCapture mirrors runMetiOverride step-by-step.
-func runMetiOverrideAndCapture(t *testing.T, client *api.Client, args metiOverrideArgs) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+func runMetiOverrideAndCapture(t *testing.T, client *api.Client, args metiOverrideArgs) (capturedResult, *bytes.Buffer) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
 	if strings.TrimSpace(args.project) == "" {
-		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout
 	}
 	if strings.TrimSpace(args.criterion) == "" {
-		return capturedResult{err: fmt.Errorf("--criterion は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--criterion は必須")}, &stdout
 	}
 	if strings.TrimSpace(args.status) == "" {
-		return capturedResult{err: fmt.Errorf("--status は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--status は必須")}, &stdout
 	}
 	if err := validateMetiStatus(args.status); err != nil {
-		return capturedResult{err: err}, &stdout, &stderr
+		return capturedResult{err: err}, &stdout
 	}
 	ctx := context.Background()
 	req := api.MetiOverrideRequest{
@@ -857,11 +872,11 @@ func runMetiOverrideAndCapture(t *testing.T, client *api.Client, args metiOverri
 	}
 	fresh, err := client.OverrideCriterion(ctx, args.project, args.criterion, req)
 	if err != nil {
-		return capturedResult{err: metiFailureToExitError("meti override", err)}, &stdout, &stderr
+		return capturedResult{err: metiFailureToExitError("meti override", err)}, &stdout
 	}
 	fmt.Fprintf(out.Writer, "METI criterion %s に上書きを適用しました\n", fresh.CriterionID)
 	fmt.Fprintf(out.Writer, "  Override status: %s\n", fresh.OverrideStatus)
-	return capturedResult{err: nil}, &stdout, &stderr
+	return capturedResult{err: nil}, &stdout
 }
 
 // ---------------------------------------------------------------------------
@@ -877,31 +892,31 @@ type metiClearOverrideArgs struct {
 // runMetiClearOverrideAndCapture mirrors runMetiClearOverride step-by-step.
 // Same pattern as runMetiOverrideAndCapture so the test does not have
 // to leak package globals between cases.
-func runMetiClearOverrideAndCapture(t *testing.T, client *api.Client, args metiClearOverrideArgs) (capturedResult, *bytes.Buffer, *bytes.Buffer) {
+func runMetiClearOverrideAndCapture(t *testing.T, client *api.Client, args metiClearOverrideArgs) (capturedResult, *bytes.Buffer) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
 	out := &OutputConfig{Writer: &stdout, ErrWriter: &stderr}
 	if strings.TrimSpace(args.project) == "" {
-		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--project は必須")}, &stdout
 	}
 	if strings.TrimSpace(args.criterion) == "" {
-		return capturedResult{err: fmt.Errorf("--criterion は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--criterion は必須")}, &stdout
 	}
 	cleanedNote := strings.TrimSpace(args.note)
 	if cleanedNote == "" {
-		return capturedResult{err: fmt.Errorf("--note は必須")}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--note は必須")}, &stdout
 	}
 	if len(cleanedNote) > metiClearOverrideNoteMaxLen {
-		return capturedResult{err: fmt.Errorf("--note は %d 文字以内", metiClearOverrideNoteMaxLen)}, &stdout, &stderr
+		return capturedResult{err: fmt.Errorf("--note は %d 文字以内", metiClearOverrideNoteMaxLen)}, &stdout
 	}
 	ctx := context.Background()
 	req := api.MetiClearOverrideRequest{Note: cleanedNote}
 	if err := client.ClearOverrideCriterion(ctx, args.project, args.criterion, req); err != nil {
-		return capturedResult{err: metiFailureToExitError("meti clear-override", err)}, &stdout, &stderr
+		return capturedResult{err: metiFailureToExitError("meti clear-override", err)}, &stdout
 	}
 	fmt.Fprintf(out.Writer, "METI criterion %s の上書きを取り消しました\n", args.criterion)
 	fmt.Fprintf(out.Writer, "  Cleared note: %s\n", cleanedNote)
-	return capturedResult{err: nil}, &stdout, &stderr
+	return capturedResult{err: nil}, &stdout
 }
 
 // TestMetiClearOverride_HappyPath_F36 — DELETE body shape + stdout
@@ -910,7 +925,7 @@ func runMetiClearOverrideAndCapture(t *testing.T, client *api.Client, args metiC
 func TestMetiClearOverride_HappyPath_F36(t *testing.T) {
 	tf := newMetiFakeServer(t)
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, stdout, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+	res, stdout := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
 		project:   "p",
 		criterion: "env_setup.policy_documented",
 		note:      "re-evaluated 2026-09-12: original override was a mis-read",
@@ -947,7 +962,7 @@ func TestMetiClearOverride_404Permanent_F36(t *testing.T) {
 		return http.StatusNotFound, map[string]string{"error": "meti assessment override not found"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+	res, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
 		project:   "p",
 		criterion: "c1",
 		note:      "trying to clear something that is not there",
@@ -971,7 +986,7 @@ func TestMetiClearOverride_400NoteRejected_F36(t *testing.T) {
 		return http.StatusBadRequest, map[string]string{"error": "override_note is required and must be 1-4096 characters"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+	res, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
 		project:   "p",
 		criterion: "c1",
 		note:      "non-empty so CLI-side validator lets it through",
@@ -992,17 +1007,17 @@ func TestMetiClearOverride_MissingFlags_F36(t *testing.T) {
 	tf := newMetiFakeServer(t)
 	client := api.NewClient(tf.server.URL, "test-key")
 	cases := []metiClearOverrideArgs{
-		{project: "p"},                                              // no criterion / note
-		{project: "p", criterion: "c1"},                             // no note
-		{project: "p", criterion: "c1", note: ""},                   // empty note
-		{project: "p", criterion: "c1", note: "   "},                // whitespace-only note
-		{project: "p", criterion: "", note: "ok"},                   // empty criterion
-		{project: "", criterion: "c1", note: "ok"},                  // empty project
+		{project: "p"},                               // no criterion / note
+		{project: "p", criterion: "c1"},              // no note
+		{project: "p", criterion: "c1", note: ""},    // empty note
+		{project: "p", criterion: "c1", note: "   "}, // whitespace-only note
+		{project: "p", criterion: "", note: "ok"},    // empty criterion
+		{project: "", criterion: "c1", note: "ok"},   // empty project
 		{project: "p", criterion: "c1", note: strings.Repeat("x", metiClearOverrideNoteMaxLen+1)}, // over cap
 	}
 	for i, args := range cases {
 		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
-			res, _, _ := runMetiClearOverrideAndCapture(t, client, args)
+			res, _ := runMetiClearOverrideAndCapture(t, client, args)
 			if res.err == nil {
 				t.Fatalf("F36: expected error for args %+v", args)
 			}
@@ -1021,7 +1036,7 @@ func TestMetiClearOverride_ForbiddenPermanent_F36(t *testing.T) {
 		return http.StatusForbidden, map[string]string{"error": "write permission required"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+	res, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
 		project:   "p",
 		criterion: "c1",
 		note:      "ok",
@@ -1043,7 +1058,7 @@ func TestMetiClearOverride_TransientExit4_500_F36(t *testing.T) {
 		return http.StatusInternalServerError, map[string]string{"error": "internal"}
 	}
 	client := api.NewClient(tf.server.URL, "test-key")
-	res, _, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
+	res, _ := runMetiClearOverrideAndCapture(t, client, metiClearOverrideArgs{
 		project:   "p",
 		criterion: "c1",
 		note:      "ok",

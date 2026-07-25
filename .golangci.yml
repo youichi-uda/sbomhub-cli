@@ -1,0 +1,97 @@
+# sbomhub-cli - golangci-lint configuration (v2 format)
+#
+# M46 Track C-2: lint hard gate for the CLI repo.
+#
+# Baseline is the backend linter set (sbomhub/apps/api/.golangci.yml),
+# adjusted for the CLI:
+#   - rowserrcheck / sqlclosecheck DROPPED: the CLI has no database/sql
+#     usage anywhere in the module, so both SQL-resource linters are
+#     guaranteed no-ops here. Re-add them if the CLI ever grows DB access.
+#   - gosimple no longer listed: merged into staticcheck in golangci v2.
+#   - gofmt / goimports moved to the v2 `formatters` section (same checks).
+#   - Everything else from the backend set is kept, including gosec and
+#     bodyclose (the CLI talks HTTP to the SBOMHub API, so bodyclose is
+#     load-bearing here).
+#
+# Config format is v2 because golangci-lint v1 is EOL and its last release
+# (v1.64.8, built with go1.24.1) hard-errors on this module's go.mod
+# ("the Go language version (go1.24) used to build golangci-lint is lower
+# than the targeted Go version (1.25)", exit 3, measured 2026-07-25).
+# CI pins golangci-lint v2.12.2 via golangci/golangci-lint-action
+# (.github/workflows/ci.yml `lint` job, hard gate — no continue-on-error).
+#
+# NOTE: `run.go` is intentionally NOT set — golangci-lint follows the
+# go.mod `go` directive automatically, same source of truth the CI
+# setup-go step uses via go-version-file. A hardcoded copy here is
+# exactly the kind of drift the old `go-version: '1.25'` CI pin had.
+
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - bodyclose      # http.Response.Body close 忘れ
+    - errcheck       # error 戻り値の無視検知
+    - gosec          # security issues
+    - govet          # go vet
+    - ineffassign    # 未使用 assign
+    - misspell       # spell check
+    - revive         # style (golint replacement)
+    - staticcheck    # 静的解析 (v2 では gosimple の S* checks も包含)
+    - unparam        # unused parameters
+    - unused         # 未使用 symbol
+  settings:
+    gosec:
+      excludes:
+        - G104  # error 無視 (errcheck で別に検知)
+        - G304  # file path inclusion (CLI はユーザー指定 path を開くのが仕事、false positive 多い)
+    revive:
+      rules:
+        - name: exported
+          arguments: ["disableStutteringCheck"]
+        - name: unused-parameter
+          disabled: true  # unparam で検知
+  exclusions:
+    generated: lax
+    # v1 の default exclude (EXC0001 等: fmt.Fprint* / Close の errcheck 緩和
+    # など) と同等の集合。backend が v1 default で運用してきた基準に合わせる。
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      # test ファイルの厳密性緩和 (backend と同一方針)
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - gosec
+    paths:
+      # SHA-pinned vendored files: この 3 file は backend
+      # (sbomhub/apps/api/internal/service/reachability/) と body byte 等価が
+      # internal/reachability/vendored.sha256 で pin されており、lint 起因の
+      # 編集は TestVendoredAnalyzerMatchesPin / cross-repo 等価 test を壊す。
+      # lint 品質は backend 側 (single source of truth) で担保し、こちらは
+      # 対象外とする。修正が必要な指摘は両 repo 同一 diff + pin 再生成で行う。
+      # (*_analyzer_test.go は pin 対象外なので通常どおり lint される)
+      - internal/reachability/types\.go$
+      - internal/reachability/go_analyzer\.go$
+      - internal/reachability/npm_analyzer\.go$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt          # gofmt 違反 (simplify 込み)
+    - goimports      # import 順序
+  exclusions:
+    generated: lax
+    paths:
+      # 上記と同じ vendored pin 3 file (gofmt の将来仕様変化で gate が
+      # 詰まないように formatter からも外す)
+      - internal/reachability/types\.go$
+      - internal/reachability/go_analyzer\.go$
+      - internal/reachability/npm_analyzer\.go$

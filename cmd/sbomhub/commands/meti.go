@@ -55,9 +55,9 @@ import (
 // Phase allow-list — mirrors handler.isValidPhase / migration 039
 // CHECK constraint on criterion_phase.
 const (
-	metiPhaseEnvSetup       = "env_setup"
-	metiPhaseSBOMCreation   = "sbom_creation"
-	metiPhaseSBOMOperation  = "sbom_operation"
+	metiPhaseEnvSetup      = "env_setup"
+	metiPhaseSBOMCreation  = "sbom_creation"
+	metiPhaseSBOMOperation = "sbom_operation"
 )
 
 // Status allow-list — mirrors criteria.Status* constants /
@@ -97,10 +97,10 @@ var (
 	metiListLimit       int
 
 	// override
-	metiOverrideCriterion        string
-	metiOverrideStatus           string
-	metiOverrideNote             string
-	metiOverrideImprovementAct   string
+	metiOverrideCriterion      string
+	metiOverrideStatus         string
+	metiOverrideNote           string
+	metiOverrideImprovementAct string
 
 	// clear-override (M3 Codex review #F36)
 	metiClearOverrideCriterion string
