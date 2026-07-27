@@ -14,10 +14,14 @@ package reachability
 
 import (
 	"context"
+	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -173,6 +177,119 @@ func TestLoadModuleGraph_ReadsRequireBlock(t *testing.T) {
 	if _, ok := graph["example.test/vulnpkg"]; !ok {
 		t.Errorf("graph missing example.test/vulnpkg: %#v", graph)
 	}
+}
+
+// TestLoadModuleGraph_ReadsConfined guards the go.mod twin of the npm
+// round-3 High finding (TestNpmDependencyGraph_ManifestReadsConfined):
+// stage 1 read go.mod with a bare os.ReadFile — following a symlinked
+// go.mod wherever it pointed (including OUT of the project root) with no
+// size bound. go.mod is now read through readManifestInRoot, the same
+// root-confined, symlink-refusing, size-capped read as the npm stage-1
+// files ("go.mod" is a pure basename, so the lstat refusal covers the
+// whole path within the root here too). A refused go.mod fails the
+// module-graph load, and Analyze downgrades to unknown (loud) rather than
+// producing a verdict from bytes the project directory does not actually
+// contain.
+func TestLoadModuleGraph_ReadsConfined(t *testing.T) {
+	t.Parallel()
+
+	input := ReachabilityInput{
+		Ecosystem:         "go",
+		VulnerableModules: []string{"example.test/vulnpkg"},
+	}
+	const goModBody = "module example.test/confined\n\nrequire example.test/vulnpkg v1.0.0\n"
+
+	t.Run("out-of-root go.mod symlink refused", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		outside := t.TempDir()
+		if err := os.WriteFile(filepath.Join(outside, "go.mod"), []byte(goModBody), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(outside, "go.mod"),
+			filepath.Join(root, "go.mod")); err != nil {
+			t.Skipf("cannot create symlinks on this platform: %v", err)
+		}
+
+		// No VulnerableSymbols → Analyze stops after stage 1 (no
+		// packages.Load), per this suite's offline convention.
+		res, err := (&GoAnalyzer{}).Analyze(context.Background(), root, input)
+		if err != nil {
+			t.Fatalf("Analyze returned error: %v", err)
+		}
+		if res.Status != StatusUnknown {
+			t.Errorf("Status = %q, want %q (out-of-root go.mod content must not enter the module graph)",
+				res.Status, StatusUnknown)
+		}
+		if !npmHasDescription(res, "module graph load failed") {
+			t.Errorf("expected a loud load failure, got %+v", res.Evidence)
+		}
+	})
+
+	t.Run("in-root go.mod symlink refused", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "real_go.mod"), []byte(goModBody), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("real_go.mod", filepath.Join(root, "go.mod")); err != nil {
+			t.Skipf("cannot create symlinks on this platform: %v", err)
+		}
+
+		res, err := (&GoAnalyzer{}).Analyze(context.Background(), root, input)
+		if err != nil {
+			t.Fatalf("Analyze returned error: %v", err)
+		}
+		if res.Status != StatusUnknown {
+			t.Errorf("Status = %q, want %q (symlinked go.mod is refused even when the target stays in-root)",
+				res.Status, StatusUnknown)
+		}
+		if !npmHasDescription(res, "module graph load failed") {
+			t.Errorf("expected a loud load failure, got %+v", res.Evidence)
+		}
+	})
+
+	t.Run("oversized go.mod refused at the cap", func(t *testing.T) {
+		t.Parallel()
+		root := t.TempDir()
+		// Sparse file over the cap: fast to create. Unlike the npm
+		// lockfile case, 64 MiB of NULs would not have parsed as a valid
+		// go.mod anyway, so the discriminating assertion is the error
+		// text: the read must be refused AT the cap, not performed
+		// unboundedly and then rejected by the parser.
+		f, err := os.Create(filepath.Join(root, "go.mod"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(npmMaxManifestSizeBytes + 1); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		_, gerr := loadModuleGraph(root)
+		if gerr == nil {
+			t.Fatal("expected an error for an oversized go.mod")
+		}
+		if !strings.Contains(gerr.Error(), "-byte cap") {
+			t.Errorf("error = %q, want the size-cap refusal, not a parse failure after an unbounded read", gerr)
+		}
+	})
+
+	// Contract pin, green before and after the confinement change: an
+	// absent go.mod must still surface as fs.ErrNotExist through the
+	// wrapped error, matching the npm stage-1 absent-file handling.
+	t.Run("absent go.mod still reports fs.ErrNotExist", func(t *testing.T) {
+		t.Parallel()
+		_, gerr := loadModuleGraph(t.TempDir())
+		if gerr == nil {
+			t.Fatal("expected an error for an absent go.mod")
+		}
+		if !errors.Is(gerr, fs.ErrNotExist) {
+			t.Errorf("error = %v, want errors.Is(err, fs.ErrNotExist) (absent-file detection must survive the read-path change)", gerr)
+		}
+	})
 }
 
 func TestMatchModules(t *testing.T) {
