@@ -1768,10 +1768,31 @@ func TestReadFileInRoot_SwapDetected(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// Pin the original inode with a second hard link BEFORE unlinking
+		// the walked path. Without it the filesystem is free to hand the
+		// very same (dev, inode) back to the replacement — GitHub's runner
+		// filesystem does exactly that — and os.SameFile then legitimately
+		// matches, so the subtest would be asserting more than
+		// readFileInRoot claims (identity reuse over time is listed as NOT
+		// detected). Holding a link keeps the inode allocated, which makes
+		// "the replacement is a different file object" true by
+		// construction and the assertion deterministic.
+		inodePin := filepath.Join(root, "src", "c.js.inode-pin")
+		if err := os.Link(target, inodePin); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Remove(inodePin) })
 		if err := os.Remove(target); err != nil {
 			t.Fatal(err)
 		}
 		npmWriteFile(t, root, "src/c.js", "REPLACEMENT")
+		replaced, err := os.Lstat(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(walkInfo, replaced) {
+			t.Fatal("fixture precondition: the replacement must not have inherited the original inode")
+		}
 
 		data, err := readFileInRoot(r, "src/c.js", walkInfo, npmMaxFileSizeBytes)
 		if err == nil {
