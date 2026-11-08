@@ -3,7 +3,7 @@
 [![日本語](https://img.shields.io/badge/lang-日本語-red.svg)](./README.md) [![English](https://img.shields.io/badge/lang-English-blue.svg)](./README_en.md)
 
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Go Version](https://img.shields.io/badge/go-1.22+-00ADD8)
+![Go Version](https://img.shields.io/badge/go-1.26+-00ADD8)
 
 SBOMHub CLI: a command-line tool that takes you from SBOM generation through upload — and, in upcoming releases, on to VEX export and CRA report drafting — in a single command, so you can meet the EU CRA 2026-09 deadline. Wraps SBOM generators (Syft, Trivy, cdxgen) and pairs with the self-host SBOMHub server.
 
@@ -158,7 +158,7 @@ SBOMHUB_BENCH_MODE=source sbomhub llm bench --sbomhub-source ../sbomhub
 - Binary mode needs HTTPS access to GitHub Releases
 - With `--bench-binary`, place `fixtures/llm-bench/cve-20-50.json`
   beside the binary or pass `--eval-set`
-- Source mode needs a Go toolchain (1.22+) and a local sbomhub OSS
+- Source mode needs a Go toolchain (1.26+) and a local sbomhub OSS
   checkout (`--sbomhub-source` / env `SBOMHUB_SOURCE` / default
   `./sbomhub`)
 - BYOK env vars exported for each provider under test (see the table)
@@ -291,7 +291,7 @@ contaminate the release pipeline's cache.
 | build | cold (estimate) | warm (estimate) | measured at |
 |-------|------------------|------------------|-------------|
 | `Dockerfile` (default, alpine slim) | ~30 s | ~10 s | CI `$GITHUB_STEP_SUMMARY` |
-| `Dockerfile.bench` (`golang:1.25-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
+| `Dockerfile.bench` (`golang:1.26.10-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
 
 Actual numbers are emitted into `Actions → CI → docker-smoke (Linux)
 → Summary` in seconds. The build flips from cold to warm once the

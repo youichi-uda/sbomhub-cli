@@ -96,7 +96,7 @@ jobs:
   # caught before a tag-driven release reaches operators.
   #
   # Steps:
-  #   1. Build the default (slim alpine) and bench (golang:1.25-alpine) images.
+  #   1. Build the default (slim alpine) and bench (golang:1.26.10-alpine) images.
   #   2. Spin up a tiny stdlib python http.server that mimics sbomhub's
   #      public /api/v1/health response ({"status":"ok","mode":"self-host"})
   #      and verify the default image's `llm test --json` exits 0 against it.
@@ -124,7 +124,7 @@ jobs:
   # target=/go/pkg/mod / /root/.cache/go-build` mounts (added in the
   # same patch) are layer-private cache volumes whose contents BuildKit
   # exports into the GHA cache when `mode=max` is set. Combined effect:
-  # the bench image's `golang:1.25-alpine` second-stage build drops
+  # the bench image's `golang:1.26.10-alpine` second-stage build drops
   # from ~3-5min cold to ~30-60s warm in steady state. Build times are
   # printed into `$GITHUB_STEP_SUMMARY` so the gain is visible without
   # log-diving. ※要確認: GHA cache scope name collides with the
@@ -180,7 +180,7 @@ jobs:
             --load \
             .
           ELAPSED=$(( $(date +%s) - START ))
-          echo "| bench (golang:1.25-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| bench (golang:1.26.10-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start mock /api/v1/health server (port 18080)
         run: |
@@ -390,7 +390,7 @@ jobs:
             --load \
             .
           ELAPSED=$(( $(date +%s) - START ))
-          echo "| bench (golang:1.25-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| bench (golang:1.26.10-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create user-defined bridge network for mock + CLI
         # See leading comment block: Colima makes `--network=host`
@@ -567,8 +567,8 @@ jobs:
   #
   # Multi-arch: both images are built for linux/amd64 + linux/arm64 via
   # docker buildx + QEMU emulation. The default `Dockerfile` (alpine
-  # base, `golang:1.22-alpine` build stage) and `Dockerfile.bench`
-  # (`golang:1.25-alpine`) both pull multi-arch base images from
+  # base, `golang:1.26.10-alpine` build stage) and `Dockerfile.bench`
+  # (`golang:1.26.10-alpine`) both pull multi-arch base images from
   # Docker Hub, so the cross-build is a straightforward QEMU `go build`
   # with no Dockerfile changes required.
   #

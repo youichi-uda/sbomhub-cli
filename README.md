@@ -3,7 +3,7 @@
 [![日本語](https://img.shields.io/badge/lang-日本語-red.svg)](./README.md) [![English](https://img.shields.io/badge/lang-English-blue.svg)](./README_en.md)
 
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Go Version](https://img.shields.io/badge/go-1.22+-00ADD8)
+![Go Version](https://img.shields.io/badge/go-1.26+-00ADD8)
 
 SBOMHub CLI: SBOM 生成からアップロード、 将来は CRA 提出向け VEX エクスポート / CRA レポート下書きまで、 1 コマンドで CRA 2026/9 期限対応を進めるためのコマンドラインツール。 Syft/Trivy/cdxgen 等の SBOM 生成ツールをラップし、 self-host 版 SBOMHub と組み合わせて利用する。
 
@@ -155,7 +155,7 @@ SBOMHUB_BENCH_MODE=source sbomhub llm bench --sbomhub-source ../sbomhub
 **前提**:
 - binary mode では GitHub Release へ HTTPS 接続できること
 - `--bench-binary` 指定時は手元の binary と同じ directory 配下に `fixtures/llm-bench/cve-20-50.json` があること、または `--eval-set` で明示すること
-- source mode では Go toolchain (1.22+) と sbomhub OSS source checkout があること (`--sbomhub-source` / 環境変数 `SBOMHUB_SOURCE` / 既定 `./sbomhub`)
+- source mode では Go toolchain (1.26+) と sbomhub OSS source checkout があること (`--sbomhub-source` / 環境変数 `SBOMHUB_SOURCE` / 既定 `./sbomhub`)
 - 比較したい provider の BYOK 環境変数が export 済 (下の表)
 
 **binary mode の version / cache**:
@@ -280,7 +280,7 @@ backend を使う。 cache scope は smoke job と release publish job
 | build | 実測予測 (cold) | 実測予測 (warm) | 計測場所 |
 |-------|-----------------|-----------------|----------|
 | `Dockerfile` (default, alpine slim) | ~30s | ~10s | CI `$GITHUB_STEP_SUMMARY` |
-| `Dockerfile.bench` (`golang:1.25-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
+| `Dockerfile.bench` (`golang:1.26.10-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
 
 実数は push ごとに `Actions → CI → docker-smoke (Linux) → Summary` に
 seconds 単位で出力される。 初回 push 後に cache が temper されると warm
