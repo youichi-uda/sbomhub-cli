@@ -158,9 +158,9 @@ SBOMHUB_BENCH_MODE=source sbomhub llm bench --sbomhub-source ../sbomhub
 - Binary mode needs HTTPS access to GitHub Releases
 - With `--bench-binary`, place `fixtures/llm-bench/cve-20-50.json`
   beside the binary or pass `--eval-set`
-- Source mode needs a Go toolchain (go1.26.10, or Go 1.26.1+ with the default
-  `GOTOOLCHAIN=auto` so it can fetch go1.26.10 — sbomhub OSS declares
-  `go 1.26.1` + `toolchain go1.26.10`) and a local sbomhub OSS
+- Source mode needs a Go toolchain (go1.27.3, or Go 1.26.1+ with the default
+  `GOTOOLCHAIN=auto` so it can fetch go1.27.3 — sbomhub OSS declares
+  `go 1.26.1` + `toolchain go1.27.3`) and a local sbomhub OSS
   checkout (`--sbomhub-source` / env `SBOMHUB_SOURCE` / default
   `./sbomhub`)
 - BYOK env vars exported for each provider under test (see the table)

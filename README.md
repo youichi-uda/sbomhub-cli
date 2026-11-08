@@ -155,7 +155,7 @@ SBOMHUB_BENCH_MODE=source sbomhub llm bench --sbomhub-source ../sbomhub
 **前提**:
 - binary mode では GitHub Release へ HTTPS 接続できること
 - `--bench-binary` 指定時は手元の binary と同じ directory 配下に `fixtures/llm-bench/cve-20-50.json` があること、または `--eval-set` で明示すること
-- source mode では Go toolchain (go1.26.10、または `GOTOOLCHAIN=auto` で自動取得できる Go 1.26.1+。sbomhub OSS は `go 1.26.1` + `toolchain go1.26.10`) と sbomhub OSS source checkout があること (`--sbomhub-source` / 環境変数 `SBOMHUB_SOURCE` / 既定 `./sbomhub`)
+- source mode では Go toolchain (go1.27.3、または `GOTOOLCHAIN=auto` で自動取得できる Go 1.26.1+。sbomhub OSS は `go 1.26.1` + `toolchain go1.27.3`) と sbomhub OSS source checkout があること (`--sbomhub-source` / 環境変数 `SBOMHUB_SOURCE` / 既定 `./sbomhub`)
 - 比較したい provider の BYOK 環境変数が export 済 (下の表)
 
 **binary mode の version / cache**:
