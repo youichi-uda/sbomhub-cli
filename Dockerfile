@@ -9,7 +9,9 @@
 # NOT auto-honoured inside the image — the base tag itself must carry the
 # patched toolchain. Keep this tag in lockstep with go.mod's `toolchain` line
 # (and Dockerfile.bench).
-FROM golang:1.26.10-alpine AS builder
+# 2026-11-08: bumped to golang:1.27.3-alpine with go.mod `toolchain go1.27.3`
+# (Go 1.27 migration; the `go 1.26.0` floor is unchanged).
+FROM golang:1.27.3-alpine AS builder
 
 WORKDIR /app
 

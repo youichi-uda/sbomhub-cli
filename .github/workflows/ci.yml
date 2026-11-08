@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           # go.mod 追従 (backend の go-test.yml / golangci-lint.yml と同じ作法)。
           # 旧 `go-version: '1.25'` ハードコードは go.mod bump で乖離するため廃止。
@@ -44,7 +44,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -70,6 +70,14 @@ jobs:
   # release adds/changes checks. Bump deliberately, together with any new
   # findings it surfaces. v2.12.2 = latest stable at pin time and the
   # exact binary the config was verified against (0 issues, 2026-07-25).
+  # 2026-11-08: bumped to v2.15.0 for the Go 1.27 migration — v2.12.2 is
+  # built with go1.26.4 and refuses the go1.27.3 toolchain ("the Go
+  # language version (go1.26) used to build golangci-lint is lower than
+  # the targeted Go version (1.27.3)"). v2.15.0 is built with go1.27.0;
+  # its one new finding (gosec G703 in llm.go) is suppressed with the
+  # rationale inline. 0 issues locally on 2026-11-08.
+  # setup-go moved v5 -> v7 at the same time: v6+ selects the go.mod
+  # `toolchain` line instead of only the `go` floor (v7 = ESM/node 24).
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -77,7 +85,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -86,7 +94,7 @@ jobs:
         # (v6 predates the v2 CLI surface).
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12.2
+          version: v2.15.0
 
   # M4 Codex review #F66: production deployment release gate. Goes
   # alongside `test` / `build` / `lint` so the Dockerfile + Dockerfile.bench
@@ -96,7 +104,7 @@ jobs:
   # caught before a tag-driven release reaches operators.
   #
   # Steps:
-  #   1. Build the default (slim alpine) and bench (golang:1.26.10-alpine) images.
+  #   1. Build the default (slim alpine) and bench (golang:1.27.3-alpine) images.
   #   2. Spin up a tiny stdlib python http.server that mimics sbomhub's
   #      public /api/v1/health response ({"status":"ok","mode":"self-host"})
   #      and verify the default image's `llm test --json` exits 0 against it.
@@ -124,7 +132,7 @@ jobs:
   # target=/go/pkg/mod / /root/.cache/go-build` mounts (added in the
   # same patch) are layer-private cache volumes whose contents BuildKit
   # exports into the GHA cache when `mode=max` is set. Combined effect:
-  # the bench image's `golang:1.26.10-alpine` second-stage build drops
+  # the bench image's `golang:1.27.3-alpine` second-stage build drops
   # from ~3-5min cold to ~30-60s warm in steady state. Build times are
   # printed into `$GITHUB_STEP_SUMMARY` so the gain is visible without
   # log-diving. ※要確認: GHA cache scope name collides with the
@@ -180,7 +188,7 @@ jobs:
             --load \
             .
           ELAPSED=$(( $(date +%s) - START ))
-          echo "| bench (golang:1.26.10-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| bench (golang:1.27.3-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Start mock /api/v1/health server (port 18080)
         run: |
@@ -390,7 +398,7 @@ jobs:
             --load \
             .
           ELAPSED=$(( $(date +%s) - START ))
-          echo "| bench (golang:1.26.10-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| bench (golang:1.27.3-alpine) | ${ELAPSED} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create user-defined bridge network for mock + CLI
         # See leading comment block: Colima makes `--network=host`
@@ -567,8 +575,8 @@ jobs:
   #
   # Multi-arch: both images are built for linux/amd64 + linux/arm64 via
   # docker buildx + QEMU emulation. The default `Dockerfile` (alpine
-  # base, `golang:1.26.10-alpine` build stage) and `Dockerfile.bench`
-  # (`golang:1.26.10-alpine`) both pull multi-arch base images from
+  # base, `golang:1.27.3-alpine` build stage) and `Dockerfile.bench`
+  # (`golang:1.27.3-alpine`) both pull multi-arch base images from
   # Docker Hub, so the cross-build is a straightforward QEMU `go build`
   # with no Dockerfile changes required.
   #
@@ -661,7 +669,7 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 

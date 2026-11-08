@@ -1438,7 +1438,10 @@ func resolveSbomhubSource(flagValue string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("--sbomhub-source の絶対パス解決に失敗: %w", err)
 	}
-	info, err := os.Stat(abs)
+	// G703: the path is the operator's own --sbomhub-source / SBOMHUB_SOURCE
+	// choice (a local checkout they ask us to build), stat'ed with the
+	// operator's own privileges; there is no trust boundary to traverse.
+	info, err := os.Stat(abs) //nolint:gosec // G703: operator-chosen source root (上記コメント参照)
 	if err != nil {
 		return "", fmt.Errorf("sbomhub source ディレクトリが見つかりません (%s): %w\n"+
 			"  --sbomhub-source <path> / 環境変数 SBOMHUB_SOURCE / カレントの ./sbomhub のいずれかで sbomhub OSS source を指定してください\n"+

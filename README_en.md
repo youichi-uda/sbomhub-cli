@@ -293,7 +293,7 @@ contaminate the release pipeline's cache.
 | build | cold (estimate) | warm (estimate) | measured at |
 |-------|------------------|------------------|-------------|
 | `Dockerfile` (default, alpine slim) | ~30 s | ~10 s | CI `$GITHUB_STEP_SUMMARY` |
-| `Dockerfile.bench` (`golang:1.26.10-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
+| `Dockerfile.bench` (`golang:1.27.3-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
 
 Actual numbers are emitted into `Actions → CI → docker-smoke (Linux)
 → Summary` in seconds. The build flips from cold to warm once the

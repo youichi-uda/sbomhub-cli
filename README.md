@@ -280,7 +280,7 @@ backend を使う。 cache scope は smoke job と release publish job
 | build | 実測予測 (cold) | 実測予測 (warm) | 計測場所 |
 |-------|-----------------|-----------------|----------|
 | `Dockerfile` (default, alpine slim) | ~30s | ~10s | CI `$GITHUB_STEP_SUMMARY` |
-| `Dockerfile.bench` (`golang:1.26.10-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
+| `Dockerfile.bench` (`golang:1.27.3-alpine`) | 3-5 min | 30-60 s | CI `$GITHUB_STEP_SUMMARY` |
 
 実数は push ごとに `Actions → CI → docker-smoke (Linux) → Summary` に
 seconds 単位で出力される。 初回 push 後に cache が temper されると warm
