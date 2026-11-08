@@ -17,13 +17,16 @@
 # (v1.64.8, built with go1.24.1) hard-errors on this module's go.mod
 # ("the Go language version (go1.24) used to build golangci-lint is lower
 # than the targeted Go version (1.25)", exit 3, measured 2026-07-25).
-# CI pins golangci-lint v2.12.2 via golangci/golangci-lint-action
-# (.github/workflows/ci.yml `lint` job, hard gate — no continue-on-error).
+# CI pins golangci-lint v2.15.0 (built with go1.27.0) via
+# golangci/golangci-lint-action (.github/workflows/ci.yml `lint` job, hard
+# gate — no continue-on-error). Older v2 binaries built with go1.26 refuse
+# the go1.27.3 toolchain, so reproduce CI with v2.15.0 or newer.
 #
-# NOTE: `run.go` is intentionally NOT set — golangci-lint follows the
-# go.mod `go` directive automatically, same source of truth the CI
-# setup-go step uses via go-version-file. A hardcoded copy here is
-# exactly the kind of drift the old `go-version: '1.25'` CI pin had.
+# NOTE: `run.go` is intentionally NOT set — golangci-lint derives its
+# target from go.mod automatically. CI's setup-go (v7, go-version-file)
+# installs the go.mod `toolchain` line (go1.27.3) when present, falling
+# back to the `go` directive. A hardcoded copy here is exactly the kind of
+# drift the old `go-version: '1.25'` CI pin had.
 
 version: "2"
 
