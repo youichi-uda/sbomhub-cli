@@ -132,7 +132,7 @@ jobs:
   # target=/go/pkg/mod / /root/.cache/go-build` mounts (added in the
   # same patch) are layer-private cache volumes whose contents BuildKit
   # exports into the GHA cache when `mode=max` is set. Combined effect:
-  # the bench image's `golang:1.27.3-alpine` second-stage build drops
+  # the bench image's single-stage `golang:1.27.3-alpine` build (Go is kept in the final image for source-mode `llm bench`) drops
   # from ~3-5min cold to ~30-60s warm in steady state. Build times are
   # printed into `$GITHUB_STEP_SUMMARY` so the gain is visible without
   # log-diving. ※要確認: GHA cache scope name collides with the
