@@ -1,8 +1,15 @@
 # SBOMHub CLI - Linux build and test
 # M32: builder bumped 1.22 -> 1.25-alpine to satisfy go.mod `go 1.25.0`
 # (raised by the vendored reachability analyzer's golang.org/x/tools v0.47.0
-# minimum, which requires go >= 1.25). Matches Dockerfile.bench + CI go 1.25.
-FROM golang:1.25-alpine AS builder
+# minimum, which requires go >= 1.25).
+# 2026-11: bumped 1.25 -> 1.26.10-alpine. golang.org/x/tools v0.52.0 /
+# golang.org/x/mod v0.42.0 raise go.mod to `go 1.26.0`, and go.mod now pins
+# `toolchain go1.26.10` (17 reachable stdlib vulns in go1.26.4 fixed there).
+# Official golang images set GOTOOLCHAIN=local, so the toolchain directive is
+# NOT auto-honoured inside the image — the base tag itself must carry the
+# patched toolchain. Keep this tag in lockstep with go.mod's `toolchain` line
+# (and Dockerfile.bench).
+FROM golang:1.26.10-alpine AS builder
 
 WORKDIR /app
 

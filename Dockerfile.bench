@@ -31,7 +31,13 @@
 # on first run, which is worse than baking 1.25 in. ※要確認: when
 # sbomhub apps/api's go.mod is bumped again (1.26, 1.27, ...) this
 # base tag must move in lockstep.
-FROM golang:1.25-alpine
+#
+# 2026-11: bumped to golang:1.26.10-alpine — sbomhub apps/api is now
+# `go 1.26.0`, and this CLI's go.mod is `go 1.26.0` + `toolchain
+# go1.26.10`. Pinned to the exact patch so the in-image toolchain carries
+# the stdlib security fixes (GOTOOLCHAIN=local ignores the toolchain
+# directive). Keep in lockstep with go.mod's `toolchain` line and Dockerfile.
+FROM golang:1.26.10-alpine
 
 WORKDIR /app
 
@@ -48,12 +54,13 @@ RUN apk add --no-cache git ca-certificates
 # `.github/workflows/ci.yml` docker-smoke job) reuses the previously
 # downloaded module set + the build artefact cache instead of pulling
 # every transitive dep + recompiling the standard library on every
-# push. The mount targets match `golang:1.25-alpine`'s defaults:
+# push. The mount targets match `golang:1.26.10-alpine`'s defaults:
 #
 #   GOMODCACHE = /go/pkg/mod
 #   GOCACHE    = /root/.cache/go-build
 #
-# Confirmed via `docker run --rm golang:1.25-alpine go env`. These
+# Confirmed via `docker run --rm golang:1.25-alpine go env`, re-verified
+# identical on `golang:1.26.10-alpine` (2026-11-08). These
 # are layer-private cache volumes (BuildKit `RUN --mount=type=cache`),
 # NOT image layers — so the resulting `sbomhub-cli:ci-bench` /
 # `:bench` image stays the same size as before, only build time
