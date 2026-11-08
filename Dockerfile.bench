@@ -33,7 +33,7 @@
 # base tag must move in lockstep.
 #
 # 2026-11: bumped to golang:1.26.10-alpine — sbomhub apps/api is now
-# `go 1.26.0`, and this CLI's go.mod is `go 1.26.0` + `toolchain
+# `go 1.26.1`, and this CLI's go.mod is `go 1.26.0` + `toolchain
 # go1.26.10`. Pinned to the exact patch so the in-image toolchain carries
 # the stdlib security fixes (GOTOOLCHAIN=local ignores the toolchain
 # directive). Keep in lockstep with go.mod's `toolchain` line and Dockerfile.
