@@ -277,7 +277,7 @@ func formatSkippedSourcesWarning(skipped []string, failOnEvaluated bool) string 
 	}
 	msg := fmt.Sprintf("⚠️  サーバ側スキャンは次の脆弱性データソースを照会していません: %s (サーバ運用者の設定による除外。 例: SBOMHUB_JVN=off)。 これらのソースでの新規検出・再確認は行われておらず、 結果は不完全な可能性があります。", names)
 	if failOnEvaluated {
-		msg += " --fail-on はこれらのソースを除いた結果で評価されています。"
+		msg += " --fail-on はサーバが返した counts で評価されています (除外ソースの過去の検出は再確認されないまま含まれる場合があります)。"
 	}
 	return msg + "\n"
 }
@@ -328,6 +328,10 @@ func formatScanFailedDetail(errMsg string, reasons []string) string {
 	}
 	return detail
 }
+
+// newScanner is scanner.New; tests replace it with a fake so the
+// run-level tests do not need syft/trivy/cdxgen installed.
+var newScanner = scanner.New
 
 var (
 	scanProject      string
@@ -456,7 +460,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	scanPrintln()
 
 	// スキャナーの選択
-	s, err := scanner.New(scanTool)
+	s, err := newScanner(scanTool)
 	if err != nil {
 		return fmt.Errorf("スキャナーの初期化に失敗しました: %w", err)
 	}

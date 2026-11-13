@@ -103,8 +103,9 @@ Exit codes: 0 success / 1 `--fail-on` threshold exceeded / 2 wait timeout or ser
 **Sources not consulted (`skipped_sources`)**: JPCERT/CC has suspended MyJVN since 2026-10-22, so a server operator
 may set `SBOMHUB_JVN=off` (sbomhub `docs/UPGRADE.md` §26). The CLI then shows `未照会ソース: jvn` in the result box,
 prints a stderr warning that results may be incomplete, and adds `skipped_sources` to `--json`. Skipping is the
-operator's choice, not a failure: `scan_status` stays `completed`, and exit codes and `--fail-on` are unchanged
-(`--fail-on` is evaluated on the results without the skipped sources). With JVN unreachable and `SBOMHUB_JVN=on`,
+operator's choice and does not by itself fail the scan (`scan_status` is `completed` when the remaining sources succeed);
+exit codes and `--fail-on` are unchanged (`--fail-on` uses the counts the server returns, which may still include
+older findings from the skipped source that were not re-checked). With JVN unreachable and `SBOMHUB_JVN=on`,
 the scan is `failed` (`reasons` include `source_unavailable`; exit 2 with `--fail-on`, otherwise a warning and exit 0) and the error/warning message points at `SBOMHUB_JVN=off`.
 Older servers that send neither `skipped_sources` nor `reasons` produce the same output as before.
 

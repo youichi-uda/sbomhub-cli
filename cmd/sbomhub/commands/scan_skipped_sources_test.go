@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"reflect"
 	"sort"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
+	"github.com/youichi-uda/sbomhub-cli/internal/scanner"
 )
 
 // Tests for the additive scan-status fields `skipped_sources` and
@@ -216,7 +216,13 @@ func TestFormatSkippedSourcesWarning(t *testing.T) {
 		t.Errorf("warning without --fail-on mentions it: %q", got)
 	}
 	if got := formatSkippedSourcesWarning([]string{"jvn"}, true); !strings.Contains(got, "--fail-on") {
-		t.Errorf("warning with --fail-on should say it was evaluated without the source: %q", got)
+		t.Errorf("warning with --fail-on should mention it: %q", got)
+	}
+	// Codex R2 Medium: SBOMHUB_JVN=off keeps older JVN findings linked, so
+	// --fail-on is NOT evaluated "without" the source; the warning must not
+	// claim so, and must say old findings may still be counted.
+	if got := formatSkippedSourcesWarning([]string{"jvn"}, true); strings.Contains(got, "除いた結果で評価") || !strings.Contains(got, "再確認されない") {
+		t.Errorf("warning misdescribes --fail-on input: %q", got)
 	}
 	// Server-supplied names are printed to a terminal: control bytes
 	// (ANSI escapes) must not pass through.
@@ -256,17 +262,23 @@ type e2eRun struct {
 	stderr string
 }
 
+// fakeScanner stands in for syft/trivy/cdxgen so the run-level tests
+// execute in CI, where no scanner is installed (Codex R2 Low).
+type fakeScanner struct{}
+
+func (fakeScanner) Name() string    { return "fake" }
+func (fakeScanner) Available() bool { return true }
+func (fakeScanner) Scan(string, string) ([]byte, error) {
+	return []byte(`{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"left-pad","version":"1.3.0"}]}`), nil
+}
+
 // runScanAgainst drives runScan against a fake server whose scan-status
-// endpoint returns body. Needs a real SBOM scanner (syft/trivy/cdxgen).
+// endpoint returns body, with a fake SBOM scanner.
 func runScanAgainst(t *testing.T, body, failOn string, jsonOut bool) e2eRun {
 	t.Helper()
-	if _, err := exec.LookPath("syft"); err != nil {
-		if _, err2 := exec.LookPath("trivy"); err2 != nil {
-			if _, err3 := exec.LookPath("cdxgen"); err3 != nil {
-				t.Skip("no SBOM scanner (syft/trivy/cdxgen) on PATH")
-			}
-		}
-	}
+	saveNewScanner := newScanner
+	newScanner = func(string) (scanner.Scanner, error) { return fakeScanner{}, nil }
+	t.Cleanup(func() { newScanner = saveNewScanner })
 	const projectID = "55555555-5555-5555-5555-555555555555"
 	const sbomID = "66666666-6666-6666-6666-666666666666"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -422,5 +434,29 @@ func TestRunScan_OldServerJSONKeySetExact(t *testing.T) {
 	want := []string{"component_count", "fail_on", "format", "project_created", "project_id", "project_name", "sbom_id", "scan_status", "url", "vulnerability_summary"}
 	if keys := jsonKeys(t, got); !reflect.DeepEqual(keys, want) {
 		t.Errorf("keys = %v, want %v", keys, want)
+	}
+}
+
+// Codex R2 Low: the result box for an old server (no skipped_sources) is
+// byte-for-byte the pre-change box.
+func TestPrintResultBox_NoSkippedSourcesExactPreviousOutput(t *testing.T) {
+	saveStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	printResultBox(3, &api.UploadResult{URL: "http://x/projects/p"}, &api.VulnerabilitySummary{High: 1}, nil)
+	_ = w.Close()
+	os.Stdout = saveStdout
+	got, _ := io.ReadAll(r)
+	want := "" +
+		"┌─────────────────────────────────────────────────────────┐\n" +
+		"│ スキャン完了                                            │\n" +
+		"├─────────────────────────────────────────────────────────┤\n" +
+		"│ コンポーネント: 3                                        │\n" +
+		"│ 脆弱性: 1 High                                           │\n" +
+		"│                                                         │\n" +
+		"│ URL: http://x/projects/p                                 │\n" +
+		"└─────────────────────────────────────────────────────────┘\n"
+	if string(got) != want {
+		t.Errorf("result box changed:\n got:\n%s\nwant:\n%s", got, want)
 	}
 }
