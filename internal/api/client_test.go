@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -859,5 +860,52 @@ func TestUploadResultJSON(t *testing.T) {
 
 	if result.VulnerabilityCount != 3 {
 		t.Errorf("VulnerabilityCount = %d, want 3", result.VulnerabilityCount)
+	}
+}
+
+// TestGetScanStatus_SkippedSourcesAndReasons guards the additive
+// scan-status fields (sbomhub docs/UPGRADE.md §26): `skipped_sources`
+// (["jvn"] when the operator set SBOMHUB_JVN=off) and `reasons`
+// (machine-readable failure reasons, incl. `source_unavailable`). An old
+// server that omits them must decode to nil slices.
+func TestGetScanStatus_SkippedSourcesAndReasons(t *testing.T) {
+	cases := []struct {
+		name        string
+		body        string
+		wantSkipped []string
+		wantReasons []string
+	}{
+		{
+			name:        "completed with skipped jvn",
+			body:        `{"status":"completed","vulnerabilities":{},"skipped_sources":["jvn"]}`,
+			wantSkipped: []string{"jvn"},
+		},
+		{
+			name:        "failed with source_unavailable",
+			body:        `{"status":"failed","error":"jvn: scan failed (fetch_failed, source_unavailable)","vulnerabilities":{},"reasons":["fetch_failed","source_unavailable"]}`,
+			wantReasons: []string{"fetch_failed", "source_unavailable"},
+		},
+		{
+			name: "old server without the fields",
+			body: `{"status":"completed","vulnerabilities":{}}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			got, err := NewClient(server.URL, "k").GetScanStatus(context.Background(), "p", "s")
+			if err != nil {
+				t.Fatalf("GetScanStatus() error = %v", err)
+			}
+			if !reflect.DeepEqual(got.SkippedSources, tc.wantSkipped) {
+				t.Errorf("SkippedSources = %#v, want %#v", got.SkippedSources, tc.wantSkipped)
+			}
+			if !reflect.DeepEqual(got.Reasons, tc.wantReasons) {
+				t.Errorf("Reasons = %#v, want %#v", got.Reasons, tc.wantReasons)
+			}
+		})
 	}
 }

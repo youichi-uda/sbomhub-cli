@@ -520,6 +520,20 @@ type ScanStatusResponse struct {
 	ProjectID       string               `json:"project_id"`
 	Error           string               `json:"error,omitempty"`
 	Vulnerabilities VulnerabilitySummary `json:"vulnerabilities"`
+	// Reasons (additive, server M62+) are the machine-readable reasons a
+	// failed scan is incomplete: deadline_exceeded, cancelled,
+	// fetch_failed, source_unavailable (with fetch_failed: the source
+	// served no answer at all, e.g. MyJVN since 2026-10-22), truncated,
+	// write_refused, distro_data_failed, queue_full, scan_error. Present
+	// only when Status == "failed" and known; nil from older servers.
+	Reasons []string `json:"reasons,omitempty"`
+	// SkippedSources (additive, sbomhub docs/UPGRADE.md §26) names the
+	// vulnerability sources the scan did not consult because the
+	// operator switched them off (SBOMHUB_JVN=off: ["jvn"]). Present
+	// only on completed/failed scans that skipped something; nil from
+	// older servers. A skipped source is the operator's choice, not a
+	// scan failure: it does not change Status or --fail-on.
+	SkippedSources []string `json:"skipped_sources,omitempty"`
 }
 
 // GetScanStatus polls the per-SBOM scan-status endpoint. Returns the

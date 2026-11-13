@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
@@ -82,6 +83,15 @@ func (e *scanExitError) ExitCode() int { return e.code }
 //     the process will return. ExitCode mirrors the documented set:
 //     0 success / 1 threshold exceeded / 2 scan timeout or server failure
 //     / 3 API or config error.
+//   - SkippedSources (additive, omitted when empty): vulnerability sources
+//     the server-side scan did not consult because the operator switched
+//     them off (SBOMHUB_JVN=off -> ["jvn"]). scan_status stays
+//     "completed" and fail_on is evaluated as usual — the results may be
+//     incomplete for those sources. Omitted for older servers.
+//   - Reasons (additive, omitted when empty): the server's
+//     machine-readable reasons for a "failed" scan (fetch_failed,
+//     source_unavailable, deadline_exceeded, ...). Omitted for older
+//     servers and for non-failed scans.
 type scanJSONResult struct {
 	SBOMID               string              `json:"sbom_id"`
 	ProjectID            string              `json:"project_id"`
@@ -93,6 +103,8 @@ type scanJSONResult struct {
 	ScanStatus           string              `json:"scan_status"`
 	VulnerabilitySummary scanJSONVulnSummary `json:"vulnerability_summary"`
 	FailOn               scanJSONFailOn      `json:"fail_on"`
+	SkippedSources       []string            `json:"skipped_sources,omitempty"`
+	Reasons              []string            `json:"reasons,omitempty"`
 }
 
 // scanJSONVulnSummary mirrors api.VulnerabilitySummary but pins JSON
@@ -142,6 +154,8 @@ type scanFinalState struct {
 	failOnStr       string // original CLI value, empty when not set
 	failOnTriggered bool
 	exitCode        int
+	skippedSources  []string // scan-status skipped_sources of the terminal poll
+	scanReasons     []string // scan-status reasons of a failed scan
 }
 
 // computeScanStatus maps the final pipeline state to one of the
@@ -233,7 +247,82 @@ func buildScanJSONResult(in scanFinalState) scanJSONResult {
 		r.FailOn.Threshold = &s
 	}
 
+	// Additive fields: only a terminal poll carries them (pollScanStatus
+	// drops anything seen on a running snapshot), so they never appear
+	// next to "running"/"unknown"/"skipped".
+	if len(in.skippedSources) > 0 {
+		r.SkippedSources = in.skippedSources
+	}
+	if in.scanFailedMsg != "" && len(in.scanReasons) > 0 {
+		r.Reasons = in.scanReasons
+	}
+
 	return r
+}
+
+// formatSkippedSourcesWarning renders the operator warning for a scan
+// whose server reported `skipped_sources` (sbomhub docs/UPGRADE.md §26:
+// SBOMHUB_JVN=off). Empty when nothing was skipped, so older servers get
+// exactly the previous output. A skipped source is the server operator's
+// choice and not a failure: exit codes and --fail-on are unchanged, the
+// warning only says the results may be incomplete.
+func formatSkippedSourcesWarning(skipped []string, failOnSet bool) string {
+	names := displaySourceNames(skipped)
+	if names == "" {
+		return ""
+	}
+	msg := fmt.Sprintf("⚠️  サーバ側スキャンは次の脆弱性データソースを照会していません: %s (サーバ運用者の設定による除外。 例: SBOMHUB_JVN=off)。 これらのソースでの新規検出・再確認は行われておらず、 結果は不完全な可能性があります。", names)
+	if failOnSet {
+		msg += " --fail-on はこれらのソースを除いた結果で評価されています。"
+	}
+	return msg + "\n"
+}
+
+// displaySourceNames joins server-supplied source names for terminal
+// output, dropping control characters (the names come from the server and
+// are printed verbatim to a terminal) and empty entries.
+func displaySourceNames(sources []string) string {
+	names := make([]string, 0, len(sources))
+	for _, src := range sources {
+		clean := strings.Map(func(r rune) rune {
+			if unicode.IsControl(r) {
+				return -1
+			}
+			return r
+		}, src)
+		clean = strings.TrimSpace(clean)
+		if clean != "" {
+			names = append(names, clean)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+// formatScanFailedDetail builds the detail shown for a failed server-side
+// scan from the server's `error` marker and its `reasons`. With no reasons
+// (older servers) it is exactly the error string, as before. Reasons the
+// error string does not already name are appended; `source_unavailable`
+// (a source served no answer at all — MyJVN has been suspended since
+// 2026-10-22) gets an explanation and the operator's way out.
+func formatScanFailedDetail(errMsg string, reasons []string) string {
+	detail := errMsg
+	var missing []string
+	sourceUnavailable := false
+	for _, r := range reasons {
+		if r == "source_unavailable" {
+			sourceUnavailable = true
+		}
+		if r != "" && !strings.Contains(errMsg, r) {
+			missing = append(missing, r)
+		}
+	}
+	if len(missing) > 0 {
+		detail += " (reasons: " + displaySourceNames(missing) + ")"
+	}
+	if sourceUnavailable {
+		detail += "。 脆弱性データソースが応答していません (source_unavailable: 例 MyJVN は 2026-10-22 から JPCERT/CC により停止中)。 サーバ運用者は SBOMHUB_JVN=off で JVN を除外してスキャンできます"
+	}
+	return detail
 }
 
 var (
@@ -266,7 +355,11 @@ Exit codes:
   0  正常終了 (脆弱性 threshold 違反なし、 もしくは --fail-on 未指定)
   1  --fail-on で指定した重大度以上の脆弱性を検出
   2  スキャン待機タイムアウト or サーバ側スキャンが失敗
-  3  API / アップロード / 設定エラー`,
+  3  API / アップロード / 設定エラー
+
+サーバ運用者が脆弱性データソースを除外している場合 (例: SBOMHUB_JVN=off)、
+未照会のソースを警告 (stderr) と --json の skipped_sources に表示します。
+除外は失敗扱いではなく、 exit code と --fail-on の判定は変わりません。`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runScan,
 }
@@ -502,6 +595,8 @@ func runScan(cmd *cobra.Command, args []string) error {
 	var scanFailedMsg string
 	var scanAPIErrMsg string
 	var scanLastFetchedAt time.Time
+	var scanSkippedSources []string
+	var scanReasons []string
 	if scanWaitForScan {
 		// Bind the polling loop's deadline to a context so the in-flight
 		// HTTP request can be cancelled the moment --wait-timeout expires
@@ -509,8 +604,10 @@ func runScan(cmd *cobra.Command, args []string) error {
 		// the only thing in effect before this — meaning --wait-timeout=10s
 		// could still hang for up to 60s on a slow server.
 		ctx, cancel := context.WithTimeout(context.Background(), scanWaitTimeout)
-		summary, scanTimedOut, scanFailedMsg, scanAPIErrMsg, scanLastFetchedAt = waitForScanCompletion(ctx, client, result.ProjectID, result.SBOMID)
+		poll := pollScanStatus(ctx, client, result.ProjectID, result.SBOMID)
 		cancel()
+		summary, scanTimedOut, scanFailedMsg, scanAPIErrMsg, scanLastFetchedAt = poll.summary, poll.timedOut, poll.failedMsg, poll.apiErrMsg, poll.lastFetchedAt
+		scanSkippedSources, scanReasons = poll.skippedSources, poll.reasons
 	}
 
 	// Compute the final state of the run. From this point we have a
@@ -570,7 +667,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 		exitCode = exitScanTimeout
 		exitErr = &scanExitError{
 			code: exitScanTimeout,
-			msg:  fmt.Sprintf("サーバ側脆弱性スキャンが失敗しました: %s。 --fail-on は評価されていません", scanFailedMsg),
+			msg:  fmt.Sprintf("サーバ側脆弱性スキャンが失敗しました: %s。 --fail-on は評価されていません", formatScanFailedDetail(scanFailedMsg, scanReasons)),
 		}
 
 	case summary == nil:
@@ -613,6 +710,8 @@ func runScan(cmd *cobra.Command, args []string) error {
 		failOnStr:       scanFailOn,
 		failOnTriggered: failOnTriggered,
 		exitCode:        exitCode,
+		skippedSources:  scanSkippedSources,
+		scanReasons:     scanReasons,
 	}
 
 	// Emit either the JSON payload (machine consumers — GitHub Action,
@@ -622,7 +721,14 @@ func runScan(cmd *cobra.Command, args []string) error {
 		jsonResult := buildScanJSONResult(finalState)
 		_ = out.PrintJSON(jsonResult)
 	} else {
-		printResultBox(componentCount, result, summary)
+		printResultBox(componentCount, result, summary, scanSkippedSources)
+	}
+
+	// skipped_sources (sbomhub docs/UPGRADE.md §26) is reported on every
+	// exit path — including a tripped --fail-on or a failed scan — since
+	// it qualifies whatever result is shown. It never changes exitErr.
+	if w := formatSkippedSourcesWarning(scanSkippedSources, failOnLevel != severity.LevelNone); w != "" {
+		fmt.Fprint(os.Stderr, w)
 	}
 
 	// Operator warnings always go to stderr (independent of --json mode)
@@ -640,7 +746,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 				fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが --wait-timeout %s 以内に完了しませんでした。 暫定 counts は取得できませんでした。\n", scanWaitTimeout)
 			}
 		} else if scanFailedMsg != "" {
-			fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが失敗しました: %s\n", scanFailedMsg)
+			fmt.Fprintf(os.Stderr, "⚠️  サーバ側脆弱性スキャンが失敗しました: %s\n", formatScanFailedDetail(scanFailedMsg, scanReasons))
 		}
 	}
 
@@ -712,6 +818,28 @@ func runScan(cmd *cobra.Command, args []string) error {
 // Retry-After hint when present (capped only by ctx deadline, so a
 // rogue large Retry-After never outlives --wait-timeout).
 func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, sbomID string) (summary *api.VulnerabilitySummary, timedOut bool, failedErrorMsg, apiErrMsg string, lastFetchedAt time.Time) {
+	o := pollScanStatus(ctx, client, projectID, sbomID)
+	return o.summary, o.timedOut, o.failedMsg, o.apiErrMsg, o.lastFetchedAt
+}
+
+// scanPollOutcome is the full result of pollScanStatus. The first five
+// fields are waitForScanCompletion's return values (see its doc);
+// skippedSources and reasons are the additive scan-status fields of the
+// terminal ("completed"/"failed") poll — nil on timeout / API error and
+// from older servers. reasons is only set for a "failed" scan.
+type scanPollOutcome struct {
+	summary        *api.VulnerabilitySummary
+	timedOut       bool
+	failedMsg      string
+	apiErrMsg      string
+	lastFetchedAt  time.Time
+	skippedSources []string
+	reasons        []string
+}
+
+// pollScanStatus is the polling loop behind waitForScanCompletion,
+// additionally carrying skipped_sources / reasons from the terminal poll.
+func pollScanStatus(ctx context.Context, client *api.Client, projectID, sbomID string) scanPollOutcome {
 	tick := scanPollInterval
 	if tick <= 0 {
 		tick = 5 * time.Second
@@ -733,7 +861,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 	var latestAt time.Time
 	for {
 		if ctx.Err() != nil {
-			return latest, true, "", "", latestAt
+			return scanPollOutcome{summary: latest, timedOut: true, lastFetchedAt: latestAt}
 		}
 
 		// nextSleep defaults to the configured poll cadence. A retryable
@@ -749,7 +877,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 			// mid-request) treat it as a clean timeout — not a transient
 			// API error to retry past the deadline.
 			if ctx.Err() != nil {
-				return latest, true, "", "", latestAt
+				return scanPollOutcome{summary: latest, timedOut: true, lastFetchedAt: latestAt}
 			}
 
 			// Classify the API error. 429 / 5xx are retryable transient
@@ -761,7 +889,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 			if errors.As(err, &apiErr) {
 				if !apiErr.IsRetryable() {
 					fmt.Fprintf(progressW(), "   ✗ scan-status 取得エラー (HTTP %d): 永続的なエラーのため即座に中断します\n", apiErr.StatusCode)
-					return latest, false, "", fmt.Sprintf("HTTP %d %s: %s", apiErr.StatusCode, apiErr.URL, strings.TrimSpace(apiErr.Message)), latestAt
+					return scanPollOutcome{summary: latest, apiErrMsg: fmt.Sprintf("HTTP %d %s: %s", apiErr.StatusCode, apiErr.URL, strings.TrimSpace(apiErr.Message)), lastFetchedAt: latestAt}
 				}
 				// Retryable (429 / 5xx). Honour Retry-After when the
 				// server supplied it AND it is longer than our default
@@ -799,9 +927,9 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 
 			switch status.Status {
 			case "completed":
-				return latest, false, "", "", latestAt
+				return scanPollOutcome{summary: latest, lastFetchedAt: latestAt, skippedSources: status.SkippedSources}
 			case "failed":
-				return latest, false, fallbackString(status.Error, "unspecified server-side scan failure"), "", latestAt
+				return scanPollOutcome{summary: latest, failedMsg: fallbackString(status.Error, "unspecified server-side scan failure"), lastFetchedAt: latestAt, skippedSources: status.SkippedSources, reasons: status.Reasons}
 			}
 		}
 
@@ -814,7 +942,7 @@ func waitForScanCompletion(ctx context.Context, client *api.Client, projectID, s
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return latest, true, "", "", latestAt
+			return scanPollOutcome{summary: latest, timedOut: true, lastFetchedAt: latestAt}
 		case <-timer.C:
 		}
 	}
@@ -827,13 +955,18 @@ func fallbackString(s, fallback string) string {
 	return s
 }
 
-func printResultBox(componentCount int, result *api.UploadResult, summary *api.VulnerabilitySummary) {
+func printResultBox(componentCount int, result *api.UploadResult, summary *api.VulnerabilitySummary, skippedSources []string) {
 	fmt.Println("┌─────────────────────────────────────────────────────────┐")
 	fmt.Println("│ スキャン完了                                            │")
 	fmt.Println("├─────────────────────────────────────────────────────────┤")
 	fmt.Printf("│ コンポーネント: %-40d │\n", componentCount)
 	vulnSummary := formatScanVulnSummary(result, summary)
 	fmt.Printf("│ 脆弱性: %-48s │\n", vulnSummary)
+	// Only when the server reported skipped_sources (older servers: the
+	// box is unchanged). Details are in the stderr warning.
+	if names := displaySourceNames(skippedSources); names != "" {
+		fmt.Printf("│ 未照会ソース: %-42s │\n", names+" ⚠️ (結果は不完全な可能性)")
+	}
 	fmt.Println("│                                                         │")
 	fmt.Printf("│ URL: %-51s │\n", result.URL)
 	fmt.Println("└─────────────────────────────────────────────────────────┘")
