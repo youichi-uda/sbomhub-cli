@@ -394,3 +394,33 @@ func TestRunScan_SourceUnavailableFailedMessage(t *testing.T) {
 		t.Errorf("failed message lacks source_unavailable hint: %q", exitErr.Error())
 	}
 }
+
+// Codex R1 Medium: a failed scan that also skipped a source does not
+// evaluate --fail-on; the skipped-source warning must not claim it did.
+func TestRunScan_FailedAndSkippedDoesNotClaimFailOnEvaluated(t *testing.T) {
+	body := `{"status":"failed","error":"nvd: scan failed (fetch_failed)","vulnerabilities":{},"reasons":["fetch_failed"],"skipped_sources":["jvn"]}`
+	r := runScanAgainst(t, body, "critical", false)
+	var exitErr *scanExitError
+	if !errors.As(r.err, &exitErr) || exitErr.ExitCode() != exitScanTimeout {
+		t.Fatalf("runScan err = %v, want exit %d", r.err, exitScanTimeout)
+	}
+	if !strings.Contains(r.stderr, "SBOMHUB_JVN=off") {
+		t.Errorf("skipped-source warning missing on failed scan:\n%s", r.stderr)
+	}
+	if strings.Contains(r.stderr, "--fail-on はこれらのソースを除いた結果で評価") {
+		t.Errorf("warning claims --fail-on was evaluated on a failed scan:\n%s", r.stderr)
+	}
+}
+
+// Codex R1 Low: old server JSON has exactly the pre-change key set.
+func TestRunScan_OldServerJSONKeySetExact(t *testing.T) {
+	r := runScanAgainst(t, bodyOldServer, "critical", true)
+	var got map[string]interface{}
+	if err := json.Unmarshal([]byte(r.stdout), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, r.stdout)
+	}
+	want := []string{"component_count", "fail_on", "format", "project_created", "project_id", "project_name", "sbom_id", "scan_status", "url", "vulnerability_summary"}
+	if keys := jsonKeys(t, got); !reflect.DeepEqual(keys, want) {
+		t.Errorf("keys = %v, want %v", keys, want)
+	}
+}

@@ -266,13 +266,17 @@ func buildScanJSONResult(in scanFinalState) scanJSONResult {
 // exactly the previous output. A skipped source is the server operator's
 // choice and not a failure: exit codes and --fail-on are unchanged, the
 // warning only says the results may be incomplete.
-func formatSkippedSourcesWarning(skipped []string, failOnSet bool) string {
+//
+// failOnEvaluated must be true only when a --fail-on threshold was
+// actually compared against the counts (completed scan); a failed or
+// timed-out scan does not evaluate it (Codex R1 Medium).
+func formatSkippedSourcesWarning(skipped []string, failOnEvaluated bool) string {
 	names := displaySourceNames(skipped)
 	if names == "" {
 		return ""
 	}
 	msg := fmt.Sprintf("⚠️  サーバ側スキャンは次の脆弱性データソースを照会していません: %s (サーバ運用者の設定による除外。 例: SBOMHUB_JVN=off)。 これらのソースでの新規検出・再確認は行われておらず、 結果は不完全な可能性があります。", names)
-	if failOnSet {
+	if failOnEvaluated {
 		msg += " --fail-on はこれらのソースを除いた結果で評価されています。"
 	}
 	return msg + "\n"
@@ -354,7 +358,7 @@ var scanCmd = &cobra.Command{
 Exit codes:
   0  正常終了 (脆弱性 threshold 違反なし、 もしくは --fail-on 未指定)
   1  --fail-on で指定した重大度以上の脆弱性を検出
-  2  スキャン待機タイムアウト or サーバ側スキャンが失敗
+  2  スキャン待機タイムアウト or サーバ側スキャンが失敗 (--fail-on 指定時のみ。 未指定時は警告のみで 0)
   3  API / アップロード / 設定エラー
 
 サーバ運用者が脆弱性データソースを除外している場合 (例: SBOMHUB_JVN=off)、
@@ -622,6 +626,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	var (
 		exitErr         error
 		failOnTriggered bool
+		failOnEvaluated bool // a --fail-on threshold was compared against final counts
 		exitCode        = exitSuccess
 	)
 
@@ -684,6 +689,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 			Unknown:  summary.Unknown,
 			KEV:      summary.KEV,
 		}
+		failOnEvaluated = true
 		if severity.ShouldFail(counts, failOnLevel) {
 			failOnTriggered = true
 			exitCode = exitThresholdExceeded
@@ -727,7 +733,7 @@ func runScan(cmd *cobra.Command, args []string) error {
 	// skipped_sources (sbomhub docs/UPGRADE.md §26) is reported on every
 	// exit path — including a tripped --fail-on or a failed scan — since
 	// it qualifies whatever result is shown. It never changes exitErr.
-	if w := formatSkippedSourcesWarning(scanSkippedSources, failOnLevel != severity.LevelNone); w != "" {
+	if w := formatSkippedSourcesWarning(scanSkippedSources, failOnEvaluated); w != "" {
 		fmt.Fprint(os.Stderr, w)
 	}
 

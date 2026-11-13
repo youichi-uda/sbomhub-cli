@@ -99,7 +99,7 @@ sbomhub scan . \
 
 ほかに `sbom_id` `project_id` `project_name` `project_created` `component_count` `format` `url` を含みます。
 
-Exit code: 0 正常 / 1 `--fail-on` の閾値超過 / 2 待機タイムアウト・サーバ側スキャン失敗 / 3 API・設定エラー。
+Exit code: 0 正常 / 1 `--fail-on` の閾値超過 / 2 待機タイムアウト・サーバ側スキャン失敗 (`--fail-on` 指定時のみ。 未指定時は stderr 警告のみで 0) / 3 API・設定エラー。
 
 **未照会のデータソース (`skipped_sources`)**: MyJVN は 2026-10-22 から JPCERT/CC により停止中のため、
 サーバ運用者は `SBOMHUB_JVN=off` で JVN を除外できます (sbomhub `docs/UPGRADE.md` §26)。
@@ -107,8 +107,8 @@ Exit code: 0 正常 / 1 `--fail-on` の閾値超過 / 2 待機タイムアウト
 `--json` に `skipped_sources` を含めます。 除外は運用者の選択であり失敗ではないため、
 `scan_status` は `completed` のまま、 exit code と `--fail-on` の判定も変わりません
 (`--fail-on` は除外したソースを除いた結果で評価されます)。
-JVN が応答しない状態で `SBOMHUB_JVN=on` のままの場合はスキャンが `failed` (`reasons` に `source_unavailable`) となり exit 2 で、
-エラーメッセージに `SBOMHUB_JVN=off` の案内が表示されます。
+JVN が応答しない状態で `SBOMHUB_JVN=on` のままの場合はスキャンが `failed` (`reasons` に `source_unavailable`) となり (`--fail-on` 指定時は exit 2、 未指定時は警告のみで exit 0)、
+エラー / 警告メッセージに `SBOMHUB_JVN=off` の案内が表示されます。
 `skipped_sources` / `reasons` を返さない旧サーバでは出力は従来どおりです。
 
 ### 脆弱性チェック（アップロードせず）

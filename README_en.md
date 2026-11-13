@@ -98,14 +98,14 @@ and prints the result. With `--json`, stdout carries exactly one object (progres
 
 It also carries `sbom_id`, `project_id`, `project_name`, `project_created`, `component_count`, `format` and `url`.
 
-Exit codes: 0 success / 1 `--fail-on` threshold exceeded / 2 wait timeout or server-side scan failure / 3 API or config error.
+Exit codes: 0 success / 1 `--fail-on` threshold exceeded / 2 wait timeout or server-side scan failure (only with `--fail-on`; without it, a stderr warning and exit 0) / 3 API or config error.
 
 **Sources not consulted (`skipped_sources`)**: JPCERT/CC has suspended MyJVN since 2026-10-22, so a server operator
 may set `SBOMHUB_JVN=off` (sbomhub `docs/UPGRADE.md` §26). The CLI then shows `未照会ソース: jvn` in the result box,
 prints a stderr warning that results may be incomplete, and adds `skipped_sources` to `--json`. Skipping is the
 operator's choice, not a failure: `scan_status` stays `completed`, and exit codes and `--fail-on` are unchanged
 (`--fail-on` is evaluated on the results without the skipped sources). With JVN unreachable and `SBOMHUB_JVN=on`,
-the scan is `failed` (`reasons` include `source_unavailable`, exit 2) and the error message points at `SBOMHUB_JVN=off`.
+the scan is `failed` (`reasons` include `source_unavailable`; exit 2 with `--fail-on`, otherwise a warning and exit 0) and the error/warning message points at `SBOMHUB_JVN=off`.
 Older servers that send neither `skipped_sources` nor `reasons` produce the same output as before.
 
 ### Vulnerability Check (without upload)
