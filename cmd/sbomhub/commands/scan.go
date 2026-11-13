@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
-	"unicode"
 
 	"github.com/spf13/cobra"
 	"github.com/youichi-uda/sbomhub-cli/internal/api"
@@ -85,9 +84,12 @@ func (e *scanExitError) ExitCode() int { return e.code }
 //     / 3 API or config error.
 //   - SkippedSources (additive, omitted when empty): vulnerability sources
 //     the server-side scan did not consult because the operator switched
-//     them off (SBOMHUB_JVN=off -> ["jvn"]). scan_status stays
-//     "completed" and fail_on is evaluated as usual — the results may be
-//     incomplete for those sources. Omitted for older servers.
+//     them off (SBOMHUB_JVN=off -> ["jvn"]). Skipping does not by itself
+//     change scan_status or fail_on: a scan whose other sources succeed is
+//     "completed" and --fail-on is evaluated on the returned counts; one
+//     whose other sources failed is "failed" (--fail-on not evaluated).
+//     Results may be incomplete for those sources. Omitted for older
+//     servers.
 //   - Reasons (additive, omitted when empty): the server's
 //     machine-readable reasons for a "failed" scan (fetch_failed,
 //     source_unavailable, deadline_exceeded, ...). Omitted for older
@@ -282,19 +284,23 @@ func formatSkippedSourcesWarning(skipped []string, failOnEvaluated bool) string 
 	return msg + "\n"
 }
 
-// displaySourceNames joins server-supplied source names for terminal
-// output, dropping control characters (the names come from the server and
-// are printed verbatim to a terminal) and empty entries.
+// displaySourceNames joins server-supplied source names (or reason codes)
+// for terminal output. They are identifiers (jvn, nvd, fetch_failed, ...),
+// so only [A-Za-z0-9._-] is shown as-is; any other rune — control
+// characters, ANSI escapes, bidi overrides, zero-width characters — is
+// shown as '?' so a server value cannot inject or spoof terminal text
+// (Codex R3 Low). Entries that are empty after trimming are dropped.
 func displaySourceNames(sources []string) string {
 	names := make([]string, 0, len(sources))
 	for _, src := range sources {
 		clean := strings.Map(func(r rune) rune {
-			if unicode.IsControl(r) {
-				return -1
+			switch {
+			case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+				return r
+			default:
+				return '?'
 			}
-			return r
-		}, src)
-		clean = strings.TrimSpace(clean)
+		}, strings.TrimSpace(src))
 		if clean != "" {
 			names = append(names, clean)
 		}
@@ -972,14 +978,15 @@ func printResultBox(componentCount int, result *api.UploadResult, summary *api.V
 	fmt.Printf("│ コンポーネント: %-40d │\n", componentCount)
 	vulnSummary := formatScanVulnSummary(result, summary)
 	fmt.Printf("│ 脆弱性: %-48s │\n", vulnSummary)
-	// Only when the server reported skipped_sources (older servers: the
-	// box is unchanged). Details are in the stderr warning.
-	if names := displaySourceNames(skippedSources); names != "" {
-		fmt.Printf("│ 未照会ソース: %-42s │\n", names+" ⚠️ (結果は不完全な可能性)")
-	}
 	fmt.Println("│                                                         │")
 	fmt.Printf("│ URL: %-51s │\n", result.URL)
 	fmt.Println("└─────────────────────────────────────────────────────────┘")
+	// Only when the server reported skipped_sources; older servers get
+	// exactly the previous box. Printed below the box because the box
+	// pads by runes, not terminal cells. Details are in the stderr warning.
+	if names := displaySourceNames(skippedSources); names != "" {
+		fmt.Printf("⚠️  未照会ソース: %s (結果は不完全な可能性があります)\n", names)
+	}
 }
 
 func countComponents(sbomData []byte) int {

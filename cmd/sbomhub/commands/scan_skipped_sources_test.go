@@ -460,3 +460,40 @@ func TestPrintResultBox_NoSkippedSourcesExactPreviousOutput(t *testing.T) {
 		t.Errorf("result box changed:\n got:\n%s\nwant:\n%s", got, want)
 	}
 }
+
+// Codex R3 Low: source names are an identifier set (jvn, nvd, ...);
+// anything outside [A-Za-z0-9._-] — bidi overrides, zero-width chars —
+// is shown as '?' so a server value cannot reorder or spoof the warning.
+func TestDisplaySourceNames_AllowlistOnly(t *testing.T) {
+	cases := map[string]string{
+		"jvn":           "jvn",
+		"nvd_2.0-x":     "nvd_2.0-x",
+		"jvn\u202eevil": "jvn?evil",
+		"a\u200bb":      "a?b",
+		"jvn\x1b[2J":    "jvn??2J",
+		"  ":            "",
+		"\u202e":        "?",
+	}
+	for in, want := range cases {
+		if got := displaySourceNames([]string{in}); got != want {
+			t.Errorf("displaySourceNames(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Codex R3 Low: the skipped-source note is printed below the fixed-width
+// box (Go's %-Ns pads by runes, not terminal cells), leaving the box
+// itself byte-identical to the old-server box.
+func TestPrintResultBox_SkippedSourcesBelowBox(t *testing.T) {
+	saveStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+	printResultBox(3, &api.UploadResult{URL: "http://x/projects/p"}, &api.VulnerabilitySummary{High: 1}, []string{"jvn"})
+	_ = w.Close()
+	os.Stdout = saveStdout
+	got, _ := io.ReadAll(r)
+	lines := strings.Split(strings.TrimRight(string(got), "\n"), "\n")
+	if len(lines) != 9 || !strings.HasPrefix(lines[7], "└") || !strings.Contains(lines[8], "未照会ソース: jvn") {
+		t.Errorf("unexpected box:\n%s", got)
+	}
+}

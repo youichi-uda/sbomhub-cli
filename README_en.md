@@ -98,10 +98,10 @@ and prints the result. With `--json`, stdout carries exactly one object (progres
 
 It also carries `sbom_id`, `project_id`, `project_name`, `project_created`, `component_count`, `format` and `url`.
 
-Exit codes: 0 success / 1 `--fail-on` threshold exceeded / 2 wait timeout or server-side scan failure (only with `--fail-on`; without it, a stderr warning and exit 0) / 3 API or config error.
+Exit codes: 0 success / 1 `--fail-on` threshold exceeded (also usage errors and local scanner failures) / 2 wait timeout or server-side scan failure (only with `--fail-on`; without it, a stderr warning and exit 0) / 3 API or config error.
 
 **Sources not consulted (`skipped_sources`)**: JPCERT/CC has suspended MyJVN since 2026-10-22, so a server operator
-may set `SBOMHUB_JVN=off` (sbomhub `docs/UPGRADE.md` §26). The CLI then shows `未照会ソース: jvn` in the result box,
+may set `SBOMHUB_JVN=off` (sbomhub `docs/UPGRADE.md` §26). The CLI then shows `未照会ソース: jvn` below the result box,
 prints a stderr warning that results may be incomplete, and adds `skipped_sources` to `--json`. Skipping is the
 operator's choice and does not by itself fail the scan (`scan_status` is `completed` when the remaining sources succeed);
 exit codes and `--fail-on` are unchanged (`--fail-on` uses the counts the server returns, which may still include

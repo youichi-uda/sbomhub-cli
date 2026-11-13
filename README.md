@@ -99,11 +99,11 @@ sbomhub scan . \
 
 ほかに `sbom_id` `project_id` `project_name` `project_created` `component_count` `format` `url` を含みます。
 
-Exit code: 0 正常 / 1 `--fail-on` の閾値超過 / 2 待機タイムアウト・サーバ側スキャン失敗 (`--fail-on` 指定時のみ。 未指定時は stderr 警告のみで 0) / 3 API・設定エラー。
+Exit code: 0 正常 / 1 `--fail-on` の閾値超過 (引数エラー・ローカルのスキャナ実行失敗なども 1) / 2 待機タイムアウト・サーバ側スキャン失敗 (`--fail-on` 指定時のみ。 未指定時は stderr 警告のみで 0) / 3 API・設定エラー。
 
 **未照会のデータソース (`skipped_sources`)**: MyJVN は 2026-10-22 から JPCERT/CC により停止中のため、
 サーバ運用者は `SBOMHUB_JVN=off` で JVN を除外できます (sbomhub `docs/UPGRADE.md` §26)。
-その場合 CLI は結果ボックスに `未照会ソース: jvn` を、 stderr に「結果は不完全な可能性があります」という警告を表示し、
+その場合 CLI は結果ボックスの下に `未照会ソース: jvn` を、 stderr に「結果は不完全な可能性があります」という警告を表示し、
 `--json` に `skipped_sources` を含めます。 除外は運用者の選択であり、 除外だけでスキャンが失敗扱いになることはありません
 (他のソースが成功すれば `scan_status` は `completed`)。 exit code と `--fail-on` の判定も変わりません
 (`--fail-on` はサーバが返した counts で評価され、 除外ソースで過去に見つかった脆弱性は再確認されないまま含まれる場合があります)。
