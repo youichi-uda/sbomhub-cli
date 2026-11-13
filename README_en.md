@@ -83,6 +83,31 @@ sbomhub scan . \
   --fail-on critical         # Exit 1 on Critical findings (for CI)
 ```
 
+#### Scan results and `--json` output
+
+`sbomhub scan` waits for the server-side vulnerability scan after upload (`--wait-for-scan`, default true)
+and prints the result. With `--json`, stdout carries exactly one object (progress and warnings go to stderr):
+
+| Field | Meaning |
+|---|---|
+| `scan_status` | `completed` / `failed` / `running` (wait timed out) / `unknown` / `skipped` |
+| `vulnerability_summary` | `critical` `high` `medium` `low` `kev` `unknown` `total` |
+| `fail_on` | `threshold` (`null` when unset) / `triggered` / `exit_code` |
+| `skipped_sources` | (additive, omitted when empty) sources the scan did not consult because the server operator switched them off, e.g. `["jvn"]` on a server with `SBOMHUB_JVN=off` |
+| `reasons` | (additive, omitted when empty) reason codes of a `failed` scan (`fetch_failed`, `source_unavailable`, `deadline_exceeded`, ...) |
+
+It also carries `sbom_id`, `project_id`, `project_name`, `project_created`, `component_count`, `format` and `url`.
+
+Exit codes: 0 success / 1 `--fail-on` threshold exceeded / 2 wait timeout or server-side scan failure / 3 API or config error.
+
+**Sources not consulted (`skipped_sources`)**: JPCERT/CC has suspended MyJVN since 2026-10-22, so a server operator
+may set `SBOMHUB_JVN=off` (sbomhub `docs/UPGRADE.md` §26). The CLI then shows `未照会ソース: jvn` in the result box,
+prints a stderr warning that results may be incomplete, and adds `skipped_sources` to `--json`. Skipping is the
+operator's choice, not a failure: `scan_status` stays `completed`, and exit codes and `--fail-on` are unchanged
+(`--fail-on` is evaluated on the results without the skipped sources). With JVN unreachable and `SBOMHUB_JVN=on`,
+the scan is `failed` (`reasons` include `source_unavailable`, exit 2) and the error message points at `SBOMHUB_JVN=off`.
+Older servers that send neither `skipped_sources` nor `reasons` produce the same output as before.
+
 ### Vulnerability Check (without upload)
 
 ```bash
