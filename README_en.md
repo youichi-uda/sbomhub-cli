@@ -86,7 +86,7 @@ sbomhub scan . \
 #### Scan results and `--json` output
 
 `sbomhub scan` waits for the server-side vulnerability scan after upload (`--wait-for-scan`, default true)
-and prints the result. With `--json`, stdout carries exactly one object (progress and warnings go to stderr):
+and prints the result. With `--json`, once a result is produced (i.e. not on early config, scanner or upload failures), stdout carries exactly one object (progress and warnings go to stderr):
 
 | Field | Meaning |
 |---|---|

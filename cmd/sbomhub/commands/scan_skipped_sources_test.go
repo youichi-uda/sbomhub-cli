@@ -296,12 +296,12 @@ func runScanAgainst(t *testing.T, body, failOn string, jsonOut bool) e2eRun {
 
 	saveProject, saveFailOn, saveWait, saveDry, saveTool := scanProject, scanFailOn, scanWaitForScan, scanDryRun, scanTool
 	saveURL, saveKey := apiURL, apiKey
-	saveJSON, saveWriter := globalOutput.JSON, globalOutput.Writer
+	saveJSON, saveWriter, saveErrWriter := globalOutput.JSON, globalOutput.Writer, globalOutput.ErrWriter
 	saveStdout, saveStderr := os.Stdout, os.Stderr
 	t.Cleanup(func() {
 		scanProject, scanFailOn, scanWaitForScan, scanDryRun, scanTool = saveProject, saveFailOn, saveWait, saveDry, saveTool
 		apiURL, apiKey = saveURL, saveKey
-		globalOutput.JSON, globalOutput.Writer = saveJSON, saveWriter
+		globalOutput.JSON, globalOutput.Writer, globalOutput.ErrWriter = saveJSON, saveWriter, saveErrWriter
 		os.Stdout, os.Stderr = saveStdout, saveStderr
 	})
 	setFastPolling(t)
@@ -315,7 +315,7 @@ func runScanAgainst(t *testing.T, body, failOn string, jsonOut bool) e2eRun {
 	outR, outW, _ := os.Pipe()
 	errR, errW, _ := os.Pipe()
 	os.Stdout, os.Stderr = outW, errW
-	globalOutput.JSON, globalOutput.Writer = jsonOut, outW
+	globalOutput.JSON, globalOutput.Writer, globalOutput.ErrWriter = jsonOut, outW, errW
 	var outBuf, errBuf bytes.Buffer
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(&outBuf, outR); done <- struct{}{} }()
